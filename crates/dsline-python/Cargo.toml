@@ -1,0 +1,19 @@
+[package]
+name = "dsline-python"
+description.workspace = true
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "_dsline"
+crate-type = ["cdylib"]
+
+[dependencies]
+dsline-core = { path = "../dsline-core" }
+dsline-shm = { path = "../dsline-shm" }
+pyo3 = { version = "0.21", features = ["abi3-py39", "extension-module"] }
+
+[lints]
+workspace = true

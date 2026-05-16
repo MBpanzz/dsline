@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "dsline"
+version = "0.0.1"
+description = "Lightweight local dataflow and shared-memory channels for Python."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "dsline contributors" }]
+dependencies = []
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+
+[project.optional-dependencies]
+numpy = ["numpy>=1.24"]
+arrow = ["pyarrow>=14.0"]
+all = ["numpy>=1.24", "pyarrow>=14.0"]
+
+[project.scripts]
+dsline = "dsline.__main__:main"
+
+[tool.maturin]
+manifest-path = "crates/dsline-python/Cargo.toml"
+python-source = "python"
+module-name = "dsline._dsline"
