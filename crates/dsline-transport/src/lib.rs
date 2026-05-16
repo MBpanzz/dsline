@@ -166,7 +166,9 @@ impl FromStr for TransportUrl {
 fn validate_tcp_target(target: &str) -> Result<()> {
     // Accept host:port or host:port/path. The port is the numeric segment
     // between the last colon and the next slash (or end of string).
-    let colon = target.rfind(':').ok_or(TransportError::MissingTarget("host:port"))?;
+    let colon = target
+        .rfind(':')
+        .ok_or(TransportError::MissingTarget("host:port"))?;
     let host = &target[..colon];
     let port_and_path = &target[colon + 1..];
 
@@ -228,13 +230,22 @@ mod tests {
 
     #[test]
     fn parse_supported_schemes() {
-        assert_eq!(TransportScheme::from_str("shm").unwrap(), TransportScheme::Shm);
-        assert_eq!(TransportScheme::from_str("bus").unwrap(), TransportScheme::Bus);
+        assert_eq!(
+            TransportScheme::from_str("shm").unwrap(),
+            TransportScheme::Shm
+        );
+        assert_eq!(
+            TransportScheme::from_str("bus").unwrap(),
+            TransportScheme::Bus
+        );
         assert_eq!(
             TransportScheme::from_str("unix").unwrap(),
             TransportScheme::Unix
         );
-        assert_eq!(TransportScheme::from_str("tcp").unwrap(), TransportScheme::Tcp);
+        assert_eq!(
+            TransportScheme::from_str("tcp").unwrap(),
+            TransportScheme::Tcp
+        );
     }
 
     #[test]

@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo test:*)",
+      "Bash(python -m maturin develop --manifest-path crates/dsline-python/Cargo.toml)",
+      "Bash(python -m unittest discover -s tests/python)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(cargo fmt:*)"
+    ]
+  }
+}
