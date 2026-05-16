@@ -2,7 +2,7 @@
 
 use dsline_core::{Backpressure as CoreBackpressure, ChannelError, DslineError, SpscConfig};
 use dsline_ops::Record;
-use dsline_shm::ShmSpscChannel;
+use dsline_shm::{PersistentShmChannel, ShmSpscChannel};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -175,6 +175,121 @@ impl ShmChannel {
     }
 }
 
+// ── FileChannel (file-backed, cross-process) ──
+
+/// A file-backed channel that can be shared across processes.
+///
+/// One process calls `create()` to initialise the file, then both
+/// producer and consumer call `open()` to connect.
+#[pyclass]
+struct FileChannel {
+    path: String,
+    channel: Mutex<PersistentShmChannel>,
+}
+
+#[pymethods]
+impl FileChannel {
+    /// Create a new file-backed channel, initialising the backing file.
+    #[staticmethod]
+    fn create(path: String, capacity: usize, slot_size: usize) -> PyResult<Self> {
+        let config = SpscConfig {
+            capacity,
+            slot_size,
+            backpressure: CoreBackpressure::Raise,
+            timeout: None,
+        };
+        let channel = PersistentShmChannel::create(&path, config).map_err(to_py_err)?;
+        Ok(Self {
+            path,
+            channel: Mutex::new(channel),
+        })
+    }
+
+    /// Open an existing file-backed channel.
+    #[staticmethod]
+    fn open(path: String, capacity: usize, slot_size: usize) -> PyResult<Self> {
+        let config = SpscConfig {
+            capacity,
+            slot_size,
+            backpressure: CoreBackpressure::Raise,
+            timeout: None,
+        };
+        let channel = PersistentShmChannel::open(&path, config).map_err(to_py_err)?;
+        Ok(Self {
+            path,
+            channel: Mutex::new(channel),
+        })
+    }
+
+    fn send(&self, data: Vec<u8>) -> PyResult<()> {
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+        channel.send(&data).map_err(to_py_err)
+    }
+
+    fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+        let data = channel.recv().map_err(to_py_err)?;
+        Ok(PyBytes::new_bound(py, &data))
+    }
+
+    fn close(&self) -> PyResult<()> {
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+        channel.close();
+        Ok(())
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        _exc_type: Option<&Bound<'_, PyType>>,
+        _exc: Option<&Bound<'_, PyAny>>,
+        _tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        self.close()?;
+        Ok(false)
+    }
+
+    #[getter]
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    #[getter]
+    fn closed(&self) -> PyResult<bool> {
+        Ok(self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?
+            .is_closed())
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let channel = self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+        let stats = PyDict::new_bound(py);
+        stats.set_item("path", &self.path)?;
+        stats.set_item("backend", "file")?;
+        stats.set_item("capacity", channel.capacity())?;
+        stats.set_item("slot_size", channel.payload_slot_size())?;
+        stats.set_item("closed", channel.is_closed())?;
+        Ok(stats)
+    }
+}
+
 // ── Pipeline ──
 
 #[doc(hidden)]
@@ -234,10 +349,10 @@ impl PyPipeline {
             .parse()
             .map_err(|e: DslineError| PyValueError::new_err(e.to_string()))?;
 
-        if parsed.scheme.as_str() != "shm" {
+        let scheme = parsed.scheme.as_str();
+        if scheme != "shm" && scheme != "file" {
             return Err(PyValueError::new_err(format!(
-                "unsupported transport scheme '{}'; only 'shm' is supported",
-                parsed.scheme
+                "unsupported transport scheme '{scheme}'; supported: shm, file"
             )));
         }
         // Validate query params parse.
@@ -286,19 +401,26 @@ impl PyPipeline {
             backpressure: CoreBackpressure::Raise,
             timeout: None,
         };
-        let mut channel = ShmSpscChannel::new(config).map_err(to_py_err)?;
+
         let mut items: Vec<PyObject> = Vec::new();
-        while let Ok(data) = channel.recv() {
-            let s = String::from_utf8_lossy(&data).to_string();
-            if s.is_empty() {
-                continue;
+
+        match parsed.scheme.as_str() {
+            "shm" => {
+                let mut channel = ShmSpscChannel::new(config).map_err(to_py_err)?;
+                while let Ok(data) = channel.recv() {
+                    push_parsed_item(&data, &mut items, py);
+                }
             }
-            if let Ok(v) = s.parse::<f64>() {
-                items.push(v.to_object(py));
-            } else {
-                items.push(s.to_object(py));
+            "file" => {
+                let mut channel =
+                    PersistentShmChannel::open(parsed.target(), config).map_err(to_py_err)?;
+                while let Ok(data) = channel.recv() {
+                    push_parsed_item(&data, &mut items, py);
+                }
             }
+            _ => unreachable!(),
         }
+
         Ok(PyList::new_bound(py, &items).into())
     }
 
@@ -723,10 +845,23 @@ fn to_py_err(err: DslineError) -> PyErr {
 
 // ── module init ──
 
+fn push_parsed_item(data: &[u8], items: &mut Vec<PyObject>, py: Python<'_>) {
+    let s = String::from_utf8_lossy(data).to_string();
+    if s.is_empty() {
+        return;
+    }
+    if let Ok(v) = s.parse::<f64>() {
+        items.push(v.to_object(py));
+    } else {
+        items.push(s.to_object(py));
+    }
+}
+
 #[pymodule]
 fn _dsline(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Backpressure>()?;
     module.add_class::<ShmChannel>()?;
+    module.add_class::<FileChannel>()?;
     module.add_class::<PyPipeline>()?;
     module.add("DslineError", _py.get_type_bound::<DslineErrorPy>())?;
     module.add("ChannelError", _py.get_type_bound::<ChannelErrorPy>())?;
