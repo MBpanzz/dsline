@@ -189,6 +189,7 @@ fn to_py_err(err: DslineError) -> PyErr {
             ChannelErrorPy::new_err(err.to_string())
         }
         DslineError::Protocol(_) => DslineErrorPy::new_err(err.to_string()),
+        DslineError::Transport(_) => DslineErrorPy::new_err(err.to_string()),
     }
 }
 
