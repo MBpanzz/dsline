@@ -44,6 +44,8 @@ name = "dsline-python"
 version = "0.0.1"
 dependencies = [
  "dsline-core",
+ "dsline-ops",
+ "dsline-pipeline",
  "dsline-shm",
  "pyo3",
 ]

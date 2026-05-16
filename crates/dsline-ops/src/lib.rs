@@ -150,6 +150,16 @@ impl Parser {
     }
 
     fn parse_expr(&mut self) -> Result<Expr, ParseError> {
+        let expr = self.parse_all()?;
+        if self.pos < self.tokens.len() {
+            let unexpected = self.tokens[self.pos..].join(" ");
+            return Err(ParseError::UnexpectedToken(unexpected));
+        }
+        Ok(expr)
+    }
+
+    /// Internal entry point used for sub-expressions (inside parentheses).
+    fn parse_all(&mut self) -> Result<Expr, ParseError> {
         self.parse_or()
     }
 
@@ -282,7 +292,7 @@ impl Parser {
         let tok = self.advance().ok_or(ParseError::UnexpectedEnd)?;
 
         if tok == "(" {
-            let inner = self.parse_expr()?;
+            let inner = self.parse_all()?;
             self.expect(")")?;
             return Ok(inner);
         }
