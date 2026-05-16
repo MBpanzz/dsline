@@ -207,13 +207,99 @@ enum PipelineOp {
 #[pyclass]
 struct PyPipeline {
     ops: Vec<PipelineOp>,
+    /// Optional transport URL for lazy source resolution.
+    transport_source: Option<String>,
 }
 
 #[pymethods]
 impl PyPipeline {
     #[new]
     fn new() -> Self {
-        Self { ops: Vec::new() }
+        Self {
+            ops: Vec::new(),
+            transport_source: None,
+        }
+    }
+
+    /// Create a pipeline with a transport URL as source.
+    ///
+    /// Supported schemes:
+    /// - `shm://name?capacity=N&slot_size=N` — opens a shared-memory channel
+    ///
+    /// After building the pipeline, call `.collect()` without arguments to
+    /// drain the transport source and process it.
+    #[staticmethod]
+    fn from_transport(url: &str) -> PyResult<Self> {
+        let parsed: dsline_transport::TransportUrl = url
+            .parse()
+            .map_err(|e: DslineError| PyValueError::new_err(e.to_string()))?;
+
+        if parsed.scheme.as_str() != "shm" {
+            return Err(PyValueError::new_err(format!(
+                "unsupported transport scheme '{}'; only 'shm' is supported",
+                parsed.scheme
+            )));
+        }
+        // Validate query params parse.
+        let _: usize = parsed
+            .query_param("capacity")
+            .unwrap_or("64")
+            .parse()
+            .map_err(|_| PyValueError::new_err("invalid capacity"))?;
+        let _: usize = parsed
+            .query_param("slot_size")
+            .unwrap_or("4096")
+            .parse()
+            .map_err(|_| PyValueError::new_err("invalid slot_size"))?;
+
+        Ok(Self {
+            ops: Vec::new(),
+            transport_source: Some(url.to_string()),
+        })
+    }
+
+    /// Resolve the transport source to a Python list by draining the channel.
+    fn _drain_transport_source(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let url_str = self
+            .transport_source
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("no transport source configured"))?;
+
+        let parsed: dsline_transport::TransportUrl = url_str
+            .parse()
+            .map_err(|e: DslineError| PyValueError::new_err(e.to_string()))?;
+
+        let capacity: usize = parsed
+            .query_param("capacity")
+            .unwrap_or("64")
+            .parse()
+            .map_err(|_| PyValueError::new_err("invalid capacity"))?;
+        let slot_size: usize = parsed
+            .query_param("slot_size")
+            .unwrap_or("4096")
+            .parse()
+            .map_err(|_| PyValueError::new_err("invalid slot_size"))?;
+
+        let config = SpscConfig {
+            capacity,
+            slot_size,
+            backpressure: CoreBackpressure::Raise,
+            timeout: None,
+        };
+        let mut channel = ShmSpscChannel::new(config).map_err(to_py_err)?;
+        let mut items: Vec<PyObject> = Vec::new();
+        while let Ok(data) = channel.recv() {
+            let s = String::from_utf8_lossy(&data).to_string();
+            if s.is_empty() {
+                continue;
+            }
+            if let Ok(v) = s.parse::<f64>() {
+                items.push(v.to_object(py));
+            } else {
+                items.push(s.to_object(py));
+            }
+        }
+        Ok(PyList::new_bound(py, &items).into())
     }
 
     /// Add an expr-lite filter stage.
@@ -308,9 +394,19 @@ impl PyPipeline {
     ///
     /// Each source item passes through all operators in order. Items dropped
     /// by filter stages are excluded from the output.
-    fn collect(&self, py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+    ///
+    /// If `source` is `None` and the pipeline was created via
+    /// `from_transport()`, the transport channel is drained and used.
+    #[pyo3(signature = (source=None))]
+    fn collect(&self, py: Python<'_>, source: Option<&Bound<'_, PyAny>>) -> PyResult<PyObject> {
+        let src_py: PyObject = match source {
+            Some(s) => s.clone().into(),
+            None => self._drain_transport_source(py)?,
+        };
+        let src = src_py.bind(py);
+
         let results = PyList::empty_bound(py);
-        let mut iter = source.iter()?;
+        let mut iter = src.iter()?;
 
         // Locate the batch operator, if any.
         let batch_idx = self
@@ -380,7 +476,7 @@ impl PyPipeline {
         source: &Bound<'_, PyAny>,
         channel: &Bound<'_, ShmChannel>,
     ) -> PyResult<usize> {
-        let results = self.collect(py, source)?;
+        let results = self.collect(py, Some(source))?;
         let list = results.bind(py).downcast::<PyList>()?;
         let ch = channel.borrow_mut();
         let mut inner = ch.lock_channel()?;
@@ -413,7 +509,7 @@ impl PyPipeline {
         drop(inner);
         drop(ch);
 
-        self.collect(py, PyList::new_bound(py, &items).as_any())
+        self.collect(py, Some(PyList::new_bound(py, &items).as_any()))
     }
 
     fn __repr__(&self) -> String {
