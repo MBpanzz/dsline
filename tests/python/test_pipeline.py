@@ -191,10 +191,17 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             p.collect(["hello"])
 
-    def test_non_numeric_dict_value_raises(self) -> None:
+    def test_non_numeric_dict_values_skipped(self) -> None:
         p = dsline.Pipeline()
-        with self.assertRaises(ValueError):
-            p.collect([{"key": "value"}])
+        # Non-numeric values are silently skipped; only numeric columns
+        # participate in expr-lite evaluation.
+        result = p.collect([{"name": "alice", "score": 90.0}])
+        self.assertEqual(result, [{"score": 90.0}])
+
+    def test_dict_with_no_numeric_values_becomes_empty(self) -> None:
+        p = dsline.Pipeline()
+        result = p.collect([{"key": "value"}])
+        self.assertEqual(result, [{}])
 
     def test_filter_py_raises_propagates(self) -> None:
         p = dsline.Pipeline()
@@ -207,6 +214,73 @@ class PipelineTests(unittest.TestCase):
         p.map_py(lambda x: 1 / 0)
         with self.assertRaises(ZeroDivisionError):
             p.collect([1])
+
+    # ── batch ──
+
+    def test_batch_groups_items(self) -> None:
+        p = dsline.Pipeline()
+        p.batch(2)
+        result = p.collect([1, 2, 3, 4])
+        self.assertEqual(result, [[1, 2], [3, 4]])
+
+    def test_batch_trailing_partial_emitted(self) -> None:
+        p = dsline.Pipeline()
+        p.batch(3)
+        result = p.collect([1, 2, 3, 4, 5])
+        self.assertEqual(result, [[1, 2, 3], [4, 5]])
+
+    def test_batch_size_1(self) -> None:
+        p = dsline.Pipeline()
+        p.batch(1)
+        result = p.collect([1, 2, 3])
+        self.assertEqual(result, [[1], [2], [3]])
+
+    def test_batch_then_filter_py(self) -> None:
+        p = dsline.Pipeline()
+        p.batch(2)
+        p.filter_py(lambda batch: sum(batch) > 5)
+        result = p.collect([1, 5, 2, 6])
+        self.assertEqual(result, [[1, 5], [2, 6]])
+
+    def test_batch_then_map_py(self) -> None:
+        p = dsline.Pipeline()
+        p.batch(3)
+        p.map_py(lambda batch: sum(batch))
+        result = p.collect([1, 2, 3, 4, 5, 6])
+        self.assertEqual(result, [6, 15])
+
+    def test_filter_expr_before_batch(self) -> None:
+        p = dsline.Pipeline()
+        p.filter_expr("x > 2")
+        p.batch(2)
+        result = p.collect([1, 2, 3, 4, 5])
+        self.assertEqual(result, [[3, 4], [5]])
+
+    def test_batch_size_zero_raises(self) -> None:
+        p = dsline.Pipeline()
+        with self.assertRaises(ValueError):
+            p.batch(0)
+
+    # ── select ──
+
+    def test_select_keeps_only_named_columns(self) -> None:
+        p = dsline.Pipeline()
+        p.select(["a", "c"])
+        result = p.collect([{"a": 1, "b": 2, "c": 3}])
+        self.assertEqual(result, [{"a": 1, "c": 3}])
+
+    def test_select_pass_through_scalars(self) -> None:
+        p = dsline.Pipeline()
+        p.select(["a"])
+        result = p.collect([1, 2])
+        self.assertEqual(result, [1, 2])
+
+    def test_select_then_filter_expr(self) -> None:
+        p = dsline.Pipeline()
+        p.select(["score"])
+        p.filter_expr("score > 80")
+        result = p.collect([{"name": "a", "score": 90}, {"name": "b", "score": 70}])
+        self.assertEqual(result, [{"score": 90}])
 
 
 if __name__ == "__main__":

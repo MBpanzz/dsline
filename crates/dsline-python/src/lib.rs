@@ -184,6 +184,11 @@ enum PipelineOp {
     MapExpr(dsline_ops::Expr),
     FilterPy(PyObject),
     MapPy(PyObject),
+    /// Accumulate items into batches of the given size.
+    /// After `Batch`, subsequent operators receive `list` values.
+    Batch(usize),
+    /// Remove all but the named columns from dict items.
+    SelectDict(Vec<String>),
 }
 
 /// A composable pipeline of operators applied to an in-process data source.
@@ -239,6 +244,25 @@ impl PyPipeline {
         self.ops.push(PipelineOp::MapPy(callable));
     }
 
+    /// Group items into batches of `size`.
+    ///
+    /// After this operator, subsequent stages receive Python lists.
+    /// A trailing partial batch is emitted as-is.
+    fn batch(&mut self, size: usize) -> PyResult<()> {
+        if size == 0 {
+            return Err(PyValueError::new_err(
+                "batch size must be greater than zero",
+            ));
+        }
+        self.ops.push(PipelineOp::Batch(size));
+        Ok(())
+    }
+
+    /// Keep only the named columns in each dict item.
+    fn select(&mut self, columns: Vec<String>) {
+        self.ops.push(PipelineOp::SelectDict(columns));
+    }
+
     /// Execute the pipeline against a Python iterable and collect results.
     ///
     /// Each source item passes through all operators in order. Items dropped
@@ -247,45 +271,59 @@ impl PyPipeline {
         let results = PyList::empty_bound(py);
         let mut iter = source.iter()?;
 
-        'outer: loop {
-            let item = match iter.next() {
+        // Locate the batch operator, if any.
+        let batch_idx = self
+            .ops
+            .iter()
+            .position(|op| matches!(op, PipelineOp::Batch(_)));
+        let batch_size = batch_idx.map(|i| match &self.ops[i] {
+            PipelineOp::Batch(n) => *n,
+            _ => unreachable!(),
+        });
+
+        let pre_ops = &self.ops[..batch_idx.unwrap_or(self.ops.len())];
+        let post_ops = &self.ops[batch_idx.map(|i| i + 1).unwrap_or(self.ops.len())..];
+
+        let mut buf: Vec<Item> = Vec::new();
+        let buf_cap = batch_size.unwrap_or(0);
+
+        loop {
+            let py_item = match iter.next() {
                 Some(Ok(v)) => v,
                 Some(Err(e)) => return Err(e),
                 None => break,
             };
 
-            let mut current = Item::from_py(&item)?;
+            // Run pre-batch ops per-item.
+            let item = match run_ops(pre_ops, Item::from_py(&py_item)?, py)? {
+                Some(it) => it,
+                None => continue,
+            };
 
-            for op in &self.ops {
-                match op {
-                    PipelineOp::FilterExpr(ast) => {
-                        let rec = current.as_record();
-                        let keep = dsline_ops::eval_bool(ast, &rec).unwrap_or(false);
-                        if !keep {
-                            continue 'outer;
-                        }
-                    }
-                    PipelineOp::MapExpr(ast) => {
-                        let rec = current.as_record();
-                        let val = dsline_ops::eval(ast, &rec).unwrap_or(f64::NAN);
-                        current = Item::Float(val);
-                    }
-                    PipelineOp::FilterPy(callable) => {
-                        let py_item = current.to_py(py)?;
-                        let result = callable.call1(py, (py_item,))?;
-                        if !result.is_truthy(py)? {
-                            continue 'outer;
-                        }
-                    }
-                    PipelineOp::MapPy(callable) => {
-                        let py_item = current.to_py(py)?;
-                        let result = callable.call1(py, (py_item,))?;
-                        current = Item::from_py(result.bind(py))?;
+            if let Some(n) = batch_size {
+                buf.push(item);
+                if buf.len() >= n {
+                    let chunk = std::mem::replace(&mut buf, Vec::with_capacity(buf_cap));
+                    let batch = Item::Batch(chunk);
+                    if let Some(processed) = run_ops(post_ops, batch, py)? {
+                        results.append(processed.to_py(py)?)?;
                     }
                 }
+            } else {
+                // No batch: run remaining ops directly.
+                if let Some(processed) = run_ops(post_ops, item, py)? {
+                    results.append(processed.to_py(py)?)?;
+                }
             }
+        }
 
-            results.append(current.to_py(py)?)?;
+        // Flush trailing partial batch.
+        if !buf.is_empty() {
+            let remainder = std::mem::take(&mut buf);
+            let batch = Item::Batch(remainder);
+            if let Some(processed) = run_ops(post_ops, batch, py)? {
+                results.append(processed.to_py(py)?)?;
+            }
         }
 
         Ok(results.into())
@@ -300,29 +338,81 @@ impl PyPipeline {
     }
 }
 
+/// Run a slice of ops against an item. Returns `Ok(None)` when a filter
+/// drops the item.
+fn run_ops(ops: &[PipelineOp], mut item: Item, py: Python<'_>) -> PyResult<Option<Item>> {
+    for op in ops {
+        let next = match op {
+            PipelineOp::FilterExpr(ast) => {
+                let rec = item.as_record();
+                let keep = dsline_ops::eval_bool(ast, &rec).unwrap_or(false);
+                if keep {
+                    Some(item)
+                } else {
+                    None
+                }
+            }
+            PipelineOp::MapExpr(ast) => {
+                let rec = item.as_record();
+                let val = dsline_ops::eval(ast, &rec).unwrap_or(f64::NAN);
+                Some(Item::Float(val))
+            }
+            PipelineOp::FilterPy(callable) => {
+                let py_item = item.to_py(py)?;
+                let result = callable.call1(py, (py_item,))?;
+                if result.is_truthy(py)? {
+                    Some(item)
+                } else {
+                    None
+                }
+            }
+            PipelineOp::MapPy(callable) => {
+                let py_item = item.to_py(py)?;
+                let result = callable.call1(py, (py_item,))?;
+                Some(Item::from_py(result.bind(py))?)
+            }
+            PipelineOp::SelectDict(columns) => match &mut item {
+                Item::Dict(map) => {
+                    let keys: Vec<String> = map.keys().cloned().collect();
+                    for k in keys {
+                        if !columns.contains(&k) {
+                            map.remove(&k);
+                        }
+                    }
+                    Some(item)
+                }
+                _ => Some(item),
+            },
+            PipelineOp::Batch(_) => Some(item),
+        };
+        match next {
+            Some(it) => item = it,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(item))
+}
+
 // ── Item: union type for pipeline values ──
 
+#[derive(Clone)]
 enum Item {
     Float(f64),
     Dict(HashMap<String, f64>),
+    /// A batch of items emitted by the `Batch` operator.
+    Batch(Vec<Item>),
 }
 
 impl Item {
     fn from_py(obj: &Bound<'_, PyAny>) -> PyResult<Self> {
-        // dict-like
+        // dict-like — store numeric values, silently skip non-numeric columns.
         if let Ok(dict) = obj.downcast::<PyDict>() {
             let mut map = HashMap::new();
             for (k, v) in dict {
                 let key: String = k.extract()?;
-                let val: f64 = match v.extract::<f64>() {
-                    Ok(f) => f,
-                    Err(_) => {
-                        return Err(PyValueError::new_err(format!(
-                            "pipeline dict value for key '{key}' is not numeric"
-                        )));
-                    }
-                };
-                map.insert(key, val);
+                if let Ok(val) = v.extract::<f64>() {
+                    map.insert(key, val);
+                }
             }
             return Ok(Item::Dict(map));
         }
@@ -344,6 +434,13 @@ impl Item {
                 }
                 Ok(dict.into())
             }
+            Item::Batch(items) => {
+                let list = PyList::empty_bound(py);
+                for item in items {
+                    list.append(item.to_py(py)?)?;
+                }
+                Ok(list.into())
+            }
         }
     }
 
@@ -363,6 +460,7 @@ impl Record for RecordAdapter<'_> {
                 _ => None,
             },
             Item::Dict(map) => map.get(name).copied(),
+            Item::Batch(_) => None,
         }
     }
 }
