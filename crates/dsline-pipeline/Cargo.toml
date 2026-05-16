@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 dsline-core = { path = "../dsline-core" }
+dsline-ops = { path = "../dsline-ops" }
 
 [lints]
 workspace = true

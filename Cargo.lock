@@ -36,6 +36,7 @@ name = "dsline-pipeline"
 version = "0.0.1"
 dependencies = [
  "dsline-core",
+ "dsline-ops",
 ]
 
 [[package]]
