@@ -5,7 +5,7 @@ use dsline_shm::ShmSpscChannel;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyType};
+use pyo3::types::{PyBytes, PyModule, PyType};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -71,9 +71,12 @@ impl ShmChannel {
         })
     }
 
-    fn send(&self, data: &[u8]) -> PyResult<()> {
+    fn send(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes_type = PyModule::import_bound(py, "builtins")?.getattr("bytes")?;
+        let bytes_obj = bytes_type.call1((data,))?;
+        let bytes = bytes_obj.downcast::<PyBytes>()?.as_bytes();
         let mut channel = self.lock_channel()?;
-        channel.send(data).map_err(to_py_err)
+        channel.send(bytes).map_err(to_py_err)
     }
 
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {

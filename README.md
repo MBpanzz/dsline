@@ -27,7 +27,9 @@ import dsline
 
 with dsline.ShmChannel("demo", capacity=4, slot_size=64) as ch:
     ch.send(b"hello")
+    ch.send(memoryview(b"view"))
     assert ch.recv() == b"hello"
+    assert ch.recv() == b"view"
 ```
 
 Zero-copy wording follows the project rule:
@@ -38,7 +40,7 @@ Implemented prototype pieces:
 
 - `dsline-core`: fixed-slot SPSC bytes ring, checksum, Frame header, metadata TLV encode/decode.
 - `dsline-shm`: fixed-slot storage trait, in-memory and file-backed storage backends, region state model, and SPSC bytes channel over `FREE`, `WRITING`, `COMMITTED`, `PINNED`, and `CORRUPTED`.
-- `dsline-python`: PyO3 `ShmChannel` binding over the `dsline-shm` prototype and Python exception exports.
+- `dsline-python`: PyO3 `ShmChannel` binding over the `dsline-shm` prototype, Python exception exports, and `send()` support for bytes-like inputs including `bytes`, `bytearray`, and `memoryview`.
 
 ## CLI
 

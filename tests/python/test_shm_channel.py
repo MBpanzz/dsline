@@ -12,6 +12,18 @@ class ShmChannelTests(unittest.TestCase):
             self.assertEqual(ch.recv(), b"one")
             self.assertEqual(ch.recv(), b"two")
 
+    def test_send_accepts_bytearray(self) -> None:
+        with dsline.ShmChannel("test-bytearray", capacity=1, slot_size=16) as ch:
+            ch.send(bytearray(b"mutable"))
+
+            self.assertEqual(ch.recv(), b"mutable")
+
+    def test_send_accepts_memoryview(self) -> None:
+        with dsline.ShmChannel("test-memoryview", capacity=1, slot_size=16) as ch:
+            ch.send(memoryview(b"view"))
+
+            self.assertEqual(ch.recv(), b"view")
+
     def test_raise_backpressure_maps_exception(self) -> None:
         ch = dsline.ShmChannel(
             "test-full",
