@@ -8,10 +8,10 @@ version = "0.0.1"
 description = "Lightweight local dataflow and shared-memory channels for Python."
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "MIT OR Apache-2.0" }
+license = { text = "MIT" }
 authors = [{ name = "dsline contributors" }]
 dependencies = []
-license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+license-files = ["LICENSE-MIT"]
 
 [project.optional-dependencies]
 numpy = ["numpy>=1.24"]
