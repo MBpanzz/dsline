@@ -349,6 +349,52 @@ impl PyPipeline {
         Ok(results.into())
     }
 
+    /// Run the pipeline against a source and send results to a channel.
+    ///
+    /// Each output item is formatted via `str()` and sent as bytes.
+    /// Returns the number of items sent.
+    fn send_to(
+        &self,
+        py: Python<'_>,
+        source: &Bound<'_, PyAny>,
+        channel: &Bound<'_, ShmChannel>,
+    ) -> PyResult<usize> {
+        let results = self.collect(py, source)?;
+        let list = results.bind(py).downcast::<PyList>()?;
+        let ch = channel.borrow_mut();
+        let mut inner = ch.lock_channel()?;
+        let mut sent = 0usize;
+        for item in list {
+            let s = item.str()?.to_string_lossy().to_string();
+            inner.send(s.as_bytes()).map_err(to_py_err)?;
+            sent += 1;
+        }
+        Ok(sent)
+    }
+
+    /// Drain all items from a channel, apply pipeline operators, and
+    /// return the results as a list.
+    fn receive_from(&self, py: Python<'_>, channel: &Bound<'_, ShmChannel>) -> PyResult<PyObject> {
+        let ch = channel.borrow_mut();
+        let mut inner = ch.lock_channel()?;
+        let mut items: Vec<PyObject> = Vec::new();
+        while let Ok(data) = inner.recv() {
+            let s = String::from_utf8_lossy(&data).to_string();
+            if s.is_empty() {
+                continue;
+            }
+            if let Ok(v) = s.parse::<f64>() {
+                items.push(v.to_object(py));
+            } else {
+                items.push(s.to_object(py));
+            }
+        }
+        drop(inner);
+        drop(ch);
+
+        self.collect(py, PyList::new_bound(py, &items).as_any())
+    }
+
     fn __repr__(&self) -> String {
         if self.ops.is_empty() {
             "Pipeline(empty)".into()

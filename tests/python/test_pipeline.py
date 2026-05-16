@@ -341,6 +341,45 @@ class PipelineTests(unittest.TestCase):
         with self.assertRaises(ZeroDivisionError):
             p.collect([1, 2])
 
+    # ── channel integration ──
+
+    def test_send_to_and_receive_from_roundtrip(self) -> None:
+        ch = dsline.ShmChannel("test-rt", capacity=8, slot_size=64)
+        p1 = dsline.Pipeline()
+        p1.filter_expr("x > 2")
+        p1.map_expr("x * 10")
+        sent = p1.send_to([1, 2, 3, 4, 5], ch)
+        self.assertEqual(sent, 3)
+
+        p2 = dsline.Pipeline()
+        result = p2.receive_from(ch)
+        self.assertEqual(result, [30.0, 40.0, 50.0])
+
+    def test_send_to_no_ops(self) -> None:
+        ch = dsline.ShmChannel("test-noop", capacity=4, slot_size=32)
+        p = dsline.Pipeline()
+        sent = p.send_to([1.5, 2.5], ch)
+        self.assertEqual(sent, 2)
+
+        result = p.receive_from(ch)
+        self.assertEqual(result, [1.5, 2.5])
+
+    def test_receive_from_empty_channel(self) -> None:
+        ch = dsline.ShmChannel("test-empty-recv", capacity=4, slot_size=32)
+        p = dsline.Pipeline()
+        result = p.receive_from(ch)
+        self.assertEqual(result, [])
+
+    def test_send_then_filter_on_receive(self) -> None:
+        ch = dsline.ShmChannel("test-send-filter-recv", capacity=8, slot_size=64)
+        p1 = dsline.Pipeline()
+        p1.send_to([1, 2, 3, 4, 5, 6], ch)
+
+        p2 = dsline.Pipeline()
+        p2.filter_expr("x > 3")
+        result = p2.receive_from(ch)
+        self.assertEqual(result, [4.0, 5.0, 6.0])
+
 
 if __name__ == "__main__":
     unittest.main()
