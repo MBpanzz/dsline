@@ -5,7 +5,7 @@ use dsline_shm::ShmSpscChannel;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyModule, PyType};
+use pyo3::types::{PyBytes, PyDict, PyModule, PyType};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -118,6 +118,29 @@ impl ShmChannel {
     #[getter]
     fn capacity(&self) -> PyResult<usize> {
         Ok(self.lock_channel()?.capacity())
+    }
+
+    #[getter]
+    fn slot_size(&self) -> PyResult<usize> {
+        Ok(self.lock_channel()?.payload_slot_size())
+    }
+
+    #[getter]
+    fn empty(&self) -> PyResult<bool> {
+        Ok(self.lock_channel()?.is_empty())
+    }
+
+    fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let channel = self.lock_channel()?;
+        let stats = PyDict::new_bound(py);
+        stats.set_item("name", &self.name)?;
+        stats.set_item("backend", "inprocess-prototype")?;
+        stats.set_item("queue_depth", channel.len())?;
+        stats.set_item("queue_capacity", channel.capacity())?;
+        stats.set_item("slot_size", channel.payload_slot_size())?;
+        stats.set_item("closed", channel.is_closed())?;
+        stats.set_item("empty", channel.is_empty())?;
+        Ok(stats)
     }
 
     fn __len__(&self) -> PyResult<usize> {

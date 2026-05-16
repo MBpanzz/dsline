@@ -42,6 +42,29 @@ class ShmChannelTests(unittest.TestCase):
 
         self.assertTrue(ch.closed)
 
+    def test_channel_state_properties_and_stats(self) -> None:
+        ch = dsline.ShmChannel("test-stats", capacity=3, slot_size=16)
+
+        self.assertEqual(ch.capacity, 3)
+        self.assertEqual(ch.slot_size, 16)
+        self.assertTrue(ch.empty)
+        self.assertEqual(len(ch), 0)
+
+        ch.send(b"one")
+        stats = ch.stats()
+
+        self.assertEqual(stats["name"], "test-stats")
+        self.assertEqual(stats["backend"], "inprocess-prototype")
+        self.assertEqual(stats["queue_depth"], 1)
+        self.assertEqual(stats["queue_capacity"], 3)
+        self.assertEqual(stats["slot_size"], 16)
+        self.assertFalse(stats["closed"])
+        self.assertFalse(stats["empty"])
+        self.assertEqual(len(ch), 1)
+
+        self.assertEqual(ch.recv(), b"one")
+        self.assertTrue(ch.empty)
+
 
 if __name__ == "__main__":
     unittest.main()
