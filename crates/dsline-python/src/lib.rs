@@ -16,6 +16,7 @@ create_exception!(_dsline, BufferFullError, ChannelErrorPy);
 create_exception!(_dsline, BufferEmptyError, ChannelErrorPy);
 create_exception!(_dsline, MessageTooLargeError, ChannelErrorPy);
 create_exception!(_dsline, CorruptedMessageError, ChannelErrorPy);
+create_exception!(_dsline, SequenceMismatchError, ChannelErrorPy);
 
 #[pyclass]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +86,12 @@ impl ShmChannel {
         Ok(PyBytes::new_bound(py, &data))
     }
 
+    fn recv_with_seq<'py>(&self, py: Python<'py>) -> PyResult<(u64, Bound<'py, PyBytes>)> {
+        let mut channel = self.lock_channel()?;
+        let message = channel.recv_with_seq().map_err(to_py_err)?;
+        Ok((message.seq, PyBytes::new_bound(py, &message.payload)))
+    }
+
     fn close(&self) -> PyResult<()> {
         let mut channel = self.lock_channel()?;
         channel.close();
@@ -138,6 +145,9 @@ impl ShmChannel {
         stats.set_item("queue_depth", channel.len())?;
         stats.set_item("queue_capacity", channel.capacity())?;
         stats.set_item("slot_size", channel.payload_slot_size())?;
+        stats.set_item("next_sequence", channel.next_sequence())?;
+        stats.set_item("expected_recv_sequence", channel.expected_recv_sequence())?;
+        stats.set_item("last_received_sequence", channel.last_received_sequence())?;
         stats.set_item("closed", channel.is_closed())?;
         stats.set_item("empty", channel.is_empty())?;
         Ok(stats)
@@ -169,6 +179,9 @@ fn to_py_err(err: DslineError) -> PyErr {
         DslineError::Channel(ChannelError::CorruptedMessage) => {
             CorruptedMessageError::new_err(err.to_string())
         }
+        DslineError::Channel(ChannelError::SequenceMismatch { .. }) => {
+            SequenceMismatchError::new_err(err.to_string())
+        }
         DslineError::Channel(ChannelError::InvalidConfig(_)) => {
             PyValueError::new_err(err.to_string())
         }
@@ -198,6 +211,10 @@ fn _dsline(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add(
         "CorruptedMessageError",
         _py.get_type_bound::<CorruptedMessageError>(),
+    )?;
+    module.add(
+        "SequenceMismatchError",
+        _py.get_type_bound::<SequenceMismatchError>(),
     )?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

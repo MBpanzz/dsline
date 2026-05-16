@@ -15,6 +15,7 @@ pub enum ChannelError {
     BufferEmpty,
     MessageTooLarge { len: usize, slot_size: usize },
     CorruptedMessage,
+    SequenceMismatch { expected: u64, actual: u64 },
     InvalidConfig(&'static str),
     StorageIo(&'static str),
 }
@@ -50,6 +51,12 @@ impl fmt::Display for ChannelError {
                 write!(f, "message length {len} exceeds slot size {slot_size}")
             }
             Self::CorruptedMessage => write!(f, "message checksum validation failed"),
+            Self::SequenceMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "message sequence mismatch: expected {expected}, got {actual}"
+                )
+            }
             Self::InvalidConfig(msg) => write!(f, "invalid channel config: {msg}"),
             Self::StorageIo(msg) => write!(f, "storage I/O error: {msg}"),
         }

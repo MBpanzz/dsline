@@ -12,6 +12,14 @@ class ShmChannelTests(unittest.TestCase):
             self.assertEqual(ch.recv(), b"one")
             self.assertEqual(ch.recv(), b"two")
 
+    def test_recv_with_seq_returns_sequence_and_payload(self) -> None:
+        with dsline.ShmChannel("test-seq", capacity=2, slot_size=16) as ch:
+            ch.send(b"one")
+            ch.send(b"two")
+
+            self.assertEqual(ch.recv_with_seq(), (0, b"one"))
+            self.assertEqual(ch.recv_with_seq(), (1, b"two"))
+
     def test_send_accepts_bytearray(self) -> None:
         with dsline.ShmChannel("test-bytearray", capacity=1, slot_size=16) as ch:
             ch.send(bytearray(b"mutable"))
@@ -58,11 +66,17 @@ class ShmChannelTests(unittest.TestCase):
         self.assertEqual(stats["queue_depth"], 1)
         self.assertEqual(stats["queue_capacity"], 3)
         self.assertEqual(stats["slot_size"], 16)
+        self.assertEqual(stats["next_sequence"], 1)
+        self.assertEqual(stats["expected_recv_sequence"], 0)
+        self.assertIsNone(stats["last_received_sequence"])
         self.assertFalse(stats["closed"])
         self.assertFalse(stats["empty"])
         self.assertEqual(len(ch), 1)
 
         self.assertEqual(ch.recv(), b"one")
+        stats = ch.stats()
+        self.assertEqual(stats["expected_recv_sequence"], 1)
+        self.assertEqual(stats["last_received_sequence"], 0)
         self.assertTrue(ch.empty)
 
 

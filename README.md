@@ -29,7 +29,7 @@ with dsline.ShmChannel("demo", capacity=4, slot_size=64) as ch:
     ch.send(b"hello")
     ch.send(memoryview(b"view"))
     assert ch.stats()["queue_depth"] == 2
-    assert ch.recv() == b"hello"
+    assert ch.recv_with_seq() == (0, b"hello")
     assert ch.recv() == b"view"
 ```
 
@@ -41,7 +41,7 @@ Implemented prototype pieces:
 
 - `dsline-core`: fixed-slot SPSC bytes ring, checksum, Frame header, metadata TLV encode/decode.
 - `dsline-shm`: fixed-slot storage trait, in-memory and file-backed storage backends, region state model, and SPSC bytes channel over `FREE`, `WRITING`, `COMMITTED`, `PINNED`, and `CORRUPTED`.
-- `dsline-python`: PyO3 `ShmChannel` binding over the `dsline-shm` prototype, Python exception exports, `send()` support for bytes-like inputs, and basic `stats()`.
+- `dsline-python`: PyO3 `ShmChannel` binding over the `dsline-shm` prototype, Python exception exports, `send()` support for bytes-like inputs, `recv_with_seq()`, and basic `stats()`.
 
 ## CLI
 

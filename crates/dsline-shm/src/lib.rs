@@ -33,6 +33,12 @@ pub struct SlotSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedMessage {
+    pub seq: u64,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FixedSlot {
     state: SlotState,
     seq: u64,
@@ -420,6 +426,14 @@ impl<S: FixedSlotStorage> FixedSlotRegion<S> {
             .expect("write corrupted data");
     }
 
+    #[cfg(test)]
+    fn overwrite_frame_seq_for_test(&mut self, index: usize, seq: u64) -> Result<()> {
+        let payload_len = self.slot(index)?.payload_len;
+        let mut data = self.storage.read_slot(index, payload_len)?;
+        data[22..30].copy_from_slice(&seq.to_le_bytes());
+        self.storage.write_slot(index, &data)
+    }
+
     fn slot(&self, index: usize) -> Result<&FixedSlot> {
         self.slots
             .get(index)
@@ -441,6 +455,8 @@ pub struct ShmSpscChannel<S: FixedSlotStorage = MemorySlotStorage> {
     tail: usize,
     len: usize,
     next_seq: u64,
+    expected_recv_seq: u64,
+    last_received_seq: Option<u64>,
     closed: bool,
 }
 
@@ -477,6 +493,8 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
             tail: 0,
             len: 0,
             next_seq: 0,
+            expected_recv_seq: 0,
+            last_received_seq: None,
             closed: false,
         })
     }
@@ -511,6 +529,10 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
     }
 
     pub fn recv(&mut self) -> Result<Vec<u8>> {
+        Ok(self.recv_with_seq()?.payload)
+    }
+
+    pub fn recv_with_seq(&mut self) -> Result<ReceivedMessage> {
         if self.closed && self.len == 0 {
             return Err(ChannelError::Closed.into());
         }
@@ -524,6 +546,15 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
         self.tail = (self.tail + 1) % self.config.capacity;
         self.len -= 1;
 
+        if snapshot.seq != self.expected_recv_seq {
+            return Err(ChannelError::SequenceMismatch {
+                expected: self.expected_recv_seq,
+                actual: snapshot.seq,
+            }
+            .into());
+        }
+        self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
+
         let frame = decoded?;
         if frame.header.kind != FrameKind::Bytes
             || checksum32(&frame.payload) != frame.header.checksum
@@ -531,7 +562,21 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
             return Err(ChannelError::CorruptedMessage.into());
         }
 
-        Ok(frame.payload)
+        if snapshot.seq != frame.header.seq {
+            return Err(ChannelError::SequenceMismatch {
+                expected: snapshot.seq,
+                actual: frame.header.seq,
+            }
+            .into());
+        }
+
+        let seq = frame.header.seq;
+        self.last_received_seq = Some(seq);
+
+        Ok(ReceivedMessage {
+            seq,
+            payload: frame.payload,
+        })
     }
 
     pub fn close(&mut self) {
@@ -562,6 +607,18 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
         self.region.slot_size()
     }
 
+    pub fn next_sequence(&self) -> u64 {
+        self.next_seq
+    }
+
+    pub fn expected_recv_sequence(&self) -> u64 {
+        self.expected_recv_seq
+    }
+
+    pub fn last_received_sequence(&self) -> Option<u64> {
+        self.last_received_seq
+    }
+
     fn wait_for_space(&self) -> Result<()> {
         if self.len < self.config.capacity {
             return Ok(());
@@ -582,6 +639,23 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
     #[cfg(test)]
     fn corrupt_tail_checksum_for_test(&mut self) {
         self.region.corrupt_checksum_for_test(self.tail);
+    }
+
+    #[cfg(test)]
+    fn corrupt_tail_frame_seq_for_test(&mut self, seq: u64) {
+        self.region
+            .overwrite_frame_seq_for_test(self.tail, seq)
+            .expect("tail slot exists");
+    }
+
+    #[cfg(test)]
+    fn set_next_sequence_for_test(&mut self, seq: u64) {
+        self.next_seq = seq;
+    }
+
+    #[cfg(test)]
+    fn set_expected_recv_sequence_for_test(&mut self, seq: u64) {
+        self.expected_recv_seq = seq;
     }
 }
 
@@ -693,6 +767,41 @@ mod tests {
     }
 
     #[test]
+    fn channel_returns_sequence_with_message() {
+        let mut channel = channel(2, 16);
+
+        channel.send(b"one").expect("send one");
+        channel.send(b"two").expect("send two");
+
+        let first = channel.recv_with_seq().expect("recv one");
+        let second = channel.recv_with_seq().expect("recv two");
+
+        assert_eq!(first.seq, 0);
+        assert_eq!(first.payload, b"one");
+        assert_eq!(second.seq, 1);
+        assert_eq!(second.payload, b"two");
+        assert_eq!(channel.next_sequence(), 2);
+        assert_eq!(channel.expected_recv_sequence(), 2);
+        assert_eq!(channel.last_received_sequence(), Some(1));
+    }
+
+    #[test]
+    fn channel_sequence_wraps() {
+        let mut channel = channel(2, 16);
+        channel.set_next_sequence_for_test(u64::MAX);
+        channel.set_expected_recv_sequence_for_test(u64::MAX);
+
+        channel.send(b"last").expect("send max");
+        channel.send(b"zero").expect("send wrapped");
+
+        assert_eq!(channel.next_sequence(), 1);
+        assert_eq!(channel.recv_with_seq().expect("recv max").seq, u64::MAX);
+        assert_eq!(channel.recv_with_seq().expect("recv zero").seq, 0);
+        assert_eq!(channel.expected_recv_sequence(), 1);
+        assert_eq!(channel.last_received_sequence(), Some(0));
+    }
+
+    #[test]
     fn channel_wraps_head_and_tail() {
         let mut channel = channel(2, 16);
 
@@ -784,6 +893,22 @@ mod tests {
         assert!(channel.is_empty());
         channel.send(b"two").expect("slot reusable");
         assert_eq!(channel.recv().expect("recv two"), b"two");
+    }
+
+    #[test]
+    fn channel_rejects_frame_sequence_mismatch() {
+        let mut channel = channel(1, 16);
+        channel.send(b"one").expect("send one");
+        channel.corrupt_tail_frame_seq_for_test(7);
+
+        assert_eq!(
+            channel.recv().expect_err("sequence mismatch"),
+            DslineError::Channel(ChannelError::SequenceMismatch {
+                expected: 0,
+                actual: 7
+            })
+        );
+        assert!(channel.is_empty());
     }
 
     #[test]

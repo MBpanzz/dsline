@@ -10,6 +10,7 @@ try:
         CorruptedMessageError,
         DslineError,
         MessageTooLargeError,
+        SequenceMismatchError,
         ShmChannel,
         __version__,
     )
@@ -27,6 +28,7 @@ __all__ = [
     "CorruptedMessageError",
     "DslineError",
     "MessageTooLargeError",
+    "SequenceMismatchError",
     "ShmChannel",
     "__version__",
 ]
