@@ -282,6 +282,65 @@ class PipelineTests(unittest.TestCase):
         result = p.collect([{"name": "a", "score": 90}, {"name": "b", "score": 70}])
         self.assertEqual(result, [{"score": 90}])
 
+    # ── map_py_batch / filter_py_batch ──
+
+    def test_map_py_batch_operates_per_element(self) -> None:
+        p = dsline.Pipeline()
+        p.batch(3)
+        p.map_py_batch(lambda x: x * 2)
+        result = p.collect([1, 2, 3, 4, 5, 6])
+        self.assertEqual(result, [[2, 4, 6], [8, 10, 12]])
+
+    def test_filter_py_batch_removes_elements(self) -> None:
+        p = dsline.Pipeline()
+        p.batch(4)
+        p.filter_py_batch(lambda x: x > 3)
+        result = p.collect([1, 2, 3, 4])
+        self.assertEqual(result, [[4]])
+
+    def test_map_then_filter_py_batch_chain(self) -> None:
+        p = dsline.Pipeline()
+        p.batch(3)
+        p.map_py_batch(lambda x: x * 10)
+        p.filter_py_batch(lambda x: x > 15)
+        result = p.collect([1, 2, 3, 4, 5, 6])
+        self.assertEqual(result, [[20, 30], [40, 50, 60]])
+
+    def test_map_py_batch_without_prior_batch(self) -> None:
+        # Falls back to per-item behavior.
+        p = dsline.Pipeline()
+        p.map_py_batch(lambda x: x * 2)
+        result = p.collect([1, 2, 3])
+        self.assertEqual(result, [2, 4, 6])
+
+    def test_filter_py_batch_without_prior_batch(self) -> None:
+        p = dsline.Pipeline()
+        p.filter_py_batch(lambda x: x > 2)
+        result = p.collect([1, 2, 3])
+        self.assertEqual(result, [3])
+
+    def test_batch_map_py_batch_then_regular_map_py(self) -> None:
+        p = dsline.Pipeline()
+        p.batch(2)
+        p.map_py_batch(lambda x: x + 1)
+        p.map_py(lambda batch: sum(batch))
+        result = p.collect([1, 2, 3, 4])
+        self.assertEqual(result, [5, 9])  # (1+1)+(2+1)=5, (3+1)+(4+1)=9
+
+    def test_map_py_batch_on_dicts(self) -> None:
+        p = dsline.Pipeline()
+        p.batch(2)
+        p.map_py_batch(lambda d: d["val"] * 2)
+        result = p.collect([{"val": 1}, {"val": 2}, {"val": 3}])
+        self.assertEqual(result, [[2, 4], [6]])
+
+    def test_filter_py_batch_raises_propagates(self) -> None:
+        p = dsline.Pipeline()
+        p.batch(2)
+        p.filter_py_batch(lambda x: 1 / 0)
+        with self.assertRaises(ZeroDivisionError):
+            p.collect([1, 2])
+
 
 if __name__ == "__main__":
     unittest.main()

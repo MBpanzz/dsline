@@ -184,8 +184,11 @@ enum PipelineOp {
     MapExpr(dsline_ops::Expr),
     FilterPy(PyObject),
     MapPy(PyObject),
+    /// Apply a per-element callable inside a batch, reassemble results.
+    MapPyBatch(PyObject),
+    /// Filter elements inside a batch with a per-element callable.
+    FilterPyBatch(PyObject),
     /// Accumulate items into batches of the given size.
-    /// After `Batch`, subsequent operators receive `list` values.
     Batch(usize),
     /// Remove all but the named columns from dict items.
     SelectDict(Vec<String>),
@@ -242,6 +245,23 @@ impl PyPipeline {
     /// The callable receives one item and should return the transformed value.
     fn map_py(&mut self, callable: PyObject) {
         self.ops.push(PipelineOp::MapPy(callable));
+    }
+
+    /// Add a Python-callable map stage that operates per-element inside a batch.
+    ///
+    /// The callable receives a single element from each batch. The Rust
+    /// side iterates over the batch, calls the function per element, and
+    /// reassembles the results into a new batch.
+    fn map_py_batch(&mut self, callable: PyObject) {
+        self.ops.push(PipelineOp::MapPyBatch(callable));
+    }
+
+    /// Add a Python-callable filter stage that operates per-element inside a batch.
+    ///
+    /// The callable receives a single element and returns truthy/falsy.
+    /// Elements returning falsy are removed from the batch.
+    fn filter_py_batch(&mut self, callable: PyObject) {
+        self.ops.push(PipelineOp::FilterPyBatch(callable));
     }
 
     /// Group items into batches of `size`.
@@ -370,6 +390,50 @@ fn run_ops(ops: &[PipelineOp], mut item: Item, py: Python<'_>) -> PyResult<Optio
                 let py_item = item.to_py(py)?;
                 let result = callable.call1(py, (py_item,))?;
                 Some(Item::from_py(result.bind(py))?)
+            }
+            PipelineOp::MapPyBatch(callable) => {
+                match &item {
+                    Item::Batch(elements) => {
+                        let mut results = Vec::with_capacity(elements.len());
+                        for elem in elements {
+                            let py_elem = elem.to_py(py)?;
+                            let result = callable.call1(py, (py_elem,))?;
+                            results.push(Item::from_py(result.bind(py))?);
+                        }
+                        Some(Item::Batch(results))
+                    }
+                    _ => {
+                        // Not a batch — treat as regular map_py.
+                        let py_item = item.to_py(py)?;
+                        let result = callable.call1(py, (py_item,))?;
+                        Some(Item::from_py(result.bind(py))?)
+                    }
+                }
+            }
+            PipelineOp::FilterPyBatch(callable) => {
+                match &item {
+                    Item::Batch(elements) => {
+                        let mut kept = Vec::with_capacity(elements.len());
+                        for elem in elements {
+                            let py_elem = elem.to_py(py)?;
+                            let result = callable.call1(py, (py_elem,))?;
+                            if result.is_truthy(py)? {
+                                kept.push(elem.clone());
+                            }
+                        }
+                        Some(Item::Batch(kept))
+                    }
+                    _ => {
+                        // Not a batch — treat as regular filter_py.
+                        let py_item = item.to_py(py)?;
+                        let result = callable.call1(py, (py_item,))?;
+                        if result.is_truthy(py)? {
+                            Some(item)
+                        } else {
+                            None
+                        }
+                    }
+                }
             }
             PipelineOp::SelectDict(columns) => match &mut item {
                 Item::Dict(map) => {
