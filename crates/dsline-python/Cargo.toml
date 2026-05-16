@@ -15,6 +15,7 @@ dsline-core = { path = "../dsline-core" }
 dsline-shm = { path = "../dsline-shm" }
 dsline-pipeline = { path = "../dsline-pipeline" }
 dsline-ops = { path = "../dsline-ops" }
+dsline-transport = { path = "../dsline-transport" }
 pyo3 = { version = "0.21", features = ["abi3-py39", "extension-module"] }
 
 [lints]

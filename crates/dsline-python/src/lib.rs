@@ -283,6 +283,27 @@ impl PyPipeline {
         self.ops.push(PipelineOp::SelectDict(columns));
     }
 
+    /// Parse a transport URL and return the scheme and target.
+    ///
+    /// Returns `(scheme, target, params)` where params is a dict of query
+    /// parameters. Used by `from_transport` to decide how to connect.
+    #[staticmethod]
+    fn parse_transport_url(url: &str) -> PyResult<(String, String, PyObject)> {
+        let parsed: dsline_transport::TransportUrl = url
+            .parse()
+            .map_err(|e: DslineError| PyValueError::new_err(e.to_string()))?;
+        let py = unsafe { Python::assume_gil_acquired() };
+        let params = PyDict::new_bound(py);
+        for (k, v) in parsed.query_pairs() {
+            params.set_item(k, v)?;
+        }
+        Ok((
+            parsed.scheme.to_string(),
+            parsed.target().to_string(),
+            params.into(),
+        ))
+    }
+
     /// Execute the pipeline against a Python iterable and collect results.
     ///
     /// Each source item passes through all operators in order. Items dropped

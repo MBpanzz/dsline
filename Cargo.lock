@@ -47,6 +47,7 @@ dependencies = [
  "dsline-ops",
  "dsline-pipeline",
  "dsline-shm",
+ "dsline-transport",
  "pyo3",
 ]
 
