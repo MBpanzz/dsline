@@ -5,6 +5,7 @@ pub type Result<T> = std::result::Result<T, DslineError>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DslineError {
     Channel(ChannelError),
+    Transport(TransportError),
     Protocol(ProtocolError),
 }
 
@@ -32,10 +33,21 @@ pub enum ProtocolError {
     HeaderLengthOverflow,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportError {
+    EmptyUrl,
+    MissingScheme,
+    UnsupportedScheme(String),
+    MissingTarget(&'static str),
+    InvalidPort(String),
+    InvalidQuery(String),
+}
+
 impl fmt::Display for DslineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Channel(err) => write!(f, "{err}"),
+            Self::Transport(err) => write!(f, "{err}"),
             Self::Protocol(err) => write!(f, "{err}"),
         }
     }
@@ -97,6 +109,21 @@ impl fmt::Display for ProtocolError {
     }
 }
 
+impl fmt::Display for TransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyUrl => write!(f, "transport URL is empty"),
+            Self::MissingScheme => write!(f, "transport URL is missing a scheme"),
+            Self::UnsupportedScheme(scheme) => {
+                write!(f, "unsupported transport scheme: {scheme}")
+            }
+            Self::MissingTarget(kind) => write!(f, "transport URL is missing {kind}"),
+            Self::InvalidPort(port) => write!(f, "invalid transport port: {port}"),
+            Self::InvalidQuery(query) => write!(f, "invalid transport query: {query}"),
+        }
+    }
+}
+
 impl std::error::Error for DslineError {}
 
 impl From<ChannelError> for DslineError {
@@ -108,5 +135,11 @@ impl From<ChannelError> for DslineError {
 impl From<ProtocolError> for DslineError {
     fn from(value: ProtocolError) -> Self {
         Self::Protocol(value)
+    }
+}
+
+impl From<TransportError> for DslineError {
+    fn from(value: TransportError) -> Self {
+        Self::Transport(value)
     }
 }
