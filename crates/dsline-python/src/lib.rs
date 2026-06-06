@@ -30,6 +30,8 @@ create_exception!(_dsline, PipelineBuildError, DslineErrorPy);
 enum Backpressure {
     Block,
     Raise,
+    DropNewest,
+    DropOldest,
 }
 
 impl From<Backpressure> for CoreBackpressure {
@@ -37,6 +39,8 @@ impl From<Backpressure> for CoreBackpressure {
         match value {
             Backpressure::Block => Self::Block,
             Backpressure::Raise => Self::Raise,
+            Backpressure::DropNewest => Self::DropNewest,
+            Backpressure::DropOldest => Self::DropOldest,
         }
     }
 }
@@ -63,16 +67,8 @@ impl ShmChannel {
         if name.trim().is_empty() {
             return Err(PyValueError::new_err("channel name must not be empty"));
         }
-        if matches!(timeout, Some(value) if value < 0.0) {
-            return Err(PyValueError::new_err("timeout must be non-negative"));
-        }
 
-        let config = SpscConfig {
-            capacity,
-            slot_size,
-            backpressure: backpressure.into(),
-            timeout: timeout.map(Duration::from_secs_f64),
-        };
+        let config = channel_config(capacity, slot_size, backpressure, timeout)?;
         let channel = ShmSpscChannel::new(config).map_err(to_py_err)?;
 
         Ok(Self {
@@ -154,6 +150,7 @@ impl ShmChannel {
         stats.set_item("queue_depth", channel.len())?;
         stats.set_item("queue_capacity", channel.capacity())?;
         stats.set_item("slot_size", channel.payload_slot_size())?;
+        set_message_size_limit_items(&stats, channel.message_size_limits())?;
         stats.set_item("next_sequence", channel.next_sequence())?;
         stats.set_item("expected_recv_sequence", channel.expected_recv_sequence())?;
         stats.set_item("last_received_sequence", channel.last_received_sequence())?;
@@ -175,6 +172,34 @@ impl ShmChannel {
     }
 }
 
+fn channel_config(
+    capacity: usize,
+    slot_size: usize,
+    backpressure: Backpressure,
+    timeout: Option<f64>,
+) -> PyResult<SpscConfig> {
+    if matches!(timeout, Some(value) if value < 0.0) {
+        return Err(PyValueError::new_err("timeout must be non-negative"));
+    }
+
+    Ok(SpscConfig {
+        capacity,
+        slot_size,
+        backpressure: backpressure.into(),
+        timeout: timeout.map(Duration::from_secs_f64),
+    })
+}
+
+fn set_message_size_limit_items(
+    stats: &Bound<'_, PyDict>,
+    limits: dsline_shm::MessageSizeLimits,
+) -> PyResult<()> {
+    stats.set_item("chunk_metadata_size", limits.chunk_metadata_size)?;
+    stats.set_item("chunk_payload_size", limits.chunk_payload_size)?;
+    stats.set_item("max_message_size", limits.max_message_size)?;
+    Ok(())
+}
+
 // ── FileChannel (file-backed, cross-process) ──
 
 /// A file-backed channel that can be shared across processes.
@@ -191,13 +216,15 @@ struct FileChannel {
 impl FileChannel {
     /// Create a new file-backed channel, initialising the backing file.
     #[staticmethod]
-    fn create(path: String, capacity: usize, slot_size: usize) -> PyResult<Self> {
-        let config = SpscConfig {
-            capacity,
-            slot_size,
-            backpressure: CoreBackpressure::Raise,
-            timeout: None,
-        };
+    #[pyo3(signature = (path, capacity, slot_size, backpressure=Backpressure::Raise, timeout=None))]
+    fn create(
+        path: String,
+        capacity: usize,
+        slot_size: usize,
+        backpressure: Backpressure,
+        timeout: Option<f64>,
+    ) -> PyResult<Self> {
+        let config = channel_config(capacity, slot_size, backpressure, timeout)?;
         let channel = PersistentShmChannel::create(&path, config).map_err(to_py_err)?;
         Ok(Self {
             path,
@@ -207,13 +234,15 @@ impl FileChannel {
 
     /// Open an existing file-backed channel.
     #[staticmethod]
-    fn open(path: String, capacity: usize, slot_size: usize) -> PyResult<Self> {
-        let config = SpscConfig {
-            capacity,
-            slot_size,
-            backpressure: CoreBackpressure::Raise,
-            timeout: None,
-        };
+    #[pyo3(signature = (path, capacity, slot_size, backpressure=Backpressure::Raise, timeout=None))]
+    fn open(
+        path: String,
+        capacity: usize,
+        slot_size: usize,
+        backpressure: Backpressure,
+        timeout: Option<f64>,
+    ) -> PyResult<Self> {
+        let config = channel_config(capacity, slot_size, backpressure, timeout)?;
         let channel = PersistentShmChannel::open(&path, config).map_err(to_py_err)?;
         Ok(Self {
             path,
@@ -221,12 +250,15 @@ impl FileChannel {
         })
     }
 
-    fn send(&self, data: Vec<u8>) -> PyResult<()> {
+    fn send(&self, py: Python<'_>, data: &Bound<'_, PyAny>) -> PyResult<()> {
+        let bytes_type = PyModule::import_bound(py, "builtins")?.getattr("bytes")?;
+        let bytes_obj = bytes_type.call1((data,))?;
+        let bytes = bytes_obj.downcast::<PyBytes>()?.as_bytes();
         let mut channel = self
             .channel
             .lock()
             .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
-        channel.send(&data).map_err(to_py_err)
+        channel.send(bytes).map_err(to_py_err)
     }
 
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
@@ -236,6 +268,15 @@ impl FileChannel {
             .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
         let data = channel.recv().map_err(to_py_err)?;
         Ok(PyBytes::new_bound(py, &data))
+    }
+
+    fn recv_with_seq<'py>(&self, py: Python<'py>) -> PyResult<(u64, Bound<'py, PyBytes>)> {
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+        let message = channel.recv_with_seq().map_err(to_py_err)?;
+        Ok((message.seq, PyBytes::new_bound(py, &message.payload)))
     }
 
     fn close(&self) -> PyResult<()> {
@@ -275,6 +316,15 @@ impl FileChannel {
             .is_closed())
     }
 
+    #[getter]
+    fn empty(&self) -> PyResult<bool> {
+        Ok(self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?
+            .is_empty())
+    }
+
     fn stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let channel = self
             .channel
@@ -283,10 +333,24 @@ impl FileChannel {
         let stats = PyDict::new_bound(py);
         stats.set_item("path", &self.path)?;
         stats.set_item("backend", "file")?;
-        stats.set_item("capacity", channel.capacity())?;
+        stats.set_item("queue_depth", channel.len())?;
+        stats.set_item("queue_capacity", channel.capacity())?;
         stats.set_item("slot_size", channel.payload_slot_size())?;
+        set_message_size_limit_items(&stats, channel.message_size_limits())?;
+        stats.set_item("next_sequence", channel.next_sequence())?;
+        stats.set_item("expected_recv_sequence", channel.expected_recv_sequence())?;
+        stats.set_item("last_received_sequence", channel.last_received_sequence())?;
         stats.set_item("closed", channel.is_closed())?;
+        stats.set_item("empty", channel.is_empty())?;
         Ok(stats)
+    }
+
+    fn __len__(&self) -> PyResult<usize> {
+        Ok(self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?
+            .len())
     }
 }
 

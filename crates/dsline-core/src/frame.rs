@@ -5,6 +5,13 @@ pub const FRAME_MAGIC: u32 = 0x4453_4c4e;
 pub const FRAME_VERSION: u16 = 1;
 pub const FRAME_HEADER_LEN: usize = 50;
 pub const TLV_HEADER_LEN: usize = 6;
+pub const FRAME_FLAG_CHUNKED: u16 = 0x0001;
+pub const FRAME_FLAG_CHUNK_START: u16 = 0x0002;
+pub const FRAME_FLAG_CHUNK_END: u16 = 0x0004;
+pub const TLV_CHUNK_INDEX: u16 = 100;
+pub const TLV_CHUNK_TOTAL: u16 = 101;
+pub const TLV_CHUNK_MESSAGE_LEN: u16 = 102;
+pub const CHUNK_METADATA_LEN: usize = (TLV_HEADER_LEN + std::mem::size_of::<u64>()) * 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]

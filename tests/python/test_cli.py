@@ -16,6 +16,8 @@ class InfoTests(unittest.TestCase):
         self.assertEqual(info["zero_copy_alloc_publish"], "unavailable")
         self.assertIn("memory", info["storage_backends"])
         self.assertIn("file", info["storage_backends"])
+        self.assertIn("DROP_NEWEST", info["backpressure_strategies"])
+        self.assertIn("DROP_OLDEST", info["backpressure_strategies"])
 
     def test_info_json_format_is_parseable(self) -> None:
         info = get_info()

@@ -13,6 +13,7 @@ def get_info() -> dict[str, Any]:
         "platform": platform.platform(),
         "channel_backend": "inprocess-prototype",
         "storage_backends": ["memory", "file"],
+        "backpressure_strategies": ["BLOCK", "RAISE", "DROP_NEWEST", "DROP_OLDEST"],
         "zero_copy_alloc_publish": "unavailable",
     }
 

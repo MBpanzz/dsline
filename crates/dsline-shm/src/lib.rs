@@ -4,8 +4,10 @@
 //! API is intentionally conservative until ADR-001 is accepted.
 
 use dsline_core::{
-    checksum::checksum32, decode_frame, encode_frame, Backpressure, ChannelError, FrameKind,
-    Result, SpscConfig, FRAME_HEADER_LEN,
+    checksum::checksum32, decode_frame, encode_frame, Backpressure, ChannelError, Frame, FrameKind,
+    Metadata, Result, SpscConfig, CHUNK_METADATA_LEN, FRAME_FLAG_CHUNKED, FRAME_FLAG_CHUNK_END,
+    FRAME_FLAG_CHUNK_START, FRAME_HEADER_LEN, TLV_CHUNK_INDEX, TLV_CHUNK_MESSAGE_LEN,
+    TLV_CHUNK_TOTAL,
 };
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -36,6 +38,224 @@ pub struct SlotSnapshot {
 pub struct ReceivedMessage {
     pub seq: u64,
     pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkInfo {
+    index: usize,
+    total: usize,
+    message_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SendPlan {
+    chunk_payload_size: usize,
+    needed_slots: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MessageSizeLimits {
+    pub slot_size: usize,
+    pub chunk_metadata_size: usize,
+    pub chunk_payload_size: usize,
+    pub max_message_size: usize,
+}
+
+fn send_plan(config: &SpscConfig, len: usize) -> Result<SendPlan> {
+    if len <= config.slot_size {
+        return Ok(SendPlan {
+            chunk_payload_size: config.slot_size,
+            needed_slots: 1,
+        });
+    }
+
+    let Some(chunk_payload_size) = config.slot_size.checked_sub(CHUNK_METADATA_LEN) else {
+        return Err(ChannelError::MessageTooLarge {
+            len,
+            slot_size: max_message_size(config),
+        }
+        .into());
+    };
+    if chunk_payload_size == 0 {
+        return Err(ChannelError::MessageTooLarge {
+            len,
+            slot_size: max_message_size(config),
+        }
+        .into());
+    }
+
+    let needed_slots = len
+        .checked_add(chunk_payload_size - 1)
+        .ok_or(ChannelError::InvalidConfig("message size overflow"))?
+        / chunk_payload_size;
+    let max_chunked_message_size = config
+        .capacity
+        .checked_mul(chunk_payload_size)
+        .ok_or(ChannelError::InvalidConfig("message size overflow"))?;
+    if needed_slots > config.capacity || len > max_chunked_message_size {
+        return Err(ChannelError::MessageTooLarge {
+            len,
+            slot_size: max_message_size(config),
+        }
+        .into());
+    }
+
+    Ok(SendPlan {
+        chunk_payload_size,
+        needed_slots,
+    })
+}
+
+fn max_message_size(config: &SpscConfig) -> usize {
+    message_size_limits(config).max_message_size
+}
+
+fn message_size_limits(config: &SpscConfig) -> MessageSizeLimits {
+    let chunk_payload_size = config
+        .slot_size
+        .checked_sub(CHUNK_METADATA_LEN)
+        .unwrap_or(0);
+    let max_message_size = config
+        .capacity
+        .checked_mul(chunk_payload_size)
+        .map(|chunked_size| chunked_size.max(config.slot_size))
+        .unwrap_or(config.slot_size);
+    MessageSizeLimits {
+        slot_size: config.slot_size,
+        chunk_metadata_size: CHUNK_METADATA_LEN,
+        chunk_payload_size,
+        max_message_size,
+    }
+}
+
+fn chunk_metadata(index: usize, total: usize, message_len: usize) -> Result<Vec<Metadata>> {
+    Ok(vec![
+        Metadata::new(TLV_CHUNK_INDEX, usize_to_u64_bytes(index)?),
+        Metadata::new(TLV_CHUNK_TOTAL, usize_to_u64_bytes(total)?),
+        Metadata::new(TLV_CHUNK_MESSAGE_LEN, usize_to_u64_bytes(message_len)?),
+    ])
+}
+
+fn chunk_flags(index: usize, total: usize) -> u16 {
+    let mut flags = FRAME_FLAG_CHUNKED;
+    if index == 0 {
+        flags |= FRAME_FLAG_CHUNK_START;
+    }
+    if index + 1 == total {
+        flags |= FRAME_FLAG_CHUNK_END;
+    }
+    flags
+}
+
+fn usize_to_u64_bytes(value: usize) -> Result<Vec<u8>> {
+    let value =
+        u64::try_from(value).map_err(|_| ChannelError::InvalidConfig("chunk metadata overflow"))?;
+    Ok(value.to_le_bytes().to_vec())
+}
+
+fn chunk_info(frame: &Frame) -> Result<ChunkInfo> {
+    let index = metadata_usize(frame, TLV_CHUNK_INDEX)?;
+    let total = metadata_usize(frame, TLV_CHUNK_TOTAL)?;
+    let message_len = metadata_usize(frame, TLV_CHUNK_MESSAGE_LEN)?;
+    if total == 0 || index >= total {
+        return Err(ChannelError::CorruptedMessage.into());
+    }
+    Ok(ChunkInfo {
+        index,
+        total,
+        message_len,
+    })
+}
+
+fn metadata_usize(frame: &Frame, ty: u16) -> Result<usize> {
+    let metadata = frame
+        .metadata
+        .iter()
+        .find(|item| item.ty == ty)
+        .ok_or(ChannelError::CorruptedMessage)?;
+    if metadata.value.len() != std::mem::size_of::<u64>() {
+        return Err(ChannelError::CorruptedMessage.into());
+    }
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(&metadata.value);
+    usize::try_from(u64::from_le_bytes(raw))
+        .map_err(|_| ChannelError::InvalidConfig("chunk metadata overflow").into())
+}
+
+fn validate_bytes_frame(frame: &Frame) -> Result<()> {
+    if frame.header.kind != FrameKind::Bytes || checksum32(&frame.payload) != frame.header.checksum
+    {
+        return Err(ChannelError::CorruptedMessage.into());
+    }
+    Ok(())
+}
+
+fn is_chunked(frame: &Frame) -> bool {
+    frame.header.flags & FRAME_FLAG_CHUNKED != 0
+}
+
+fn sequence_precedes(left: u64, right: u64) -> bool {
+    left != right && right.wrapping_sub(left) < (1u64 << 63)
+}
+
+fn encode_message_frames(
+    config: &SpscConfig,
+    plan: SendPlan,
+    seq: u64,
+    bytes: &[u8],
+) -> Result<Vec<Vec<u8>>> {
+    if plan.needed_slots == 1 {
+        return Ok(vec![encode_frame(
+            FrameKind::Bytes,
+            0,
+            seq,
+            0,
+            0,
+            &[],
+            bytes,
+        )?]);
+    }
+
+    let mut frames = Vec::with_capacity(plan.needed_slots);
+    for (index, chunk) in bytes.chunks(plan.chunk_payload_size).enumerate() {
+        let metadata = chunk_metadata(index, plan.needed_slots, bytes.len())?;
+        frames.push(encode_frame(
+            FrameKind::Bytes,
+            chunk_flags(index, plan.needed_slots),
+            seq,
+            0,
+            0,
+            &metadata,
+            chunk,
+        )?);
+    }
+    if frames.len() != plan.needed_slots {
+        return Err(ChannelError::InvalidConfig("chunk plan mismatch").into());
+    }
+    if frames
+        .iter()
+        .any(|frame| frame.len() > config.slot_size + FRAME_HEADER_LEN)
+    {
+        return Err(ChannelError::InvalidConfig("chunk frame exceeds slot size").into());
+    }
+    Ok(frames)
+}
+
+fn validate_chunk(frame: &Frame, seq: u64, expected: ChunkInfo) -> Result<()> {
+    validate_bytes_frame(frame)?;
+    if frame.header.seq != seq || !is_chunked(frame) {
+        return Err(ChannelError::CorruptedMessage.into());
+    }
+    let info = chunk_info(frame)?;
+    if info != expected {
+        return Err(ChannelError::CorruptedMessage.into());
+    }
+    let has_start = frame.header.flags & FRAME_FLAG_CHUNK_START != 0;
+    let has_end = frame.header.flags & FRAME_FLAG_CHUNK_END != 0;
+    if has_start != (info.index == 0) || has_end != (info.index + 1 == info.total) {
+        return Err(ChannelError::CorruptedMessage.into());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,11 +606,39 @@ impl<S: FixedSlotStorage> FixedSlotRegion<S> {
         })
     }
 
+    pub fn peek_committed(&self, index: usize) -> Result<SlotSnapshot> {
+        let slot = self.slot(index)?;
+        if slot.state != SlotState::Committed {
+            return Err(ChannelError::BufferEmpty.into());
+        }
+        let seq = slot.seq;
+        let payload_len = slot.payload_len;
+        let data = self.storage.read_slot(index, payload_len)?;
+        Ok(SlotSnapshot {
+            state: SlotState::Committed,
+            seq,
+            payload_len,
+            data,
+        })
+    }
+
     pub fn release_pinned(&mut self, index: usize) -> Result<()> {
         if self.slot(index)?.state != SlotState::Pinned {
             return Err(ChannelError::InvalidConfig("slot is not pinned").into());
         }
 
+        self.release_slot(index)
+    }
+
+    pub fn release_committed(&mut self, index: usize) -> Result<()> {
+        if self.slot(index)?.state != SlotState::Committed {
+            return Err(ChannelError::InvalidConfig("slot is not committed").into());
+        }
+
+        self.release_slot(index)
+    }
+
+    fn release_slot(&mut self, index: usize) -> Result<()> {
         self.storage.clear_slot(index)?;
         let slot = self.slot_mut(index)?;
         slot.state = SlotState::Free;
@@ -674,12 +922,38 @@ impl PersistentSlotRegion {
         })
     }
 
+    pub fn peek_committed(&self, index: usize) -> Result<SlotSnapshot> {
+        let (state, seq, payload_len) = self.read_header(index)?;
+        if state != SlotState::Committed {
+            return Err(ChannelError::BufferEmpty.into());
+        }
+        let data = self.read_payload(index, payload_len)?;
+        Ok(SlotSnapshot {
+            state: SlotState::Committed,
+            seq,
+            payload_len,
+            data,
+        })
+    }
+
     /// Release a pinned slot back to FREE.
     pub fn release_pinned(&self, index: usize) -> Result<()> {
         let (state, _, _) = self.read_header(index)?;
         if state != SlotState::Pinned {
             return Err(ChannelError::InvalidConfig("slot is not pinned").into());
         }
+        self.release_slot(index)
+    }
+
+    pub fn release_committed(&self, index: usize) -> Result<()> {
+        let (state, _, _) = self.read_header(index)?;
+        if state != SlotState::Committed {
+            return Err(ChannelError::InvalidConfig("slot is not committed").into());
+        }
+        self.release_slot(index)
+    }
+
+    fn release_slot(&self, index: usize) -> Result<()> {
         self.clear_payload(index)?;
         self.write_header(index, SlotState::Free, 0, 0)?;
         Ok(())
@@ -734,6 +1008,13 @@ pub struct PersistentShmChannel {
     closed: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PersistentSlotHeader {
+    index: usize,
+    state: SlotState,
+    seq: u64,
+}
+
 impl PersistentShmChannel {
     /// Create a new persistent channel, initialising the file.
     pub fn create(path: impl AsRef<Path>, config: SpscConfig) -> Result<Self> {
@@ -779,85 +1060,39 @@ impl PersistentShmChannel {
 
         let region = PersistentSlotRegion::open(path, config.capacity, region_slot_size)?;
 
-        // Scan the ring to recover state.
-        let mut len = 0usize;
-        let mut next_seq = 0u64;
-        let mut head = 0usize;
-
-        for i in 0..config.capacity {
-            if let Ok((
-                state @ (SlotState::Committed | SlotState::Pinned | SlotState::Writing),
-                seq,
-                _,
-            )) = region.read_header(i)
-            {
-                len += 1;
-                head = (i + 1) % config.capacity;
-                next_seq = next_seq.max(seq.wrapping_add(1));
-                let _ = state; // used only in pattern
-            }
-        }
-
-        // Tail is the first non-FREE slot.
-        let tail = (0..config.capacity)
-            .find(|&i| {
-                matches!(
-                    region.read_header(i),
-                    Ok((SlotState::Committed, _, _))
-                        | Ok((SlotState::Pinned, _, _))
-                        | Ok((SlotState::Writing, _, _))
-                )
-            })
-            .unwrap_or(0);
-
-        // expected_recv_seq is the seq of the first committed slot.
-        let expected_recv = if len > 0 {
-            region
-                .read_header(tail)
-                .map(|(_, s, _)| s)
-                .unwrap_or(next_seq)
-        } else {
-            next_seq
-        };
-
-        Ok(Self {
+        let mut channel = Self {
             region,
             config,
-            head,
-            tail,
-            len,
-            next_seq,
-            expected_recv_seq: expected_recv,
+            head: 0,
+            tail: 0,
+            len: 0,
+            next_seq: 0,
+            expected_recv_seq: 0,
             last_received_seq: None,
             closed: false,
-        })
+        };
+        channel.refresh_from_storage()?;
+        Ok(channel)
     }
 
     pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
         if self.closed {
             return Err(ChannelError::Closed.into());
         }
-        if bytes.len() > self.config.slot_size {
-            return Err(ChannelError::MessageTooLarge {
-                len: bytes.len(),
-                slot_size: self.config.slot_size,
-            }
-            .into());
-        }
-
-        if self.config.backpressure == Backpressure::Raise && self.len == self.config.capacity {
-            return Err(ChannelError::BufferFull.into());
-        }
-        if self.config.backpressure == Backpressure::Block {
-            self.wait_for_space()?;
+        self.refresh_from_storage()?;
+        let plan = send_plan(&self.config, bytes.len())?;
+        if !self.prepare_send_slots(plan.needed_slots)? {
+            return Ok(());
         }
 
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let frame = encode_frame(FrameKind::Bytes, 0, seq, 0, 0, &[], bytes)?;
-        self.region.write_committed(self.head, seq, &frame)?;
-        self.head = (self.head + 1) % self.config.capacity;
-        self.len += 1;
+        let frames = encode_message_frames(&self.config, plan, seq, bytes)?;
+        for frame in frames {
+            self.region.write_committed(self.head, seq, &frame)?;
+            self.head = (self.head + 1) % self.config.capacity;
+            self.len += 1;
+        }
         Ok(())
     }
 
@@ -866,6 +1101,7 @@ impl PersistentShmChannel {
     }
 
     pub fn recv_with_seq(&mut self) -> Result<ReceivedMessage> {
+        self.refresh_from_storage()?;
         if self.closed && self.len == 0 {
             return Err(ChannelError::Closed.into());
         }
@@ -885,11 +1121,7 @@ impl PersistentShmChannel {
             thread::yield_now();
         }
 
-        let snapshot = self.region.read_committed(self.tail)?;
-        let decoded = decode_frame(&snapshot.data);
-        self.region.release_pinned(self.tail)?;
-        self.tail = (self.tail + 1) % self.config.capacity;
-        self.len -= 1;
+        let snapshot = self.read_tail_snapshot()?;
 
         if snapshot.seq != self.expected_recv_seq {
             return Err(ChannelError::SequenceMismatch {
@@ -898,33 +1130,51 @@ impl PersistentShmChannel {
             }
             .into());
         }
-        self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
 
-        let frame = decoded?;
-        if frame.header.kind != FrameKind::Bytes
-            || checksum32(&frame.payload) != frame.header.checksum
-        {
-            return Err(ChannelError::CorruptedMessage.into());
+        let decoded = decode_frame(&snapshot.data);
+        let frame = match decoded {
+            Ok(frame) => frame,
+            Err(err) => {
+                self.advance_tail_after_read()?;
+                self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
+                return Err(err);
+            }
+        };
+        if let Err(err) = validate_bytes_frame(&frame) {
+            self.advance_tail_after_read()?;
+            self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
+            return Err(err);
         }
 
         if snapshot.seq != frame.header.seq {
+            let actual = frame.header.seq;
+            self.advance_tail_after_read()?;
+            self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
             return Err(ChannelError::SequenceMismatch {
                 expected: snapshot.seq,
-                actual: frame.header.seq,
+                actual,
             }
             .into());
         }
 
         let seq = frame.header.seq;
+        let payload = if is_chunked(&frame) {
+            self.recv_chunked_message(snapshot.seq, frame)?
+        } else {
+            self.advance_tail_after_read()?;
+            frame.payload
+        };
+        self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
         self.last_received_seq = Some(seq);
-        Ok(ReceivedMessage {
-            seq,
-            payload: frame.payload,
-        })
+        Ok(ReceivedMessage { seq, payload })
     }
 
     pub fn close(&mut self) {
         self.closed = true;
+    }
+
+    pub fn refresh(&mut self) -> Result<()> {
+        self.refresh_from_storage()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -947,8 +1197,52 @@ impl PersistentShmChannel {
         self.config.slot_size
     }
 
-    fn wait_for_space(&self) -> Result<()> {
-        if self.len < self.config.capacity {
+    pub fn next_sequence(&self) -> u64 {
+        self.next_seq
+    }
+
+    pub fn expected_recv_sequence(&self) -> u64 {
+        self.expected_recv_seq
+    }
+
+    pub fn last_received_sequence(&self) -> Option<u64> {
+        self.last_received_seq
+    }
+
+    pub fn message_size_limits(&self) -> MessageSizeLimits {
+        message_size_limits(&self.config)
+    }
+
+    fn prepare_send_slots(&mut self, needed_slots: usize) -> Result<bool> {
+        if needed_slots > self.config.capacity {
+            return Err(ChannelError::MessageTooLarge {
+                len: needed_slots,
+                slot_size: self.config.capacity,
+            }
+            .into());
+        }
+        if self.config.capacity - self.len >= needed_slots {
+            return Ok(true);
+        }
+
+        match self.config.backpressure {
+            Backpressure::Raise => Err(ChannelError::BufferFull.into()),
+            Backpressure::Block => {
+                self.wait_for_space(needed_slots)?;
+                Ok(true)
+            }
+            Backpressure::DropNewest => Ok(false),
+            Backpressure::DropOldest => {
+                while self.config.capacity - self.len < needed_slots {
+                    self.drop_oldest_message()?;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    fn wait_for_space(&mut self, needed_slots: usize) -> Result<()> {
+        if self.config.capacity - self.len >= needed_slots {
             return Ok(());
         }
         let Some(timeout) = self.config.timeout else {
@@ -956,12 +1250,209 @@ impl PersistentShmChannel {
         };
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if self.len < self.config.capacity {
+            self.refresh_from_storage()?;
+            if self.config.capacity - self.len >= needed_slots {
                 return Ok(());
             }
             thread::yield_now();
         }
         Err(ChannelError::BufferFull.into())
+    }
+
+    fn refresh_from_storage(&mut self) -> Result<()> {
+        let occupied = self.occupied_slot_headers()?;
+        self.len = occupied.len();
+
+        if occupied.is_empty() {
+            self.head = 0;
+            self.tail = 0;
+            self.expected_recv_seq = self.next_seq;
+            return Ok(());
+        }
+
+        self.tail = self.infer_tail_from_occupied(&occupied)?;
+        self.head = self.infer_head_from_tail(self.tail)?;
+
+        for slot in &occupied {
+            let candidate = slot.seq.wrapping_add(1);
+            if sequence_precedes(self.next_seq, candidate) {
+                self.next_seq = candidate;
+            }
+        }
+
+        self.expected_recv_seq = self.region.read_header(self.tail)?.1;
+        Ok(())
+    }
+
+    fn occupied_slot_headers(&self) -> Result<Vec<PersistentSlotHeader>> {
+        let mut occupied = Vec::new();
+        for index in 0..self.config.capacity {
+            let (state, seq, _) = self.region.read_header(index)?;
+            if matches!(
+                state,
+                SlotState::Committed | SlotState::Pinned | SlotState::Writing
+            ) {
+                occupied.push(PersistentSlotHeader { index, state, seq });
+            }
+        }
+        Ok(occupied)
+    }
+
+    fn infer_tail_from_occupied(&self, occupied: &[PersistentSlotHeader]) -> Result<usize> {
+        let mut occupied_by_index = vec![false; self.config.capacity];
+        for slot in occupied {
+            occupied_by_index[slot.index] = true;
+        }
+
+        if occupied.len() < self.config.capacity {
+            for slot in occupied {
+                let previous = if slot.index == 0 {
+                    self.config.capacity - 1
+                } else {
+                    slot.index - 1
+                };
+                if !occupied_by_index[previous] {
+                    return Ok(slot.index);
+                }
+            }
+        }
+
+        if self.len > 0 && occupied_by_index[self.tail] {
+            return Ok(self.tail);
+        }
+
+        let mut oldest = occupied[0];
+        for slot in &occupied[1..] {
+            if self.slot_precedes(*slot, oldest)? {
+                oldest = *slot;
+            }
+        }
+        Ok(oldest.index)
+    }
+
+    fn infer_head_from_tail(&self, tail: usize) -> Result<usize> {
+        let mut head = tail;
+        for _ in 0..self.config.capacity {
+            if matches!(self.region.read_header(head)?.0, SlotState::Free) {
+                return Ok(head);
+            }
+            head = (head + 1) % self.config.capacity;
+            if head == tail {
+                return Ok(head);
+            }
+        }
+        Ok(head)
+    }
+
+    fn slot_precedes(
+        &self,
+        left: PersistentSlotHeader,
+        right: PersistentSlotHeader,
+    ) -> Result<bool> {
+        if left.seq != right.seq {
+            return Ok(sequence_precedes(left.seq, right.seq));
+        }
+
+        Ok(self.chunk_index_for_slot(left)? < self.chunk_index_for_slot(right)?)
+    }
+
+    fn chunk_index_for_slot(&self, slot: PersistentSlotHeader) -> Result<usize> {
+        if slot.state != SlotState::Committed {
+            return Ok(0);
+        }
+
+        let snapshot = self.region.peek_committed(slot.index)?;
+        let frame = decode_frame(&snapshot.data)?;
+        if is_chunked(&frame) {
+            Ok(chunk_info(&frame)?.index)
+        } else {
+            Ok(0)
+        }
+    }
+
+    fn read_tail_snapshot(&mut self) -> Result<SlotSnapshot> {
+        loop {
+            let (state, _, _) = self.region.read_header(self.tail)?;
+            if state == SlotState::Committed {
+                break;
+            }
+            if self.closed {
+                return Err(ChannelError::Closed.into());
+            }
+            thread::yield_now();
+        }
+
+        self.region.read_committed(self.tail)
+    }
+
+    fn advance_tail_after_read(&mut self) -> Result<()> {
+        self.region.release_pinned(self.tail)?;
+        self.tail = (self.tail + 1) % self.config.capacity;
+        self.len -= 1;
+        Ok(())
+    }
+
+    fn recv_chunked_message(&mut self, seq: u64, first_frame: Frame) -> Result<Vec<u8>> {
+        let first_info = chunk_info(&first_frame)?;
+        if first_info.index != 0 {
+            return Err(ChannelError::CorruptedMessage.into());
+        }
+        let mut payload = Vec::with_capacity(first_info.message_len);
+        payload.extend_from_slice(&first_frame.payload);
+        self.advance_tail_after_read()?;
+
+        for index in 1..first_info.total {
+            let snapshot = self.read_tail_snapshot()?;
+            if snapshot.seq != seq {
+                return Err(ChannelError::SequenceMismatch {
+                    expected: seq,
+                    actual: snapshot.seq,
+                }
+                .into());
+            }
+            let frame = decode_frame(&snapshot.data)?;
+            validate_chunk(
+                &frame,
+                seq,
+                ChunkInfo {
+                    index,
+                    total: first_info.total,
+                    message_len: first_info.message_len,
+                },
+            )?;
+            payload.extend_from_slice(&frame.payload);
+            self.advance_tail_after_read()?;
+        }
+
+        if payload.len() != first_info.message_len {
+            return Err(ChannelError::CorruptedMessage.into());
+        }
+        Ok(payload)
+    }
+
+    fn drop_oldest_message(&mut self) -> Result<()> {
+        if self.len == 0 {
+            return Ok(());
+        }
+        let snapshot = self.region.peek_committed(self.tail)?;
+        let frame = decode_frame(&snapshot.data)?;
+        let slots_to_drop = if is_chunked(&frame) {
+            let info = chunk_info(&frame)?;
+            if info.index != 0 {
+                return Err(ChannelError::CorruptedMessage.into());
+            }
+            info.total
+        } else {
+            1
+        };
+
+        for _ in 0..slots_to_drop {
+            self.region.release_committed(self.tail)?;
+            self.tail = (self.tail + 1) % self.config.capacity;
+            self.len -= 1;
+        }
+        self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
+        Ok(())
     }
 }
 
@@ -1021,28 +1512,19 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
         if self.closed {
             return Err(ChannelError::Closed.into());
         }
-        if bytes.len() > self.config.slot_size {
-            return Err(ChannelError::MessageTooLarge {
-                len: bytes.len(),
-                slot_size: self.config.slot_size,
-            }
-            .into());
-        }
-
-        match self.config.backpressure {
-            Backpressure::Raise if self.len == self.config.capacity => {
-                return Err(ChannelError::BufferFull.into());
-            }
-            Backpressure::Block => self.wait_for_space()?,
-            Backpressure::Raise => {}
+        let plan = send_plan(&self.config, bytes.len())?;
+        if !self.prepare_send_slots(plan.needed_slots)? {
+            return Ok(());
         }
 
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let frame = encode_frame(FrameKind::Bytes, 0, seq, 0, 0, &[], bytes)?;
-        self.region.write_committed(self.head, seq, &frame)?;
-        self.head = (self.head + 1) % self.config.capacity;
-        self.len += 1;
+        let frames = encode_message_frames(&self.config, plan, seq, bytes)?;
+        for frame in frames {
+            self.region.write_committed(self.head, seq, &frame)?;
+            self.head = (self.head + 1) % self.config.capacity;
+            self.len += 1;
+        }
         Ok(())
     }
 
@@ -1059,10 +1541,6 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
         }
 
         let snapshot = self.region.read_committed(self.tail)?;
-        let decoded = decode_frame(&snapshot.data);
-        self.region.release_pinned(self.tail)?;
-        self.tail = (self.tail + 1) % self.config.capacity;
-        self.len -= 1;
 
         if snapshot.seq != self.expected_recv_seq {
             return Err(ChannelError::SequenceMismatch {
@@ -1071,30 +1549,44 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
             }
             .into());
         }
-        self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
 
-        let frame = decoded?;
-        if frame.header.kind != FrameKind::Bytes
-            || checksum32(&frame.payload) != frame.header.checksum
-        {
-            return Err(ChannelError::CorruptedMessage.into());
+        let decoded = decode_frame(&snapshot.data);
+        let frame = match decoded {
+            Ok(frame) => frame,
+            Err(err) => {
+                self.advance_tail_after_read()?;
+                self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
+                return Err(err);
+            }
+        };
+        if let Err(err) = validate_bytes_frame(&frame) {
+            self.advance_tail_after_read()?;
+            self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
+            return Err(err);
         }
 
         if snapshot.seq != frame.header.seq {
+            let actual = frame.header.seq;
+            self.advance_tail_after_read()?;
+            self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
             return Err(ChannelError::SequenceMismatch {
                 expected: snapshot.seq,
-                actual: frame.header.seq,
+                actual,
             }
             .into());
         }
 
         let seq = frame.header.seq;
+        let payload = if is_chunked(&frame) {
+            self.recv_chunked_message(snapshot.seq, frame)?
+        } else {
+            self.advance_tail_after_read()?;
+            frame.payload
+        };
+        self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
         self.last_received_seq = Some(seq);
 
-        Ok(ReceivedMessage {
-            seq,
-            payload: frame.payload,
-        })
+        Ok(ReceivedMessage { seq, payload })
     }
 
     pub fn close(&mut self) {
@@ -1137,8 +1629,40 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
         self.last_received_seq
     }
 
-    fn wait_for_space(&self) -> Result<()> {
-        if self.len < self.config.capacity {
+    pub fn message_size_limits(&self) -> MessageSizeLimits {
+        message_size_limits(&self.config)
+    }
+
+    fn prepare_send_slots(&mut self, needed_slots: usize) -> Result<bool> {
+        if needed_slots > self.config.capacity {
+            return Err(ChannelError::MessageTooLarge {
+                len: needed_slots,
+                slot_size: self.config.capacity,
+            }
+            .into());
+        }
+        if self.config.capacity - self.len >= needed_slots {
+            return Ok(true);
+        }
+
+        match self.config.backpressure {
+            Backpressure::Raise => Err(ChannelError::BufferFull.into()),
+            Backpressure::Block => {
+                self.wait_for_space(needed_slots)?;
+                Ok(true)
+            }
+            Backpressure::DropNewest => Ok(false),
+            Backpressure::DropOldest => {
+                while self.config.capacity - self.len < needed_slots {
+                    self.drop_oldest_message()?;
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    fn wait_for_space(&self, needed_slots: usize) -> Result<()> {
+        if self.config.capacity - self.len >= needed_slots {
             return Ok(());
         }
         let Some(timeout) = self.config.timeout else {
@@ -1146,12 +1670,82 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
         };
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            if self.len < self.config.capacity {
+            if self.config.capacity - self.len >= needed_slots {
                 return Ok(());
             }
             thread::yield_now();
         }
         Err(ChannelError::BufferFull.into())
+    }
+
+    fn advance_tail_after_read(&mut self) -> Result<()> {
+        self.region.release_pinned(self.tail)?;
+        self.tail = (self.tail + 1) % self.config.capacity;
+        self.len -= 1;
+        Ok(())
+    }
+
+    fn recv_chunked_message(&mut self, seq: u64, first_frame: Frame) -> Result<Vec<u8>> {
+        let first_info = chunk_info(&first_frame)?;
+        if first_info.index != 0 {
+            return Err(ChannelError::CorruptedMessage.into());
+        }
+        let mut payload = Vec::with_capacity(first_info.message_len);
+        payload.extend_from_slice(&first_frame.payload);
+        self.advance_tail_after_read()?;
+
+        for index in 1..first_info.total {
+            let snapshot = self.region.read_committed(self.tail)?;
+            if snapshot.seq != seq {
+                return Err(ChannelError::SequenceMismatch {
+                    expected: seq,
+                    actual: snapshot.seq,
+                }
+                .into());
+            }
+            let frame = decode_frame(&snapshot.data)?;
+            validate_chunk(
+                &frame,
+                seq,
+                ChunkInfo {
+                    index,
+                    total: first_info.total,
+                    message_len: first_info.message_len,
+                },
+            )?;
+            payload.extend_from_slice(&frame.payload);
+            self.advance_tail_after_read()?;
+        }
+
+        if payload.len() != first_info.message_len {
+            return Err(ChannelError::CorruptedMessage.into());
+        }
+        Ok(payload)
+    }
+
+    fn drop_oldest_message(&mut self) -> Result<()> {
+        if self.len == 0 {
+            return Ok(());
+        }
+        let snapshot = self.region.peek_committed(self.tail)?;
+        let frame = decode_frame(&snapshot.data)?;
+        let slots_to_drop = if is_chunked(&frame) {
+            let info = chunk_info(&frame)?;
+            if info.index != 0 {
+                return Err(ChannelError::CorruptedMessage.into());
+            }
+            info.total
+        } else {
+            1
+        };
+
+        for _ in 0..slots_to_drop {
+            self.region.release_committed(self.tail)?;
+            self.tail = (self.tail + 1) % self.config.capacity;
+            self.len -= 1;
+        }
+        self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1180,12 +1774,13 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileSlotStorage, FixedSlotRegion, FixedSlotStorage, MemorySlotStorage, ShmSpscChannel,
-        SlotState,
+        FileSlotStorage, FixedSlotRegion, FixedSlotStorage, MemorySlotStorage,
+        PersistentShmChannel, ShmSpscChannel, SlotState,
     };
     use dsline_core::error::{ChannelError, DslineError};
     use dsline_core::{
-        decode_frame, encode_frame, Backpressure, FrameKind, SpscConfig, FRAME_HEADER_LEN,
+        decode_frame, encode_frame, Backpressure, FrameKind, SpscConfig, CHUNK_METADATA_LEN,
+        FRAME_HEADER_LEN,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -1285,6 +1880,35 @@ mod tests {
     }
 
     #[test]
+    fn channel_sends_and_receives_chunked_message() {
+        let mut channel = channel(4, 64);
+        let payload = vec![b'x'; 80];
+
+        channel.send(&payload).expect("send chunked");
+
+        assert_eq!(channel.len(), 4);
+        let message = channel.recv_with_seq().expect("recv chunked");
+        assert_eq!(message.seq, 0);
+        assert_eq!(message.payload, payload);
+        assert!(channel.is_empty());
+        assert_eq!(channel.expected_recv_sequence(), 1);
+    }
+
+    #[test]
+    fn channel_rejects_chunked_message_larger_than_capacity() {
+        let mut channel = channel(2, 64);
+        let payload = vec![b'x'; 100];
+
+        assert_eq!(
+            channel.send(&payload).expect_err("too large"),
+            DslineError::Channel(ChannelError::MessageTooLarge {
+                len: 100,
+                slot_size: 64
+            })
+        );
+    }
+
+    #[test]
     fn channel_returns_sequence_with_message() {
         let mut channel = channel(2, 16);
 
@@ -1341,6 +1965,17 @@ mod tests {
     }
 
     #[test]
+    fn channel_reports_message_size_limits() {
+        let channel = channel(4, 64);
+        let limits = channel.message_size_limits();
+
+        assert_eq!(limits.slot_size, 64);
+        assert_eq!(limits.chunk_metadata_size, CHUNK_METADATA_LEN);
+        assert_eq!(limits.chunk_payload_size, 22);
+        assert_eq!(limits.max_message_size, 88);
+    }
+
+    #[test]
     fn channel_rejects_oversized_payload_before_frame_encode() {
         let mut channel = channel(1, 4);
 
@@ -1379,6 +2014,73 @@ mod tests {
             channel.send(b"two").expect_err("timeout"),
             DslineError::Channel(ChannelError::BufferFull)
         );
+    }
+
+    #[test]
+    fn channel_drop_newest_backpressure_discards_incoming_message() {
+        let mut channel = ShmSpscChannel::new(SpscConfig {
+            capacity: 1,
+            slot_size: 16,
+            backpressure: Backpressure::DropNewest,
+            timeout: None,
+        })
+        .expect("channel");
+        channel.send(b"one").expect("send one");
+        channel.send(b"two").expect("drop two");
+
+        assert_eq!(channel.len(), 1);
+        assert_eq!(channel.next_sequence(), 1);
+        let message = channel.recv_with_seq().expect("recv one");
+        assert_eq!(message.seq, 0);
+        assert_eq!(message.payload, b"one");
+        assert_eq!(
+            channel.recv().expect_err("empty"),
+            DslineError::Channel(ChannelError::BufferEmpty)
+        );
+    }
+
+    #[test]
+    fn channel_drop_oldest_backpressure_discards_oldest_message() {
+        let mut channel = ShmSpscChannel::new(SpscConfig {
+            capacity: 2,
+            slot_size: 16,
+            backpressure: Backpressure::DropOldest,
+            timeout: None,
+        })
+        .expect("channel");
+        channel.send(b"one").expect("send one");
+        channel.send(b"two").expect("send two");
+        channel.send(b"three").expect("send three");
+
+        assert_eq!(channel.len(), 2);
+        assert_eq!(channel.next_sequence(), 3);
+        assert_eq!(channel.expected_recv_sequence(), 1);
+        let first = channel.recv_with_seq().expect("recv two");
+        let second = channel.recv_with_seq().expect("recv three");
+        assert_eq!(first.seq, 1);
+        assert_eq!(first.payload, b"two");
+        assert_eq!(second.seq, 2);
+        assert_eq!(second.payload, b"three");
+    }
+
+    #[test]
+    fn channel_drop_oldest_discards_whole_chunked_message() {
+        let mut channel = ShmSpscChannel::new(SpscConfig {
+            capacity: 4,
+            slot_size: 64,
+            backpressure: Backpressure::DropOldest,
+            timeout: None,
+        })
+        .expect("channel");
+        let large = vec![b'a'; 80];
+        channel.send(&large).expect("send large");
+        channel.send(b"small").expect("send small and drop large");
+
+        assert_eq!(channel.len(), 1);
+        assert_eq!(channel.expected_recv_sequence(), 1);
+        let message = channel.recv_with_seq().expect("recv small");
+        assert_eq!(message.seq, 1);
+        assert_eq!(message.payload, b"small");
     }
 
     #[test]
@@ -1525,6 +2227,61 @@ mod tests {
                 "file storage is smaller than expected"
             ))
         );
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn persistent_channel_drop_oldest_backpressure_discards_oldest_message() {
+        let path = test_file_path("persistent-drop-oldest");
+        let mut channel = PersistentShmChannel::create(
+            &path,
+            SpscConfig {
+                capacity: 2,
+                slot_size: 16,
+                backpressure: Backpressure::DropOldest,
+                timeout: None,
+            },
+        )
+        .expect("persistent channel");
+
+        channel.send(b"one").expect("send one");
+        channel.send(b"two").expect("send two");
+        channel.send(b"three").expect("send three");
+
+        assert_eq!(channel.len(), 2);
+        let first = channel.recv_with_seq().expect("recv two");
+        let second = channel.recv_with_seq().expect("recv three");
+        assert_eq!(first.seq, 1);
+        assert_eq!(first.payload, b"two");
+        assert_eq!(second.seq, 2);
+        assert_eq!(second.payload, b"three");
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn persistent_channel_sends_and_receives_chunked_message() {
+        let path = test_file_path("persistent-chunked");
+        let mut channel = PersistentShmChannel::create(
+            &path,
+            SpscConfig {
+                capacity: 4,
+                slot_size: 64,
+                backpressure: Backpressure::Raise,
+                timeout: None,
+            },
+        )
+        .expect("persistent channel");
+        let payload = vec![b'z'; 80];
+
+        channel.send(&payload).expect("send chunked");
+
+        assert_eq!(channel.len(), 4);
+        let message = channel.recv_with_seq().expect("recv chunked");
+        assert_eq!(message.seq, 0);
+        assert_eq!(message.payload, payload);
+        assert!(channel.is_empty());
 
         fs::remove_file(path).expect("cleanup");
     }

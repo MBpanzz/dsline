@@ -70,6 +70,7 @@ Rust core
 
 - Fixed-slot SPSC bytes channel (in-process)
 - Cross-process file-backed SPSC (two processes, one file, verified)
+- Variable-length bytes messages via multi-slot chunking
 - Frame protocol with magic, version, checksum, metadata TLV
 - Slot state machine with write-commit-read-release lifecycle
 - Ring recovery on channel open (scan + reconstruct head/tail)
@@ -83,17 +84,17 @@ Rust core
 - `from_transport("shm://...")` and `from_transport("file://...")`
 - Context manager support on all channels
 - Channel stats (queue_depth, capacity, sequence tracking)
+- Backpressure strategies BLOCK, RAISE, DROP_NEWEST, DROP_OLDEST
 - CLI with info and bench commands
 
 ### Not Yet Implemented (0.1.0+)
 
 - OS shared memory (POSIX shm / mmap) — currently file-backed
-- Variable-length messages — fixed slot_size per channel
+- Arena-backed variable-length allocator — current support uses multi-slot chunking
 - MPSC / multi-consumer — SPSC only
 - alloc/publish zero-copy — requires safety gate (Miri, loom, stress testing)
 - Pipeline background runtime (tokio) — collect() blocks
 - Crash recovery (pid+start_time based)
-- Backpressure strategies DROP_NEWEST/DROP_OLDEST — BLOCK/RAISE only
 - Python async API
 - Arrow RecordBatch support
 - Windows named file mapping
@@ -152,12 +153,11 @@ These numbers are expected for the 0.0.1 in-process prototype and are published 
 Priority order:
 
 1. **OS shared memory backend** (Linux POSIX shm) — unblocks real multi-process performance testing
-2. **Variable-length messages** — remove fixed slot_size constraint
+2. **Arena-backed variable-length allocator** — current support uses multi-slot chunking
 3. **MPSC** — multi-producer CAS on head
-4. **Backpressure strategies** — DROP_NEWEST, DROP_OLDEST
-5. **Pipeline runtime** — tokio background thread, run/start/stop
-6. **Benchmark: dsline vs mp.Queue in multi-process** — the defining performance test
-7. **PyPI release** — `pip install dsline`
+4. **Pipeline runtime** — tokio background thread, run/start/stop
+5. **Benchmark: dsline vs mp.Queue in multi-process** — the defining performance test
+6. **PyPI release** — `pip install dsline`
 
 ---
 

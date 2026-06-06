@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 pub enum Backpressure {
     Block,
     Raise,
+    DropNewest,
+    DropOldest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,12 +73,15 @@ impl SpscBytesRing {
             .into());
         }
 
-        match self.config.backpressure {
-            Backpressure::Raise if self.queue.len() == self.config.capacity => {
-                return Err(ChannelError::BufferFull.into());
+        if self.queue.len() == self.config.capacity {
+            match self.config.backpressure {
+                Backpressure::Raise => return Err(ChannelError::BufferFull.into()),
+                Backpressure::Block => self.wait_for_space()?,
+                Backpressure::DropNewest => return Ok(()),
+                Backpressure::DropOldest => {
+                    let _ = self.queue.pop_front();
+                }
             }
-            Backpressure::Block => self.wait_for_space()?,
-            Backpressure::Raise => {}
         }
 
         let seq = self.next_seq;
@@ -228,6 +233,44 @@ mod tests {
             ring.send(b"b").expect_err("timeout"),
             DslineError::Channel(ChannelError::BufferFull)
         );
+    }
+
+    #[test]
+    fn drop_newest_backpressure_discards_incoming_message() {
+        let mut ring = SpscBytesRing::new(SpscConfig {
+            capacity: 1,
+            slot_size: 8,
+            backpressure: Backpressure::DropNewest,
+            timeout: None,
+        })
+        .expect("valid config");
+        ring.send(b"a").expect("first send");
+        ring.send(b"b").expect("dropped newest send");
+
+        assert_eq!(ring.next_seq_for_test(), 1);
+        assert_eq!(ring.recv().expect("recv original"), b"a");
+        assert_eq!(
+            ring.recv().expect_err("empty after dropped newest"),
+            DslineError::Channel(ChannelError::BufferEmpty)
+        );
+    }
+
+    #[test]
+    fn drop_oldest_backpressure_discards_oldest_message() {
+        let mut ring = SpscBytesRing::new(SpscConfig {
+            capacity: 2,
+            slot_size: 8,
+            backpressure: Backpressure::DropOldest,
+            timeout: None,
+        })
+        .expect("valid config");
+        ring.send(b"a").expect("send a");
+        ring.send(b"b").expect("send b");
+        ring.send(b"c").expect("send c and drop a");
+
+        assert_eq!(ring.next_seq_for_test(), 3);
+        assert_eq!(ring.recv().expect("recv b"), b"b");
+        assert_eq!(ring.recv().expect("recv c"), b"c");
     }
 
     #[test]
