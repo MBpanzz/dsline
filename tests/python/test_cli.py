@@ -8,14 +8,15 @@ from dsline._info import format_info, get_info
 
 
 class InfoTests(unittest.TestCase):
-    def test_info_contains_prototype_status(self) -> None:
+    def test_info_contains_backend_status(self) -> None:
         info = get_info()
 
         self.assertEqual(info["name"], "dsline")
-        self.assertEqual(info["channel_backend"], "inprocess-prototype")
+        self.assertEqual(info["channel_backend"], "shm")
         self.assertEqual(info["zero_copy_alloc_publish"], "unavailable")
         self.assertIn("memory", info["storage_backends"])
         self.assertIn("file", info["storage_backends"])
+        self.assertIn("mmap", info["storage_backends"])
         self.assertIn("DROP_NEWEST", info["backpressure_strategies"])
         self.assertIn("DROP_OLDEST", info["backpressure_strategies"])
 

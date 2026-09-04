@@ -12,9 +12,12 @@ use dsline_core::{
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Instant;
+
+use memmap2::MmapMut;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -364,6 +367,82 @@ impl FixedSlotStorage for MemorySlotStorage {
     }
 }
 
+/// Byte-range access to persistent slot storage shared across processes.
+///
+/// The storage is a flat array of `capacity` slots, each `slot_size` bytes.
+/// Slot metadata (state, seq, payload_len) lives in the storage itself so
+/// that multiple processes can coordinate through the shared backing store.
+pub trait SlotRegionIo: std::fmt::Debug + Sized {
+    /// Create a new region, truncating any existing backing store.
+    ///
+    /// `total_len` is the full backing size (region header + slot area).
+    fn create(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self>;
+    /// Open an existing region, validating that the backing store is large
+    /// enough for `total_len` bytes.
+    fn open(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self>;
+
+    fn capacity(&self) -> usize;
+    fn slot_size(&self) -> usize;
+    fn path(&self) -> &Path;
+
+    /// Read `len` bytes at `offset`.
+    fn read_at(&self, offset: usize, len: usize) -> Result<Vec<u8>>;
+    /// Write `bytes` at `offset`.
+    fn write_at(&self, offset: usize, bytes: &[u8]) -> Result<()>;
+    /// Write `len` zero bytes at `offset`.
+    fn clear_at(&self, offset: usize, len: usize) -> Result<()>;
+    /// Ensure writes in `[offset, offset + len)` are visible to other
+    /// processes before returning. No-op for backends whose writes are
+    /// already ordered (file I/O with flush).
+    fn flush_range(&self, _offset: usize, _len: usize) -> Result<()> {
+        Ok(())
+    }
+
+    /// Load an 8-byte cursor value at `offset` with acquire semantics.
+    ///
+    /// Default: byte I/O through `read_at` with a `SeqCst` fence (file
+    /// backends — cross-process ordering is provided by the OS file layer).
+    fn load_u64(&self, offset: usize) -> Result<u64> {
+        let bytes = self.read_at(offset, 8)?;
+        fence(Ordering::SeqCst);
+        let value = u64::from_le_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| ChannelError::StorageIo("cursor read size"))?,
+        );
+        Ok(value)
+    }
+
+    /// Store an 8-byte cursor value at `offset` with release semantics.
+    fn store_u64(&self, offset: usize, value: u64) -> Result<()> {
+        fence(Ordering::SeqCst);
+        self.write_at(offset, &value.to_le_bytes())
+    }
+
+    /// Advance an 8-byte cursor at `offset` to `max(current, value)`.
+    /// Used for the consumer-owned tail cursor, which both the consumer
+    /// (consume) and the producer (DropOldest) advance.
+    fn fetch_max_u64(&self, offset: usize, value: u64) -> Result<u64> {
+        let current = self.load_u64(offset)?;
+        if value > current {
+            self.store_u64(offset, value)?;
+            Ok(value)
+        } else {
+            Ok(current)
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct FileSlotStorage {
     capacity: usize,
@@ -373,16 +452,18 @@ pub struct FileSlotStorage {
 }
 
 impl FileSlotStorage {
-    pub fn create(path: impl AsRef<Path>, capacity: usize, slot_size: usize) -> Result<Self> {
+    pub fn create(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
         if capacity == 0 {
             return Err(ChannelError::InvalidConfig("capacity must be greater than zero").into());
         }
         if slot_size == 0 {
             return Err(ChannelError::InvalidConfig("slot_size must be greater than zero").into());
         }
-        let total_len = capacity
-            .checked_mul(slot_size)
-            .ok_or(ChannelError::InvalidConfig("storage size overflow"))?;
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .create(true)
@@ -402,16 +483,18 @@ impl FileSlotStorage {
         })
     }
 
-    pub fn open(path: impl AsRef<Path>, capacity: usize, slot_size: usize) -> Result<Self> {
+    pub fn open(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
         if capacity == 0 {
             return Err(ChannelError::InvalidConfig("capacity must be greater than zero").into());
         }
         if slot_size == 0 {
             return Err(ChannelError::InvalidConfig("slot_size must be greater than zero").into());
         }
-        let expected_len = capacity
-            .checked_mul(slot_size)
-            .ok_or(ChannelError::InvalidConfig("storage size overflow"))?;
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .read(true)
@@ -422,7 +505,7 @@ impl FileSlotStorage {
             .metadata()
             .map_err(|_| ChannelError::StorageIo("stat file storage"))?
             .len();
-        if actual_len < expected_len as u64 {
+        if actual_len < total_len as u64 {
             return Err(
                 ChannelError::InvalidConfig("file storage is smaller than expected").into(),
             );
@@ -450,6 +533,94 @@ impl FileSlotStorage {
             .ok_or(ChannelError::InvalidConfig("slot offset overflow"))?;
         Ok(offset as u64)
     }
+
+    fn validate_range(&self, offset: usize, len: usize) -> Result<()> {
+        let total = self
+            .capacity
+            .checked_mul(self.slot_size)
+            .ok_or(ChannelError::InvalidConfig("storage size overflow"))?;
+        if offset > total || len > total - offset {
+            return Err(ChannelError::InvalidConfig("file storage range out of bounds").into());
+        }
+        Ok(())
+    }
+}
+
+impl SlotRegionIo for FileSlotStorage {
+    fn create(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
+        Self::create(path, capacity, slot_size, total_len)
+    }
+
+    fn open(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
+        Self::open(path, capacity, slot_size, total_len)
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn slot_size(&self) -> usize {
+        self.slot_size
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn read_at(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.validate_range(offset, len)?;
+        let mut data = vec![0; len];
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("file storage lock poisoned"))?;
+        file.seek(SeekFrom::Start(offset as u64))
+            .map_err(|_| ChannelError::StorageIo("seek file storage"))?;
+        file.read_exact(&mut data)
+            .map_err(|_| ChannelError::StorageIo("read file storage"))?;
+        Ok(data)
+    }
+
+    fn write_at(&self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.validate_range(offset, bytes.len())?;
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("file storage lock poisoned"))?;
+        file.seek(SeekFrom::Start(offset as u64))
+            .map_err(|_| ChannelError::StorageIo("seek file storage"))?;
+        file.write_all(bytes)
+            .map_err(|_| ChannelError::StorageIo("write file storage"))?;
+        file.flush()
+            .map_err(|_| ChannelError::StorageIo("flush file storage"))?;
+        Ok(())
+    }
+
+    fn clear_at(&self, offset: usize, len: usize) -> Result<()> {
+        self.validate_range(offset, len)?;
+        let zeros = vec![0; len];
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("file storage lock poisoned"))?;
+        file.seek(SeekFrom::Start(offset as u64))
+            .map_err(|_| ChannelError::StorageIo("seek file storage"))?;
+        file.write_all(&zeros)
+            .map_err(|_| ChannelError::StorageIo("clear file storage"))?;
+        file.flush()
+            .map_err(|_| ChannelError::StorageIo("flush file storage"))?;
+        Ok(())
+    }
 }
 
 impl FixedSlotStorage for FileSlotStorage {
@@ -469,19 +640,7 @@ impl FixedSlotStorage for FileSlotStorage {
             }
             .into());
         }
-
-        let offset = self.offset(index)?;
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| ChannelError::StorageIo("file storage lock poisoned"))?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|_| ChannelError::StorageIo("seek file storage"))?;
-        file.write_all(bytes)
-            .map_err(|_| ChannelError::StorageIo("write file storage"))?;
-        file.flush()
-            .map_err(|_| ChannelError::StorageIo("flush file storage"))?;
-        Ok(())
+        SlotRegionIo::write_at(self, self.offset(index)? as usize, bytes)
     }
 
     fn read_slot(&self, index: usize, len: usize) -> Result<Vec<u8>> {
@@ -492,34 +651,255 @@ impl FixedSlotStorage for FileSlotStorage {
             }
             .into());
         }
-
-        let offset = self.offset(index)?;
-        let mut data = vec![0; len];
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| ChannelError::StorageIo("file storage lock poisoned"))?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|_| ChannelError::StorageIo("seek file storage"))?;
-        file.read_exact(&mut data)
-            .map_err(|_| ChannelError::StorageIo("read file storage"))?;
-        Ok(data)
+        SlotRegionIo::read_at(self, self.offset(index)? as usize, len)
     }
 
     fn clear_slot(&mut self, index: usize) -> Result<()> {
-        let offset = self.offset(index)?;
-        let zeros = vec![0; self.slot_size];
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| ChannelError::StorageIo("file storage lock poisoned"))?;
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|_| ChannelError::StorageIo("seek file storage"))?;
-        file.write_all(&zeros)
-            .map_err(|_| ChannelError::StorageIo("clear file storage"))?;
-        file.flush()
-            .map_err(|_| ChannelError::StorageIo("flush file storage"))?;
+        SlotRegionIo::clear_at(self, self.offset(index)? as usize, self.slot_size)
+    }
+}
+
+/// A slot region backed by a memory-mapped file.
+///
+/// The mapping is shared across every process that maps the same file, which
+/// makes this the OS shared-memory backend for channels.
+#[derive(Debug)]
+pub struct MmapSlotStorage {
+    capacity: usize,
+    slot_size: usize,
+    total_len: usize,
+    path: PathBuf,
+    /// Kept alive so the mapping never outlives the file handle it derives
+    /// from; resizing or truncating the file while mapped is undefined.
+    _file: File,
+    map: Mutex<MmapMut>,
+}
+
+impl MmapSlotStorage {
+    pub fn create(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
+        Self::create_with_options(path, capacity, slot_size, total_len, false)
+    }
+
+    /// Create a new region only if the backing file does not exist yet.
+    pub fn create_new(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
+        Self::create_with_options(path, capacity, slot_size, total_len, true)
+    }
+
+    fn create_with_options(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+        create_new: bool,
+    ) -> Result<Self> {
+        if capacity == 0 {
+            return Err(ChannelError::InvalidConfig("capacity must be greater than zero").into());
+        }
+        if slot_size == 0 {
+            return Err(ChannelError::InvalidConfig("slot_size must be greater than zero").into());
+        }
+        let path = path.as_ref().to_path_buf();
+        let mut options = OpenOptions::new();
+        options.read(true).write(true);
+        if create_new {
+            options.create_new(true);
+        } else {
+            options.create(true).truncate(true);
+        }
+        let file = options
+            .open(&path)
+            .map_err(|_| ChannelError::StorageIo("open mmap storage"))?;
+        file.set_len(total_len as u64)
+            .map_err(|_| ChannelError::StorageIo("resize mmap storage"))?;
+
+        Self::map(file, path, capacity, slot_size, total_len)
+    }
+
+    pub fn open(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
+        if capacity == 0 {
+            return Err(ChannelError::InvalidConfig("capacity must be greater than zero").into());
+        }
+        if slot_size == 0 {
+            return Err(ChannelError::InvalidConfig("slot_size must be greater than zero").into());
+        }
+        let path = path.as_ref().to_path_buf();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|_| ChannelError::StorageIo("open mmap storage"))?;
+        let actual_len = file
+            .metadata()
+            .map_err(|_| ChannelError::StorageIo("stat mmap storage"))?
+            .len();
+        if actual_len < total_len as u64 {
+            return Err(
+                ChannelError::InvalidConfig("file storage is smaller than expected").into(),
+            );
+        }
+
+        Self::map(file, path, capacity, slot_size, total_len)
+    }
+
+    fn map(
+        file: File,
+        path: PathBuf,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
+        // SAFETY: the file handle is kept in `_file` for the lifetime of the
+        // mapping and the file is never resized or truncated while mapped.
+        let map = unsafe { MmapMut::map_mut(&file) }
+            .map_err(|_| ChannelError::StorageIo("map mmap storage"))?;
+        Ok(Self {
+            capacity,
+            slot_size,
+            total_len,
+            path,
+            _file: file,
+            map: Mutex::new(map),
+        })
+    }
+
+    fn validate_range(&self, offset: usize, len: usize) -> Result<()> {
+        if offset > self.total_len || len > self.total_len - offset {
+            return Err(ChannelError::InvalidConfig("mmap storage range out of bounds").into());
+        }
         Ok(())
+    }
+}
+
+impl SlotRegionIo for MmapSlotStorage {
+    fn create(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
+        Self::create(path, capacity, slot_size, total_len)
+    }
+
+    fn open(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
+        Self::open(path, capacity, slot_size, total_len)
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn slot_size(&self) -> usize {
+        self.slot_size
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn read_at(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.validate_range(offset, len)?;
+        let map = self
+            .map
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("mmap storage lock poisoned"))?;
+        Ok(map[offset..offset + len].to_vec())
+    }
+
+    fn write_at(&self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.validate_range(offset, bytes.len())?;
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("mmap storage lock poisoned"))?;
+        let end = offset + bytes.len();
+        map[offset..end].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn load_u64(&self, offset: usize) -> Result<u64> {
+        self.validate_range(offset, 8)?;
+        let map = self
+            .map
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("mmap storage lock poisoned"))?;
+        // SAFETY: `offset` is 8-aligned (region header cursor constants) and
+        // within the mapping, which outlives the lock guard; the underlying
+        // memory is shared with other processes, where the hardware provides
+        // the atomicity of aligned 8-byte accesses.
+        let ptr = unsafe { map.as_ptr().add(offset) } as *const AtomicU64;
+        Ok(unsafe { (&*ptr).load(Ordering::Acquire) })
+    }
+
+    fn store_u64(&self, offset: usize, value: u64) -> Result<()> {
+        self.validate_range(offset, 8)?;
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("mmap storage lock poisoned"))?;
+        // SAFETY: as in `load_u64`; a release store publishes the slot writes
+        // that precede it to a consumer that acquire-loads the cursor.
+        let ptr = unsafe { map.as_mut_ptr().add(offset) } as *mut AtomicU64;
+        unsafe { (&*ptr).store(value, Ordering::Release) };
+        Ok(())
+    }
+
+    fn fetch_max_u64(&self, offset: usize, value: u64) -> Result<u64> {
+        self.validate_range(offset, 8)?;
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("mmap storage lock poisoned"))?;
+        // SAFETY: as in `load_u64`; the RMW advances the shared cursor
+        // monotonically even when two roles (consumer consume, producer
+        // DropOldest) advance it concurrently.
+        let ptr = unsafe { map.as_mut_ptr().add(offset) } as *mut AtomicU64;
+        Ok(unsafe { (&*ptr).fetch_max(value, Ordering::Release) })
+    }
+
+    fn clear_at(&self, offset: usize, len: usize) -> Result<()> {
+        self.validate_range(offset, len)?;
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("mmap storage lock poisoned"))?;
+        map[offset..offset + len].fill(0);
+        Ok(())
+    }
+
+    fn flush_range(&self, offset: usize, len: usize) -> Result<()> {
+        let map = self
+            .map
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("mmap storage lock poisoned"))?;
+        // FlushViewOfFile only (memmap2's flush_async_range): required for
+        // writes to be visible to OTHER processes' mappings of the same file
+        // on Windows (file-backed sections are not coherent across views
+        // without a flush; paging-file-backed sections like
+        // multiprocessing.shared_memory are). memmap2's `flush_range`
+        // additionally calls FlushFileBuffers, a full disk sync that costs
+        // ~1ms per call — never use it per message.
+        map.flush_async_range(offset, len)
+            .map_err(|_| ChannelError::StorageIo("flush mmap storage").into())
     }
 }
 
@@ -695,10 +1075,66 @@ impl<S: FixedSlotStorage> FixedSlotRegion<S> {
     }
 }
 
-// ── Persistent slot region (file-backed, cross-process ready) ──
+// ── Persistent slot region (shared-memory, cross-process) ──
 
 /// Size of the per-slot header stored in persistent storage.
 pub const PERSISTENT_SLOT_HEADER_LEN: usize = 13;
+
+/// Size of the region header at the start of the backing store, holding the
+/// SPSC cursors: `head` (producer-owned, monotonic slot count) at offset 0
+/// and `tail` (consumer-owned) at offset 8.
+pub const REGION_HEADER_LEN: usize = 16;
+
+const CURSOR_HEAD_OFFSET: usize = 0;
+const CURSOR_TAIL_OFFSET: usize = 8;
+
+/// Resolve a channel name to a stable region file path in the runtime
+/// directory. The same name always maps to the same path, in every process,
+/// so `ShmChannel`-style channels can connect by name.
+pub fn shm_region_path(name: &str) -> Result<PathBuf> {
+    let dir = shm_runtime_dir()?;
+    let digest = checksum32(name.as_bytes());
+    Ok(dir.join(format!("dsline-{digest:08x}.bin")))
+}
+
+fn shm_runtime_dir() -> Result<PathBuf> {
+    let dir = shm_runtime_base()?.join("dsline").join("shm");
+    std::fs::create_dir_all(&dir)
+        .map_err(|_| ChannelError::StorageIo("create shm runtime directory"))?;
+    Ok(dir)
+}
+
+#[cfg(windows)]
+fn shm_runtime_base() -> Result<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("TEMP").map(PathBuf::from));
+    base.ok_or_else(|| ChannelError::InvalidConfig("LOCALAPPDATA is not set").into())
+}
+
+#[cfg(not(windows))]
+fn shm_runtime_base() -> Result<PathBuf> {
+    let base = std::env::var_os("XDG_RUNTIME_DIR")
+        .or_else(|| std::env::var_os("TMPDIR"))
+        .map(PathBuf::from);
+    Ok(base.unwrap_or_else(std::env::temp_dir))
+}
+
+/// A slot region that stores metadata (state, seq, length) in the storage
+/// layer alongside frame data, enabling cross-process access.
+///
+/// Slot layout in storage:
+/// ```text
+/// [state: u8] [seq: u64 LE] [payload_len: u32 LE] [frame bytes…]
+/// ```
+/// Total per-slot region size for a channel config (header + frame space).
+fn persistent_region_slot_size(config: &SpscConfig) -> Result<usize> {
+    config
+        .slot_size
+        .checked_add(FRAME_HEADER_LEN)
+        .and_then(|v| v.checked_add(PERSISTENT_SLOT_HEADER_LEN))
+        .ok_or(ChannelError::InvalidConfig("slot_size is too large").into())
+}
 
 /// A slot region that stores metadata (state, seq, length) in the storage
 /// layer alongside frame data, enabling cross-process access.
@@ -708,14 +1144,14 @@ pub const PERSISTENT_SLOT_HEADER_LEN: usize = 13;
 /// [state: u8] [seq: u64 LE] [payload_len: u32 LE] [frame bytes…]
 /// ```
 #[derive(Debug)]
-pub struct PersistentSlotRegion {
-    storage: FileSlotStorage,
+pub struct PersistentSlotRegion<S: SlotRegionIo = MmapSlotStorage> {
+    storage: S,
     /// Usable frame space after subtracting the header.
     frame_capacity: usize,
 }
 
-impl PersistentSlotRegion {
-    /// Create a new file-backed persistent region.
+impl<S: SlotRegionIo> PersistentSlotRegion<S> {
+    /// Create a new persistent region.
     ///
     /// `slot_size` is the total per-slot size (header + max frame).
     pub fn create(path: impl AsRef<Path>, capacity: usize, slot_size: usize) -> Result<Self> {
@@ -725,11 +1161,19 @@ impl PersistentSlotRegion {
             )
             .into());
         }
-        let storage = FileSlotStorage::create(path, capacity, slot_size)?;
+        let total_len = Self::total_len(capacity, slot_size)?;
+        let storage = S::create(path, capacity, slot_size, total_len)?;
         Ok(Self {
             frame_capacity: slot_size - PERSISTENT_SLOT_HEADER_LEN,
             storage,
         })
+    }
+
+    fn total_len(capacity: usize, slot_size: usize) -> Result<usize> {
+        capacity
+            .checked_mul(slot_size)
+            .and_then(|v| v.checked_add(REGION_HEADER_LEN))
+            .ok_or(ChannelError::InvalidConfig("storage size overflow").into())
     }
 
     /// Open an existing persistent region.
@@ -740,9 +1184,24 @@ impl PersistentSlotRegion {
             )
             .into());
         }
-        let storage = FileSlotStorage::open(path, capacity, slot_size)?;
+        let total_len = Self::total_len(capacity, slot_size)?;
+        let storage = S::open(path, capacity, slot_size, total_len)?;
         Ok(Self {
             frame_capacity: slot_size - PERSISTENT_SLOT_HEADER_LEN,
+            storage,
+        })
+    }
+
+    /// Wrap an already-created storage instance.
+    pub fn from_storage(storage: S) -> Result<Self> {
+        if storage.slot_size() <= PERSISTENT_SLOT_HEADER_LEN {
+            return Err(ChannelError::InvalidConfig(
+                "slot_size must be greater than persistent header size",
+            )
+            .into());
+        }
+        Ok(Self {
+            frame_capacity: storage.slot_size() - PERSISTENT_SLOT_HEADER_LEN,
             storage,
         })
     }
@@ -765,7 +1224,9 @@ impl PersistentSlotRegion {
 
     /// Read the header of a slot from storage. Returns `(state, seq, payload_len)`.
     fn read_header(&self, index: usize) -> Result<(SlotState, u64, usize)> {
-        let raw = self.storage.read_slot(index, PERSISTENT_SLOT_HEADER_LEN)?;
+        let raw = self
+            .storage
+            .read_at(self.slot_offset(index), PERSISTENT_SLOT_HEADER_LEN)?;
         let state = match raw[0] {
             0 => SlotState::Free,
             1 => SlotState::Writing,
@@ -792,19 +1253,7 @@ impl PersistentSlotRegion {
         header[0] = state as u8;
         header[1..9].copy_from_slice(&seq.to_le_bytes());
         header[9..13].copy_from_slice(&(payload_len as u32).to_le_bytes());
-        let offset = self.slot_offset(index);
-        let mut file = self
-            .storage
-            .file
-            .lock()
-            .map_err(|_| ChannelError::StorageIo("persistent storage lock poisoned"))?;
-        file.seek(SeekFrom::Start(offset as u64))
-            .map_err(|_| ChannelError::StorageIo("seek header write"))?;
-        file.write_all(&header)
-            .map_err(|_| ChannelError::StorageIo("write header"))?;
-        file.flush()
-            .map_err(|_| ChannelError::StorageIo("flush header"))?;
-        Ok(())
+        self.storage.write_at(self.slot_offset(index), &header)
     }
 
     /// Write frame data to slot payload area (after header).
@@ -816,19 +1265,8 @@ impl PersistentSlotRegion {
             }
             .into());
         }
-        let offset = self.slot_offset(index) + PERSISTENT_SLOT_HEADER_LEN;
-        let mut file = self
-            .storage
-            .file
-            .lock()
-            .map_err(|_| ChannelError::StorageIo("persistent storage lock poisoned"))?;
-        file.seek(SeekFrom::Start(offset as u64))
-            .map_err(|_| ChannelError::StorageIo("seek persistent payload"))?;
-        file.write_all(frame)
-            .map_err(|_| ChannelError::StorageIo("write persistent payload"))?;
-        file.flush()
-            .map_err(|_| ChannelError::StorageIo("flush persistent payload"))?;
-        Ok(())
+        self.storage
+            .write_at(self.slot_offset(index) + PERSISTENT_SLOT_HEADER_LEN, frame)
     }
 
     fn read_payload(&self, index: usize, len: usize) -> Result<Vec<u8>> {
@@ -839,39 +1277,40 @@ impl PersistentSlotRegion {
             }
             .into());
         }
-        let offset = self.slot_offset(index) + PERSISTENT_SLOT_HEADER_LEN;
-        let mut data = vec![0u8; len];
-        let mut file = self
-            .storage
-            .file
-            .lock()
-            .map_err(|_| ChannelError::StorageIo("persistent storage lock poisoned"))?;
-        file.seek(SeekFrom::Start(offset as u64))
-            .map_err(|_| ChannelError::StorageIo("seek persistent payload"))?;
-        file.read_exact(&mut data)
-            .map_err(|_| ChannelError::StorageIo("read persistent payload"))?;
-        Ok(data)
+        self.storage
+            .read_at(self.slot_offset(index) + PERSISTENT_SLOT_HEADER_LEN, len)
     }
 
     fn clear_payload(&self, index: usize) -> Result<()> {
-        let offset = self.slot_offset(index) + PERSISTENT_SLOT_HEADER_LEN;
-        let zeros = vec![0u8; self.frame_capacity];
-        let mut file = self
-            .storage
-            .file
-            .lock()
-            .map_err(|_| ChannelError::StorageIo("persistent storage lock poisoned"))?;
-        file.seek(SeekFrom::Start(offset as u64))
-            .map_err(|_| ChannelError::StorageIo("seek persistent clear"))?;
-        file.write_all(&zeros)
-            .map_err(|_| ChannelError::StorageIo("clear persistent payload"))?;
-        file.flush()
-            .map_err(|_| ChannelError::StorageIo("flush persistent clear"))?;
-        Ok(())
+        self.storage.clear_at(
+            self.slot_offset(index) + PERSISTENT_SLOT_HEADER_LEN,
+            self.frame_capacity,
+        )
     }
 
     fn slot_offset(&self, index: usize) -> usize {
-        index * self.storage.slot_size()
+        REGION_HEADER_LEN + index * self.storage.slot_size()
+    }
+
+    /// Load the producer-owned head cursor (acquire).
+    pub fn load_head(&self) -> Result<u64> {
+        self.storage.load_u64(CURSOR_HEAD_OFFSET)
+    }
+
+    /// Publish the head cursor after all slot writes (release).
+    pub fn store_head(&self, head: u64) -> Result<()> {
+        self.storage.store_u64(CURSOR_HEAD_OFFSET, head)
+    }
+
+    /// Load the consumer-owned tail cursor (acquire).
+    pub fn load_tail(&self) -> Result<u64> {
+        self.storage.load_u64(CURSOR_TAIL_OFFSET)
+    }
+
+    /// Advance the tail cursor monotonically (release). Called by the
+    /// consumer on consume and by the producer for DropOldest.
+    pub fn fetch_max_tail(&self, tail: u64) -> Result<u64> {
+        self.storage.fetch_max_u64(CURSOR_TAIL_OFFSET, tail)
     }
 
     // ── public state-transition API ──
@@ -883,12 +1322,33 @@ impl PersistentSlotRegion {
 
     /// Write a committed frame to a free slot.
     ///
-    /// Protocol: write WRITING header → write payload → write COMMITTED header.
+    /// Protocol: write WRITING header → write payload → write COMMITTED
+    /// header. Cross-process visibility is ordered with release/acquire
+    /// fences and a `flush_range` (FlushViewOfFile) after the COMMITTED
+    /// header — on Windows, file-backed mappings are not coherent across
+    /// views without a flush. No per-message disk sync (FlushFileBuffers);
+    /// system-crash durability is out of scope.
     pub fn write_committed(&self, index: usize, seq: u64, frame: &[u8]) -> Result<()> {
+        self.write_committed_no_flush(index, seq, frame)?;
+        // Make the whole slot visible to other processes' mappings.
+        self.storage.flush_range(
+            self.slot_offset(index),
+            PERSISTENT_SLOT_HEADER_LEN + frame.len(),
+        )
+    }
+
+    /// Same as `write_committed` but defers the cross-process flush. The
+    /// caller must publish the writes with a `flush_range` (usually one
+    /// batch flush covering the slots and the head cursor) before another
+    /// process is allowed to observe them.
+    fn write_committed_no_flush(&self, index: usize, seq: u64, frame: &[u8]) -> Result<()> {
         let (state, _, _) = self.read_header(index)?;
         if state != SlotState::Free {
             return Err(ChannelError::BufferFull.into());
         }
+        // Pairs with the Release fence in `release_slot`: the slot is truly
+        // free (payload cleared) before we write into it.
+        fence(Ordering::Acquire);
 
         // Phase 1: mark WRITING
         self.write_header(index, SlotState::Writing, seq, frame.len())?;
@@ -896,10 +1356,11 @@ impl PersistentSlotRegion {
         // Phase 2: write payload
         self.write_payload(index, frame)?;
 
-        // Phase 3: commit
-        self.write_header(index, SlotState::Committed, seq, frame.len())?;
-
-        Ok(())
+        // Phase 3: commit — the Release fence orders the payload writes
+        // before the COMMITTED header, so a reader that observes COMMITTED
+        // (and pairs with an Acquire fence) never sees stale payload bytes.
+        fence(Ordering::Release);
+        self.write_header(index, SlotState::Committed, seq, frame.len())
     }
 
     /// Read a committed frame, transitioning the slot to PINNED.
@@ -908,6 +1369,9 @@ impl PersistentSlotRegion {
         if state != SlotState::Committed {
             return Err(ChannelError::BufferEmpty.into());
         }
+        // Pairs with the Release fence in `write_committed`: the payload
+        // published before COMMITTED is visible to this read.
+        fence(Ordering::Acquire);
 
         let data = self.read_payload(index, payload_len)?;
 
@@ -953,10 +1417,93 @@ impl PersistentSlotRegion {
         self.release_slot(index)
     }
 
+    /// As `release_pinned`, deferring the cross-process flush (see
+    /// `release_slot_no_flush`). Channel-private: the channel publishes the
+    /// released slot together with the tail cursor in one batch flush.
+    fn release_pinned_no_flush(&self, index: usize) -> Result<()> {
+        let (state, _, _) = self.read_header(index)?;
+        if state != SlotState::Pinned {
+            return Err(ChannelError::InvalidConfig("slot is not pinned").into());
+        }
+        self.release_slot_no_flush(index)
+    }
+
+    /// As `release_committed`, deferring the cross-process flush.
+    fn release_committed_no_flush(&self, index: usize) -> Result<()> {
+        let (state, _, _) = self.read_header(index)?;
+        if state != SlotState::Committed {
+            return Err(ChannelError::InvalidConfig("slot is not committed").into());
+        }
+        self.release_slot_no_flush(index)
+    }
+
     fn release_slot(&self, index: usize) -> Result<()> {
+        self.release_slot_no_flush(index)?;
+        // Make the FREE header visible to the producer's mapping (Windows).
+        self.storage
+            .flush_range(self.slot_offset(index), PERSISTENT_SLOT_HEADER_LEN)
+    }
+
+    fn release_slot_no_flush(&self, index: usize) -> Result<()> {
         self.clear_payload(index)?;
-        self.write_header(index, SlotState::Free, 0, 0)?;
-        Ok(())
+        // Order the payload clear before the FREE header: a producer that
+        // observes FREE (and pairs with an Acquire fence) never overwrites a
+        // slot whose payload is still visible to the consumer.
+        fence(Ordering::Release);
+        self.write_header(index, SlotState::Free, 0, 0)
+    }
+
+    /// Publish the cursor words and one slot to other processes' mappings.
+    ///
+    /// Uses a single flush over `[0, end]` while the range stays small, and
+    /// two page-local flushes (slot first, then the cursor words in the
+    /// first page) for larger offsets: FlushViewOfFile scans every page in
+    /// the range, so one large-range call costs more than two small ones
+    /// once the slot sits far from the first page. The slot-first order
+    /// keeps the reader's view consistent: it may see the slot released
+    /// with a stale cursor (it retries), never a new cursor with a stale
+    /// slot.
+    fn flush_release(&self, index: usize) -> Result<()> {
+        const MAX_SINGLE_FLUSH: usize = 8 * 4096;
+        let off = self.slot_offset(index);
+        let end = off + PERSISTENT_SLOT_HEADER_LEN;
+        if end <= MAX_SINGLE_FLUSH {
+            self.storage.flush_range(0, end)
+        } else {
+            self.storage.flush_range(off, PERSISTENT_SLOT_HEADER_LEN)?;
+            self.storage.flush_range(0, REGION_HEADER_LEN)
+        }
+    }
+
+    /// Publish a committed batch of slot frames plus the cursor words.
+    ///
+    /// Small batches (region offsets up to `MAX_SINGLE_FLUSH`) are
+    /// published with one flush over `[0, last-slot end]`, which covers
+    /// every slot of the batch and the cursor together. Larger batches fall
+    /// back to one page-local flush per slot followed by the cursor flush,
+    /// so the cost stays proportional to the batch, not the region.
+    fn publish_batch(&self, frames: &[Vec<u8>], first_index: usize) -> Result<()> {
+        const MAX_SINGLE_FLUSH: usize = 8 * 4096;
+        let last_offset = if frames.is_empty() {
+            self.slot_offset(first_index)
+        } else {
+            let last_index = (first_index + frames.len() - 1) % self.storage.capacity();
+            self.slot_offset(last_index)
+                + PERSISTENT_SLOT_HEADER_LEN
+                + frames.last().map(Vec::len).unwrap_or(0)
+        };
+        if last_offset <= MAX_SINGLE_FLUSH {
+            self.storage.flush_range(0, last_offset)
+        } else {
+            for (k, frame) in frames.iter().enumerate() {
+                let index = (first_index + k) % self.storage.capacity();
+                self.storage.flush_range(
+                    self.slot_offset(index),
+                    PERSISTENT_SLOT_HEADER_LEN + frame.len(),
+                )?;
+            }
+            self.storage.flush_range(0, REGION_HEADER_LEN)
+        }
     }
 
     /// Mark a slot as corrupted.
@@ -991,17 +1538,51 @@ impl PersistentSlotRegion {
     }
 }
 
-/// A channel backed by a persistent (file-based) slot region.
+/// A channel backed by a persistent slot region.
 ///
 /// This channel can be opened by multiple processes that share the same
-/// backing file. One process acts as producer, another as consumer.
+/// backing store (a file, or an OS shared-memory mapping). One process acts
+/// as producer, another as consumer.
+///
+/// Ring position comes from two shared monotonic slot counts in the region
+/// header: `head` (the number of slots the producer has fully committed,
+/// published after each message with a release store and a batch flush) and
+/// `tail` (the number of slots the consumer — or a `DropOldest` producer —
+/// has released back to FREE). `refresh_cursors` reloads both counts in O(1),
+/// so the per-operation cost no longer depends on the ring capacity; the
+/// previous design re-scanned all slot headers on every operation to
+/// re-derive the ring state.
+///
+/// The slot state machine (FREE → WRITING → COMMITTED → PINNED → FREE) is
+/// retained for write/read safety: the producer never writes into a non-FREE
+/// slot and the consumer only reads COMMITTED slots. The full slot-header
+/// scan now runs once per open (recovery): it rebuilds the producer's next
+/// message sequence, the consumer's expected sequence, and the producer's
+/// write position when a crashed writer left an incomplete batch whose slots
+/// the cursors cannot represent. Such leftovers are counted in the queue
+/// depth (`recovery_bias`) and surfaced to the consumer as an empty ring
+/// rather than a hang.
 #[derive(Debug)]
-pub struct PersistentShmChannel {
-    region: PersistentSlotRegion,
+pub struct PersistentShmChannel<S: SlotRegionIo = MmapSlotStorage> {
+    region: PersistentSlotRegion<S>,
     config: SpscConfig,
+    /// Producer-owned next write index, recovered at open and advanced
+    /// locally. Never overwritten by a refresh: only the producer moves it.
     head: usize,
+    /// Next read index, re-derived from the shared tail count at every
+    /// refresh (a DropOldest producer also advances the shared tail).
     tail: usize,
+    /// Queue depth: `(head_cursor - tail_cursor) + recovery_bias`, clamped
+    /// to capacity. Mirrors the occupied count of the old full scan.
     len: usize,
+    /// Monotonic slot counts mirrored from the shared region header.
+    head_cursor: u64,
+    tail_cursor: u64,
+    /// Crash-leftover occupancy: slots occupied at open that the shared
+    /// cursors do not count (a producer that died mid-write left WRITING
+    /// slots, and the shared head never advanced past them). Kept in the
+    /// depth so the send guard never over-commits a physically full ring.
+    recovery_bias: usize,
     next_seq: u64,
     expected_recv_seq: u64,
     last_received_seq: Option<u64>,
@@ -1015,50 +1596,26 @@ struct PersistentSlotHeader {
     seq: u64,
 }
 
-impl PersistentShmChannel {
-    /// Create a new persistent channel, initialising the file.
+impl<S: SlotRegionIo> PersistentShmChannel<S> {
+    /// Create a new persistent channel, initialising the backing store.
     pub fn create(path: impl AsRef<Path>, config: SpscConfig) -> Result<Self> {
         config.validate()?;
-        let region_slot_size = config
-            .slot_size
-            .checked_add(FRAME_HEADER_LEN)
-            .and_then(|v| v.checked_add(PERSISTENT_SLOT_HEADER_LEN))
-            .ok_or(ChannelError::InvalidConfig("slot_size is too large"))?;
-
-        let region = PersistentSlotRegion::create(path, config.capacity, region_slot_size)?;
-
-        // Initialise all slots as FREE.
-        for i in 0..config.capacity {
-            region.write_header(i, SlotState::Free, 0, 0)?;
-        }
-
-        Ok(Self {
-            region,
-            config,
-            head: 0,
-            tail: 0,
-            len: 0,
-            next_seq: 0,
-            expected_recv_seq: 0,
-            last_received_seq: None,
-            closed: false,
-        })
+        let region_slot_size = persistent_region_slot_size(&config)?;
+        let region = PersistentSlotRegion::<S>::create(path, config.capacity, region_slot_size)?;
+        Self::new_initialized(region, config)
     }
 
     /// Open an existing persistent channel.
     ///
     /// The caller is responsible for knowing whether it is the producer or
-    /// consumer. This method reads the current state from the file to
-    /// recover `head` and `tail` positions.
+    /// consumer. This method scans the slot headers once to recover the
+    /// sequence state (a fresh process must rebuild the producer's next
+    /// sequence and the consumer's expected sequence from storage); ring
+    /// position thereafter comes from the shared cursors.
     pub fn open(path: impl AsRef<Path>, config: SpscConfig) -> Result<Self> {
         config.validate()?;
-        let region_slot_size = config
-            .slot_size
-            .checked_add(FRAME_HEADER_LEN)
-            .and_then(|v| v.checked_add(PERSISTENT_SLOT_HEADER_LEN))
-            .ok_or(ChannelError::InvalidConfig("slot_size is too large"))?;
-
-        let region = PersistentSlotRegion::open(path, config.capacity, region_slot_size)?;
+        let region_slot_size = persistent_region_slot_size(&config)?;
+        let region = PersistentSlotRegion::<S>::open(path, config.capacity, region_slot_size)?;
 
         let mut channel = Self {
             region,
@@ -1066,12 +1623,37 @@ impl PersistentShmChannel {
             head: 0,
             tail: 0,
             len: 0,
+            head_cursor: 0,
+            tail_cursor: 0,
+            recovery_bias: 0,
             next_seq: 0,
             expected_recv_seq: 0,
             last_received_seq: None,
             closed: false,
         };
-        channel.refresh_from_storage()?;
+        channel.recover_from_storage()?;
+        Ok(channel)
+    }
+
+    fn new_initialized(region: PersistentSlotRegion<S>, config: SpscConfig) -> Result<Self> {
+        let channel = Self {
+            region,
+            config,
+            head: 0,
+            tail: 0,
+            len: 0,
+            head_cursor: 0,
+            tail_cursor: 0,
+            recovery_bias: 0,
+            next_seq: 0,
+            expected_recv_seq: 0,
+            last_received_seq: None,
+            closed: false,
+        };
+        // Initialise all slots as FREE.
+        for i in 0..channel.config.capacity {
+            channel.region.write_header(i, SlotState::Free, 0, 0)?;
+        }
         Ok(channel)
     }
 
@@ -1079,7 +1661,7 @@ impl PersistentShmChannel {
         if self.closed {
             return Err(ChannelError::Closed.into());
         }
-        self.refresh_from_storage()?;
+        self.refresh_cursors()?;
         let plan = send_plan(&self.config, bytes.len())?;
         if !self.prepare_send_slots(plan.needed_slots)? {
             return Ok(());
@@ -1088,11 +1670,20 @@ impl PersistentShmChannel {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         let frames = encode_message_frames(&self.config, plan, seq, bytes)?;
-        for frame in frames {
-            self.region.write_committed(self.head, seq, &frame)?;
+        let first_index = self.head;
+        for frame in &frames {
+            self.region
+                .write_committed_no_flush(self.head, seq, frame)?;
             self.head = (self.head + 1) % self.config.capacity;
             self.len += 1;
         }
+        // Publish the batch: the release store of the head cursor orders
+        // the payload and COMMITTED writes before it, and one flush over
+        // [0, last-slot end] publishes the whole batch and the cursor
+        // together (page-local flushes take over for larger offsets).
+        self.head_cursor += frames.len() as u64;
+        self.region.store_head(self.head_cursor)?;
+        self.region.publish_batch(&frames, first_index)?;
         Ok(())
     }
 
@@ -1101,27 +1692,21 @@ impl PersistentShmChannel {
     }
 
     pub fn recv_with_seq(&mut self) -> Result<ReceivedMessage> {
-        self.refresh_from_storage()?;
+        self.refresh_cursors()?;
         if self.closed && self.len == 0 {
             return Err(ChannelError::Closed.into());
         }
-        if self.len == 0 {
+
+        // Gate: only a fully COMMITTED slot is readable. The producer
+        // publishes the batch and the head cursor with one flush, so in a
+        // healthy run this polls for at most the flush window; a WRITING
+        // slot that stays put past the grace period is a crash leftover
+        // (see verify C7), reported as an empty ring rather than hanging.
+        if !self.poll_tail_committed()? {
             return Err(ChannelError::BufferEmpty.into());
         }
 
-        // Poll until the slot at tail is COMMITTED.
-        loop {
-            let (state, _, _) = self.region.read_header(self.tail)?;
-            if state == SlotState::Committed {
-                break;
-            }
-            if self.closed {
-                return Err(ChannelError::Closed.into());
-            }
-            thread::yield_now();
-        }
-
-        let snapshot = self.read_tail_snapshot()?;
+        let snapshot = self.region.read_committed(self.tail)?;
 
         if snapshot.seq != self.expected_recv_seq {
             return Err(ChannelError::SequenceMismatch {
@@ -1174,7 +1759,7 @@ impl PersistentShmChannel {
     }
 
     pub fn refresh(&mut self) -> Result<()> {
-        self.refresh_from_storage()
+        self.refresh_cursors()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -1250,7 +1835,7 @@ impl PersistentShmChannel {
         };
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
-            self.refresh_from_storage()?;
+            self.refresh_cursors()?;
             if self.config.capacity - self.len >= needed_slots {
                 return Ok(());
             }
@@ -1259,28 +1844,69 @@ impl PersistentShmChannel {
         Err(ChannelError::BufferFull.into())
     }
 
-    fn refresh_from_storage(&mut self) -> Result<()> {
-        let occupied = self.occupied_slot_headers()?;
-        self.len = occupied.len();
-
-        if occupied.is_empty() {
-            self.head = 0;
-            self.tail = 0;
-            self.expected_recv_seq = self.next_seq;
-            return Ok(());
+    /// O(1) refresh: reload the shared head/tail cursors and re-derive the
+    /// queue depth and the consumer's read position. `head` (the producer's
+    /// write position) is intentionally not touched — only the producer
+    /// moves it, and on open it was recovered zombie-aware.
+    fn refresh_cursors(&mut self) -> Result<()> {
+        let head_c = self.region.load_head()?;
+        let tail_c = self.region.load_tail()?;
+        // Both cursors must live in the same <2^63 window (the sequence
+        // comparison rule). head < tail means the counts have diverged —
+        // inconsistent region state, refuse rather than wrap into garbage.
+        let dist = head_c.wrapping_sub(tail_c);
+        if dist >= (1u64 << 63) {
+            return Err(ChannelError::InvalidConfig("ring cursors are inconsistent").into());
         }
+        self.head_cursor = head_c;
+        self.tail_cursor = tail_c;
+        self.tail = (tail_c % self.config.capacity as u64) as usize;
+        self.len = (dist.min(self.config.capacity as u64) as usize + self.recovery_bias)
+            .min(self.config.capacity);
+        Ok(())
+    }
 
-        self.tail = self.infer_tail_from_occupied(&occupied)?;
-        self.head = self.infer_head_from_tail(self.tail)?;
+    /// One-time recovery scan at open. The shared cursors carry the ring
+    /// position; the scan rebuilds the pieces the cursors cannot represent:
+    /// the producer's next message sequence (max occupied seq + 1), the
+    /// consumer's expected sequence (the seq of the oldest readable slot),
+    /// and the producer's write position (first FREE slot after the oldest
+    /// readable slot — this also steps over any WRITING slot left by a
+    /// crashed producer). `recovery_bias` keeps crash leftovers in the queue
+    /// depth so the send guard never over-commits a physically full ring.
+    fn recover_from_storage(&mut self) -> Result<()> {
+        let occupied = self.occupied_slot_headers()?;
+        let head_c = self.region.load_head()?;
+        let tail_c = self.region.load_tail()?;
+        let dist = head_c.wrapping_sub(tail_c);
+        let cursor_len = dist.min(self.config.capacity as u64) as usize;
 
+        self.head_cursor = head_c;
+        self.tail_cursor = tail_c;
+        let tail_index = (tail_c % self.config.capacity as u64) as usize;
+        self.tail = tail_index;
+        self.head = self.infer_head_from_tail(tail_index)?;
+        // The scan sees every occupied slot; the cursors only see fully
+        // committed batches. The difference is crash leftovers.
+        self.recovery_bias = occupied.len().saturating_sub(cursor_len);
+        self.len = (cursor_len + self.recovery_bias).min(self.config.capacity);
+
+        // Producer sequence: continue after the newest occupied slot.
         for slot in &occupied {
             let candidate = slot.seq.wrapping_add(1);
             if sequence_precedes(self.next_seq, candidate) {
                 self.next_seq = candidate;
             }
         }
-
-        self.expected_recv_seq = self.region.read_header(self.tail)?.1;
+        // Consumer sequence: the first message to read is the oldest
+        // committed/pinned slot; with nothing readable yet the sequence
+        // restarts at 0 (the current-region convention).
+        let readable = occupied.iter().any(|s| s.state != SlotState::Writing);
+        self.expected_recv_seq = if readable {
+            self.region.read_header(self.tail)?.1
+        } else {
+            0
+        };
         Ok(())
     }
 
@@ -1288,6 +1914,9 @@ impl PersistentShmChannel {
         let mut occupied = Vec::new();
         for index in 0..self.config.capacity {
             let (state, seq, _) = self.region.read_header(index)?;
+            // WRITING slots count as occupied for depth/guard purposes (a
+            // producer must not over-commit a physically full ring), but they
+            // are never readable.
             if matches!(
                 state,
                 SlotState::Committed | SlotState::Pinned | SlotState::Writing
@@ -1298,38 +1927,9 @@ impl PersistentShmChannel {
         Ok(occupied)
     }
 
-    fn infer_tail_from_occupied(&self, occupied: &[PersistentSlotHeader]) -> Result<usize> {
-        let mut occupied_by_index = vec![false; self.config.capacity];
-        for slot in occupied {
-            occupied_by_index[slot.index] = true;
-        }
-
-        if occupied.len() < self.config.capacity {
-            for slot in occupied {
-                let previous = if slot.index == 0 {
-                    self.config.capacity - 1
-                } else {
-                    slot.index - 1
-                };
-                if !occupied_by_index[previous] {
-                    return Ok(slot.index);
-                }
-            }
-        }
-
-        if self.len > 0 && occupied_by_index[self.tail] {
-            return Ok(self.tail);
-        }
-
-        let mut oldest = occupied[0];
-        for slot in &occupied[1..] {
-            if self.slot_precedes(*slot, oldest)? {
-                oldest = *slot;
-            }
-        }
-        Ok(oldest.index)
-    }
-
+    /// First FREE slot stepping forward from `tail` — the producer's next
+    /// write position. Walks past WRITING slots (crash leftovers) too, so a
+    /// recovered producer writes after them instead of into them.
     fn infer_head_from_tail(&self, tail: usize) -> Result<usize> {
         let mut head = tail;
         for _ in 0..self.config.capacity {
@@ -1344,57 +1944,60 @@ impl PersistentShmChannel {
         Ok(head)
     }
 
-    fn slot_precedes(
-        &self,
-        left: PersistentSlotHeader,
-        right: PersistentSlotHeader,
-    ) -> Result<bool> {
-        if left.seq != right.seq {
-            return Ok(sequence_precedes(left.seq, right.seq));
-        }
-
-        Ok(self.chunk_index_for_slot(left)? < self.chunk_index_for_slot(right)?)
+    fn tail_is_committed(&self) -> Result<bool> {
+        Ok(self.region.read_header(self.tail)?.0 == SlotState::Committed)
     }
 
-    fn chunk_index_for_slot(&self, slot: PersistentSlotHeader) -> Result<usize> {
-        if slot.state != SlotState::Committed {
-            return Ok(0);
-        }
-
-        let snapshot = self.region.peek_committed(slot.index)?;
-        let frame = decode_frame(&snapshot.data)?;
-        if is_chunked(&frame) {
-            Ok(chunk_info(&frame)?.index)
-        } else {
-            Ok(0)
-        }
-    }
-
-    fn read_tail_snapshot(&mut self) -> Result<SlotSnapshot> {
-        loop {
+    /// Bounded poll for the COMMITTED state at the tail. Returns `false`
+    /// when the slot is still not committed after the grace period — a
+    /// crash leftover (WRITING) or a release that was never republished
+    /// (FREE) — which the caller reports as an empty ring. The bound keeps
+    /// the consumer from hanging on a dead writer while absorbing the
+    /// producer's batch-flush window.
+    fn poll_tail_committed(&mut self) -> Result<bool> {
+        const POLL_LIMIT: u32 = 256;
+        for _ in 0..POLL_LIMIT {
             let (state, _, _) = self.region.read_header(self.tail)?;
             if state == SlotState::Committed {
-                break;
+                return Ok(true);
             }
             if self.closed {
                 return Err(ChannelError::Closed.into());
             }
             thread::yield_now();
         }
-
-        self.region.read_committed(self.tail)
+        Ok(false)
     }
 
     fn advance_tail_after_read(&mut self) -> Result<()> {
-        self.region.release_pinned(self.tail)?;
+        let index = self.tail;
+        self.region.release_pinned_no_flush(index)?;
         self.tail = (self.tail + 1) % self.config.capacity;
-        self.len -= 1;
+        // Publish the FREE header and the advanced tail cursor (two
+        // page-local flushes; the cursor lives in the first page).
+        self.tail_cursor = self.tail_cursor.wrapping_add(1);
+        self.region.fetch_max_tail(self.tail_cursor)?;
+        // Publish the FREE header and the advanced tail cursor.
+        self.region.flush_release(index)?;
+        // `len` is re-derived from the cursors at the start of every
+        // operation, so it can undercount while a producer is mid-write;
+        // never go below zero (the next refresh recomputes the true depth).
+        self.len = self.len.saturating_sub(1);
         Ok(())
     }
 
     fn recv_chunked_message(&mut self, seq: u64, first_frame: Frame) -> Result<Vec<u8>> {
-        let first_info = chunk_info(&first_frame)?;
+        let first_info = match chunk_info(&first_frame) {
+            Ok(info) => info,
+            Err(err) => {
+                // The first chunk is pinned by the caller; release it so the
+                // tail can advance on a retry.
+                self.region.release_pinned(self.tail)?;
+                return Err(err);
+            }
+        };
         if first_info.index != 0 {
+            self.region.release_pinned(self.tail)?;
             return Err(ChannelError::CorruptedMessage.into());
         }
         let mut payload = Vec::with_capacity(first_info.message_len);
@@ -1402,16 +2005,30 @@ impl PersistentShmChannel {
         self.advance_tail_after_read()?;
 
         for index in 1..first_info.total {
-            let snapshot = self.read_tail_snapshot()?;
+            // The batch flush publishes all chunks and the head cursor
+            // together, so when chunk 0 was visible the remaining chunks are
+            // COMMITTED as well; the bounded poll is a crash-leftover
+            // backstop.
+            if !self.poll_tail_committed()? {
+                return Err(ChannelError::BufferEmpty.into());
+            }
+            let snapshot = self.region.read_committed(self.tail)?;
             if snapshot.seq != seq {
+                self.region.release_pinned(self.tail)?;
                 return Err(ChannelError::SequenceMismatch {
                     expected: seq,
                     actual: snapshot.seq,
                 }
                 .into());
             }
-            let frame = decode_frame(&snapshot.data)?;
-            validate_chunk(
+            let frame = match decode_frame(&snapshot.data) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    self.region.release_pinned(self.tail)?;
+                    return Err(err);
+                }
+            };
+            if let Err(err) = validate_chunk(
                 &frame,
                 seq,
                 ChunkInfo {
@@ -1419,7 +2036,10 @@ impl PersistentShmChannel {
                     total: first_info.total,
                     message_len: first_info.message_len,
                 },
-            )?;
+            ) {
+                self.region.release_pinned(self.tail)?;
+                return Err(err);
+            }
             payload.extend_from_slice(&frame.payload);
             self.advance_tail_after_read()?;
         }
@@ -1447,12 +2067,39 @@ impl PersistentShmChannel {
         };
 
         for _ in 0..slots_to_drop {
-            self.region.release_committed(self.tail)?;
+            let index = self.tail;
+            self.region.release_committed_no_flush(index)?;
             self.tail = (self.tail + 1) % self.config.capacity;
-            self.len -= 1;
+            self.tail_cursor = self.tail_cursor.wrapping_add(1);
+            self.region.fetch_max_tail(self.tail_cursor)?;
+            self.region.flush_release(index)?;
+            self.len = self.len.saturating_sub(1);
         }
         self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
         Ok(())
+    }
+}
+impl PersistentShmChannel<MmapSlotStorage> {
+    /// Create the region if it does not exist yet, otherwise open it and
+    /// recover the current state. Used for named shared-memory channels
+    /// where the first caller initialises the region.
+    pub fn create_or_open(path: impl AsRef<Path>, config: SpscConfig) -> Result<Self> {
+        config.validate()?;
+        let region_slot_size = persistent_region_slot_size(&config)?;
+
+        if let Ok(storage) = MmapSlotStorage::create_new(
+            &path,
+            config.capacity,
+            region_slot_size,
+            PersistentSlotRegion::<MmapSlotStorage>::total_len(config.capacity, region_slot_size)?,
+        ) {
+            // Freshly created: initialise all slots as FREE.
+            let region = PersistentSlotRegion::from_storage(storage)?;
+            return Self::new_initialized(region, config);
+        }
+
+        // The region already exists: open and recover.
+        Self::open(path, config)
     }
 }
 
@@ -1686,8 +2333,17 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
     }
 
     fn recv_chunked_message(&mut self, seq: u64, first_frame: Frame) -> Result<Vec<u8>> {
-        let first_info = chunk_info(&first_frame)?;
+        let first_info = match chunk_info(&first_frame) {
+            Ok(info) => info,
+            Err(err) => {
+                // The first chunk is pinned by the caller; release it so the
+                // tail can advance on a retry.
+                self.region.release_pinned(self.tail)?;
+                return Err(err);
+            }
+        };
         if first_info.index != 0 {
+            self.region.release_pinned(self.tail)?;
             return Err(ChannelError::CorruptedMessage.into());
         }
         let mut payload = Vec::with_capacity(first_info.message_len);
@@ -1697,14 +2353,21 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
         for index in 1..first_info.total {
             let snapshot = self.region.read_committed(self.tail)?;
             if snapshot.seq != seq {
+                self.region.release_pinned(self.tail)?;
                 return Err(ChannelError::SequenceMismatch {
                     expected: seq,
                     actual: snapshot.seq,
                 }
                 .into());
             }
-            let frame = decode_frame(&snapshot.data)?;
-            validate_chunk(
+            let frame = match decode_frame(&snapshot.data) {
+                Ok(frame) => frame,
+                Err(err) => {
+                    self.region.release_pinned(self.tail)?;
+                    return Err(err);
+                }
+            };
+            if let Err(err) = validate_chunk(
                 &frame,
                 seq,
                 ChunkInfo {
@@ -1712,7 +2375,10 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
                     total: first_info.total,
                     message_len: first_info.message_len,
                 },
-            )?;
+            ) {
+                self.region.release_pinned(self.tail)?;
+                return Err(err);
+            }
             payload.extend_from_slice(&frame.payload);
             self.advance_tail_after_read()?;
         }
@@ -1774,8 +2440,8 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileSlotStorage, FixedSlotRegion, FixedSlotStorage, MemorySlotStorage,
-        PersistentShmChannel, ShmSpscChannel, SlotState,
+        shm_region_path, FileSlotStorage, FixedSlotRegion, FixedSlotStorage, MemorySlotStorage,
+        MmapSlotStorage, PersistentShmChannel, ShmSpscChannel, SlotRegionIo, SlotState,
     };
     use dsline_core::error::{ChannelError, DslineError};
     use dsline_core::{
@@ -2184,7 +2850,7 @@ mod tests {
     #[test]
     fn file_storage_writes_reads_and_clears_slot() {
         let path = test_file_path("file-storage-basic");
-        let mut storage = FileSlotStorage::create(&path, 2, 16).expect("storage");
+        let mut storage = FileSlotStorage::create(&path, 2, 16, 32).expect("storage");
 
         storage.write_slot(1, b"hello").expect("write");
         assert_eq!(storage.read_slot(1, 5).expect("read"), b"hello");
@@ -2204,7 +2870,9 @@ mod tests {
             backpressure: Backpressure::Raise,
             timeout: None,
         };
-        let storage = FileSlotStorage::create(&path, 2, 16 + FRAME_HEADER_LEN).expect("storage");
+        let storage =
+            FileSlotStorage::create(&path, 2, 16 + FRAME_HEADER_LEN, 2 * (16 + FRAME_HEADER_LEN))
+                .expect("storage");
         let mut channel = ShmSpscChannel::with_storage(config, storage).expect("channel");
 
         channel.send(b"one").expect("send one");
@@ -2222,7 +2890,7 @@ mod tests {
         fs::write(&path, b"tiny").expect("write tiny file");
 
         assert_eq!(
-            FileSlotStorage::open(&path, 2, 16).expect_err("too small"),
+            FileSlotStorage::open(&path, 2, 16, 32).expect_err("too small"),
             DslineError::Channel(ChannelError::InvalidConfig(
                 "file storage is smaller than expected"
             ))
@@ -2234,7 +2902,7 @@ mod tests {
     #[test]
     fn persistent_channel_drop_oldest_backpressure_discards_oldest_message() {
         let path = test_file_path("persistent-drop-oldest");
-        let mut channel = PersistentShmChannel::create(
+        let mut channel = PersistentShmChannel::<MmapSlotStorage>::create(
             &path,
             SpscConfig {
                 capacity: 2,
@@ -2263,7 +2931,7 @@ mod tests {
     #[test]
     fn persistent_channel_sends_and_receives_chunked_message() {
         let path = test_file_path("persistent-chunked");
-        let mut channel = PersistentShmChannel::create(
+        let mut channel = PersistentShmChannel::<MmapSlotStorage>::create(
             &path,
             SpscConfig {
                 capacity: 4,
@@ -2284,5 +2952,293 @@ mod tests {
         assert!(channel.is_empty());
 
         fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn mmap_storage_writes_reads_and_clears() {
+        let path = test_file_path("mmap-storage-basic");
+        let storage = MmapSlotStorage::create(&path, 2, 16, 32).expect("storage");
+
+        storage.write_at(1, b"hello").expect("write");
+        assert_eq!(storage.read_at(1, 5).expect("read"), b"hello");
+
+        storage.clear_at(1, 16).expect("clear");
+        assert_eq!(storage.read_at(1, 5).expect("read cleared"), &[0; 5]);
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn mmap_storage_two_instances_share_data() {
+        let path = test_file_path("mmap-storage-shared");
+        let created = MmapSlotStorage::create(&path, 2, 16, 32).expect("storage");
+
+        created.write_at(5, b"hello").expect("write");
+
+        // A second handle to the same file observes the first handle's writes
+        // through the shared mapping — the basis of cross-process sharing.
+        let opened = MmapSlotStorage::open(&path, 2, 16, 32).expect("open");
+        assert_eq!(opened.read_at(5, 5).expect("read"), b"hello");
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn mmap_storage_rejects_smaller_existing_file() {
+        let path = test_file_path("mmap-storage-small");
+        fs::write(&path, b"tiny").expect("write tiny file");
+
+        assert_eq!(
+            MmapSlotStorage::open(&path, 2, 16, 32).expect_err("too small"),
+            DslineError::Channel(ChannelError::InvalidConfig(
+                "file storage is smaller than expected"
+            ))
+        );
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn mmap_storage_create_new_refuses_existing_file() {
+        let path = test_file_path("mmap-storage-create-new");
+        let created = MmapSlotStorage::create(&path, 2, 16, 32).expect("storage");
+        created.write_at(0, b"keep me").expect("write");
+
+        assert!(MmapSlotStorage::create_new(&path, 2, 16, 32).is_err());
+
+        let opened = MmapSlotStorage::open(&path, 2, 16, 32).expect("open");
+        assert_eq!(opened.read_at(0, 7).expect("read"), b"keep me");
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn persistent_channel_mmap_backend_recovers_messages() {
+        let path = test_file_path("persistent-mmap-recover");
+        let config = SpscConfig {
+            capacity: 4,
+            slot_size: 64,
+            backpressure: Backpressure::Raise,
+            timeout: None,
+        };
+        let mut created =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        created.send(b"one").expect("send one");
+        created.send(b"two").expect("send two");
+
+        // A second handle to the same region recovers the queued messages.
+        let mut opened =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("open");
+        assert_eq!(opened.len(), 2);
+        assert_eq!(opened.recv_with_seq().expect("recv one").payload, b"one");
+        assert_eq!(opened.recv_with_seq().expect("recv two").payload, b"two");
+        assert!(opened.is_empty());
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn persistent_channel_create_or_open_reuses_existing_region() {
+        let path = test_file_path("persistent-mmap-create-or-open");
+        let config = SpscConfig {
+            capacity: 2,
+            slot_size: 16,
+            backpressure: Backpressure::Raise,
+            timeout: None,
+        };
+        let mut first =
+            PersistentShmChannel::<MmapSlotStorage>::create_or_open(&path, config.clone())
+                .expect("first handle");
+        first.send(b"hello").expect("send");
+
+        // A second create_or_open must open the existing region, not truncate it.
+        let mut second = PersistentShmChannel::<MmapSlotStorage>::create_or_open(&path, config)
+            .expect("second handle");
+        assert_eq!(second.recv_with_seq().expect("recv").payload, b"hello");
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    // ── cursor protocol tests ──
+
+    fn persistent_config(capacity: usize, slot_size: usize) -> SpscConfig {
+        SpscConfig {
+            capacity,
+            slot_size,
+            backpressure: Backpressure::Raise,
+            timeout: None,
+        }
+    }
+
+    #[test]
+    fn persistent_channel_two_handles_share_cursor_ring() {
+        // Two handles to the same region (the in-process equivalent of two
+        // processes): ring position comes from the shared cursors, so the
+        // consumer handle sees exactly what the producer handle committed.
+        let path = test_file_path("persistent-cursor-roundtrip");
+        let config = persistent_config(8, 64);
+        let mut producer =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        let large = vec![b'z'; 80]; // 4-slot chunked message
+        producer.send(b"one").expect("send one");
+        producer.send(&large).expect("send chunked");
+        producer.send(b"two").expect("send two");
+
+        let mut consumer =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("open consumer");
+        assert_eq!(consumer.len(), 6, "depth = committed slots via cursors");
+
+        let first = consumer.recv_with_seq().expect("recv one");
+        assert_eq!((first.seq, first.payload), (0, b"one".to_vec()));
+        let second = consumer.recv_with_seq().expect("recv chunked");
+        assert_eq!(second.seq, 1);
+        assert_eq!(second.payload, large);
+        let third = consumer.recv_with_seq().expect("recv two");
+        assert_eq!((third.seq, third.payload), (2, b"two".to_vec()));
+        assert!(consumer.is_empty());
+
+        // The producer observes the released space through the shared tail
+        // cursor on its next operation.
+        producer.send(b"three").expect("send three");
+        assert_eq!(
+            consumer.recv_with_seq().expect("recv three").payload,
+            b"three"
+        );
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn persistent_channel_recovery_skips_crashed_writing_slot() {
+        // A producer that died mid-write leaves a WRITING slot that the
+        // shared head cursor never counted. Recovery must count it in the
+        // depth (bias), skip it for the next write, and surface it to the
+        // consumer as an empty ring instead of a hang.
+        let path = test_file_path("persistent-writer-crash");
+        let config = persistent_config(4, 64);
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        ch.send(b"one").expect("send");
+        // Crash: slot 1 holds an in-flight WRITING header (seq 1); the head
+        // cursor still points at slot 1, which is never committed.
+        ch.region
+            .write_header(1, SlotState::Writing, 1, 10)
+            .expect("zombie header");
+
+        let mut recovered =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("open after crash");
+        // committed "one" (cursor-counted) + the zombie (bias).
+        assert_eq!(recovered.len(), 2);
+        assert_eq!(
+            recovered.next_sequence(),
+            2,
+            "continue after the zombie seq"
+        );
+
+        // The write position steps over the zombie (slot 2, not slot 1).
+        recovered.send(b"two").expect("send past zombie");
+        assert_eq!(recovered.region.load_head().expect("head"), 2);
+
+        assert_eq!(recovered.recv_with_seq().expect("recv one").payload, b"one");
+        // The zombie is surfaced as an empty ring, not an infinite poll.
+        assert!(matches!(
+            recovered.recv(),
+            Err(DslineError::Channel(ChannelError::BufferEmpty))
+        ));
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn persistent_channel_send_guard_counts_crash_leftovers() {
+        // With the zombie occupying physical capacity, the send guard must
+        // not allow an over-commit even though the cursors under-count.
+        let path = test_file_path("persistent-guard-bias");
+        let config = persistent_config(2, 64);
+        let ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        let frame = encode_frame(FrameKind::Bytes, 0, 0, 0, 0, &[], b"one").expect("encode");
+        ch.region
+            .write_committed(0, 0, &frame)
+            .expect("commit slot 0");
+        ch.region
+            .write_header(1, SlotState::Writing, 1, 10)
+            .expect("zombie header");
+
+        let mut recovered =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("open after crash");
+        // Only slot 2... capacity 2: the ring is full (committed + zombie).
+        assert_eq!(recovered.len(), 2);
+        assert!(matches!(
+            recovered.send(b"full?"),
+            Err(DslineError::Channel(ChannelError::BufferFull))
+        ));
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn persistent_channel_writing_only_ring_reads_as_empty() {
+        // A region whose only occupied slot is WRITING (producer mid-write
+        // of the very first message) must behave as an empty ring.
+        let path = test_file_path("persistent-writing-only");
+        let config = persistent_config(4, 64);
+        let ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        ch.region
+            .write_header(0, SlotState::Writing, 0, 10)
+            .expect("in-flight header");
+
+        let mut other = PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("open");
+        assert!(matches!(
+            other.recv(),
+            Err(DslineError::Channel(ChannelError::BufferEmpty))
+        ));
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn persistent_channel_rejoined_handles_continue_after_drain() {
+        // After both sides drain the ring and reopen, the shared cursors
+        // keep the ring position; new handles continue from there with the
+        // sequences restarting (the empty-open convention).
+        let path = test_file_path("persistent-rejoin");
+        let config = persistent_config(4, 16);
+        {
+            let mut producer =
+                PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone())
+                    .expect("create");
+            producer.send(b"a").expect("send a");
+            producer.send(b"b").expect("send b");
+            let mut consumer = PersistentShmChannel::<MmapSlotStorage>::open(&path, config.clone())
+                .expect("open consumer");
+            assert_eq!(consumer.recv().expect("recv a"), b"a");
+            assert_eq!(consumer.recv().expect("recv b"), b"b");
+            assert!(consumer.is_empty());
+        }
+
+        let mut p = PersistentShmChannel::<MmapSlotStorage>::open(&path, config.clone())
+            .expect("reopen producer");
+        let mut c =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("reopen consumer");
+        p.send(b"x").expect("send x");
+        let message = c.recv_with_seq().expect("recv x");
+        assert_eq!((message.seq, message.payload), (0, b"x".to_vec()));
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn shm_region_path_is_stable_for_the_same_name() {
+        let first = shm_region_path("demo").expect("path one");
+        let second = shm_region_path("demo").expect("path two");
+        let other = shm_region_path("other").expect("path other");
+
+        assert_eq!(first, second);
+        assert_ne!(first, other);
+
+        let parent = first.parent().expect("parent dir");
+        assert!(parent.ends_with("shm"), "runtime dir: {parent:?}");
     }
 }

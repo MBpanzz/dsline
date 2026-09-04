@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 dsline-core = { path = "../dsline-core" }
+memmap2 = "0.9"
 
 [lints]
 workspace = true

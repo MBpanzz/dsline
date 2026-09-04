@@ -11,8 +11,8 @@ def get_info() -> dict[str, Any]:
         "version": dsline.__version__,
         "python": platform.python_version(),
         "platform": platform.platform(),
-        "channel_backend": "inprocess-prototype",
-        "storage_backends": ["memory", "file"],
+        "channel_backend": "shm",
+        "storage_backends": ["memory", "file", "mmap"],
         "backpressure_strategies": ["BLOCK", "RAISE", "DROP_NEWEST", "DROP_OLDEST"],
         "zero_copy_alloc_publish": "unavailable",
     }

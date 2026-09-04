@@ -11,6 +11,19 @@ Initial required topics:
 - Benchmark reports
 - Platform support
 
+## Channels
+
+`ShmChannel` is a named shared-memory channel: all processes using the same
+name (and the same capacity and slot_size) connect to the same memory-mapped
+region file. `FileChannel` memory-maps an explicit file path. Both share the
+same fixed-slot SPSC core and the same 13-byte per-slot header layout. Ring
+position comes from two shared monotonic cursor words in the region header
+(16 bytes before the slot area): the producer publishes the head count with
+each message batch and the consumer advances the tail count on each release,
+so every operation refreshes in O(1); the slot-header scan runs once per
+open (recovery) to rebuild the sequence state. The cursor protocol is
+verified by `verify/check_invariants.py` (Z3, CP-SAT, SCIP, replay).
+
 ## Backpressure
 
 `ShmChannel` and `FileChannel` support four fixed-slot SPSC backpressure strategies:

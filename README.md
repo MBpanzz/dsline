@@ -2,19 +2,20 @@
 
 `dsline` is a lightweight local dataflow framework for Python data processing and inter-process communication.
 
-Current development follows `ROADMAP.md`. The first implementation target is a fixed-slot SPSC bytes channel. The current PyO3 `ShmChannel` binding is an in-process prototype over the `dsline-shm` fixed-slot SPSC channel; the real OS shared-memory backend is still intentionally gated behind the 0.0.1 implementation work.
+Current development follows `ROADMAP.md`. The first implementation target is a fixed-slot SPSC bytes channel. `ShmChannel` and `FileChannel` are backed by a memory-mapped region that is shared across processes, so a producer and a consumer in separate processes exchange messages through the same mapping.
 
 ## Status
 
-This repository is at the first test-version stage. It is suitable for API, packaging, protocol, and benchmark harness validation, but it is not yet the final dual-process shared-memory transport.
+This repository is at the first test-version stage. It is suitable for API, packaging, protocol, and benchmark harness validation, but it is not yet the final dual-process shared-memory transport with zero-copy.
 
 Current boundaries:
 
-- `ShmChannel` is an in-process prototype.
+- `ShmChannel` is a named shared-memory channel: every process that uses the same `name` (and the same capacity and slot_size) connects to the same memory-mapped region. Region files live in the platform runtime directory (e.g. `%LOCALAPPDATA%\dsline\shm\` on Windows, `$XDG_RUNTIME_DIR`/`$TMPDIR` on Unix). `FileChannel` memory-maps an explicit file path the same way.
 - `send/recv` for existing bytes uses a copy path.
 - Messages larger than one slot are supported through multi-slot chunking; each chunk still uses fixed-slot storage.
 - `alloc/publish` zero-copy APIs are not exposed.
-- MPSC, multi-consumer, crash recovery, and real OS shared memory are still future work.
+- MPSC, multi-consumer, crash recovery, and anonymous OS shared memory (no backing file) are still future work.
+- On Windows a region file cannot be deleted while a channel still holds its mapping (standard memory-mapped file behavior); drop the channel first.
 
 ## Install for development
 
@@ -32,6 +33,24 @@ with dsline.ShmChannel("demo", capacity=4, slot_size=64) as ch:
     assert ch.stats()["queue_depth"] == 2
     assert ch.recv_with_seq() == (0, b"hello")
     assert ch.recv() == b"view"
+```
+
+Cross-process usage: two processes that open the same name see the same region.
+
+```python
+# process 1 (producer)
+import dsline
+
+with dsline.ShmChannel("demo", capacity=4, slot_size=64) as ch:
+    ch.send(b"hello")
+```
+
+```python
+# process 2 (consumer)
+import dsline
+
+with dsline.ShmChannel("demo", capacity=4, slot_size=64) as ch:
+    assert ch.recv() == b"hello"
 ```
 
 Backpressure strategies are available on `ShmChannel` and `FileChannel` through
@@ -52,8 +71,8 @@ Zero-copy wording follows the project rule:
 Implemented prototype pieces:
 
 - `dsline-core`: fixed-slot SPSC bytes ring, checksum, Frame header, chunk flags, and metadata TLV encode/decode.
-- `dsline-shm`: fixed-slot storage trait, in-memory and file-backed storage backends, region state model, SPSC bytes channel over `FREE`, `WRITING`, `COMMITTED`, `PINNED`, and `CORRUPTED`, and multi-slot chunked messages.
-- `dsline-python`: PyO3 `ShmChannel` and `FileChannel` bindings over the `dsline-shm` prototype, Python exception exports, `send()` support for bytes-like inputs (`bytes`, `bytearray`, `memoryview`, and compatible buffer objects), `recv_with_seq()`, `Block`/`Raise`/`DropNewest`/`DropOldest` backpressure, and `stats()` with queue, sequence, and message-size limits.
+- `dsline-shm`: slot-region byte-range storage trait with file and memory-mapped (OS shared memory) backends, region state model, cross-process SPSC bytes channel over `FREE`, `WRITING`, `COMMITTED`, `PINNED`, and `CORRUPTED` with shared head/tail cursor words in the region header (O(1) per-operation refresh; the slot-header scan runs once at open for sequence recovery and crashed-writer cleanup), multi-slot chunked messages, and name→region resolution for named channels.
+- `dsline-python`: PyO3 `ShmChannel` (named, cross-process shared memory) and `FileChannel` (mmap-backed file) bindings over the `dsline-shm` core, Python exception exports, `send()` support for bytes-like inputs (`bytes`, `bytearray`, `memoryview`, and compatible buffer objects), `recv_with_seq()`, `Block`/`Raise`/`DropNewest`/`DropOldest` backpressure, and `stats()` with queue, sequence, and message-size limits.
 
 ## CLI
 

@@ -2,7 +2,7 @@
 
 use dsline_core::{Backpressure as CoreBackpressure, ChannelError, DslineError, SpscConfig};
 use dsline_ops::Record;
-use dsline_shm::{PersistentShmChannel, ShmSpscChannel};
+use dsline_shm::{shm_region_path, MmapSlotStorage, PersistentShmChannel};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -45,12 +45,18 @@ impl From<Backpressure> for CoreBackpressure {
     }
 }
 
-// ── ShmChannel ──
+// ── ShmChannel (named OS shared memory, cross-process) ──
 
+/// A shared-memory channel addressed by name.
+///
+/// All processes that use the same `name` (and the same capacity and
+/// slot_size) connect to the same memory-mapped region, so one process can
+/// send while another receives.
 #[pyclass]
 struct ShmChannel {
     name: String,
-    channel: Mutex<ShmSpscChannel>,
+    path: String,
+    channel: Mutex<PersistentShmChannel>,
 }
 
 #[pymethods]
@@ -69,10 +75,14 @@ impl ShmChannel {
         }
 
         let config = channel_config(capacity, slot_size, backpressure, timeout)?;
-        let channel = ShmSpscChannel::new(config).map_err(to_py_err)?;
+        let path = shm_region_path(&name).map_err(to_py_err)?;
+        let path = path.to_string_lossy().into_owned();
+        let channel = PersistentShmChannel::<MmapSlotStorage>::create_or_open(&path, config)
+            .map_err(to_py_err)?;
 
         Ok(Self {
             name,
+            path,
             channel: Mutex::new(channel),
         })
     }
@@ -123,6 +133,11 @@ impl ShmChannel {
     }
 
     #[getter]
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    #[getter]
     fn closed(&self) -> PyResult<bool> {
         Ok(self.lock_channel()?.is_closed())
     }
@@ -146,7 +161,8 @@ impl ShmChannel {
         let channel = self.lock_channel()?;
         let stats = PyDict::new_bound(py);
         stats.set_item("name", &self.name)?;
-        stats.set_item("backend", "inprocess-prototype")?;
+        stats.set_item("path", &self.path)?;
+        stats.set_item("backend", "shm")?;
         stats.set_item("queue_depth", channel.len())?;
         stats.set_item("queue_capacity", channel.capacity())?;
         stats.set_item("slot_size", channel.payload_slot_size())?;
@@ -165,7 +181,7 @@ impl ShmChannel {
 }
 
 impl ShmChannel {
-    fn lock_channel(&self) -> PyResult<std::sync::MutexGuard<'_, ShmSpscChannel>> {
+    fn lock_channel(&self) -> PyResult<std::sync::MutexGuard<'_, PersistentShmChannel>> {
         self.channel
             .lock()
             .map_err(|_| PyRuntimeError::new_err("channel lock is poisoned"))
@@ -200,9 +216,10 @@ fn set_message_size_limit_items(
     Ok(())
 }
 
-// ── FileChannel (file-backed, cross-process) ──
+// ── FileChannel (mmap-backed file, cross-process) ──
 
-/// A file-backed channel that can be shared across processes.
+/// A channel backed by a memory-mapped file that can be shared across
+/// processes.
 ///
 /// One process calls `create()` to initialise the file, then both
 /// producer and consumer call `open()` to connect.
@@ -225,7 +242,8 @@ impl FileChannel {
         timeout: Option<f64>,
     ) -> PyResult<Self> {
         let config = channel_config(capacity, slot_size, backpressure, timeout)?;
-        let channel = PersistentShmChannel::create(&path, config).map_err(to_py_err)?;
+        let channel =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config).map_err(to_py_err)?;
         Ok(Self {
             path,
             channel: Mutex::new(channel),
@@ -243,7 +261,8 @@ impl FileChannel {
         timeout: Option<f64>,
     ) -> PyResult<Self> {
         let config = channel_config(capacity, slot_size, backpressure, timeout)?;
-        let channel = PersistentShmChannel::open(&path, config).map_err(to_py_err)?;
+        let channel =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).map_err(to_py_err)?;
         Ok(Self {
             path,
             channel: Mutex::new(channel),
@@ -470,14 +489,18 @@ impl PyPipeline {
 
         match parsed.scheme.as_str() {
             "shm" => {
-                let mut channel = ShmSpscChannel::new(config).map_err(to_py_err)?;
+                let path = shm_region_path(parsed.target()).map_err(to_py_err)?;
+                let mut channel =
+                    PersistentShmChannel::<MmapSlotStorage>::create_or_open(&path, config)
+                        .map_err(to_py_err)?;
                 while let Ok(data) = channel.recv() {
                     push_parsed_item(&data, &mut items, py);
                 }
             }
             "file" => {
                 let mut channel =
-                    PersistentShmChannel::open(parsed.target(), config).map_err(to_py_err)?;
+                    PersistentShmChannel::<MmapSlotStorage>::open(parsed.target(), config)
+                        .map_err(to_py_err)?;
                 while let Ok(data) = channel.recv() {
                     push_parsed_item(&data, &mut items, py);
                 }

@@ -1,0 +1,314 @@
+{
+  "platform": "win32",
+  "python": "3.13.12",
+  "cpu": 16,
+  "throughput": [
+    {
+      "backend": "dsline_shm",
+      "transport": "shared memory (mmap)",
+      "msg_size": 64,
+      "msgs_s": 10423,
+      "gib_s": 0.001,
+      "wall_s": 1.919
+    },
+    {
+      "backend": "dsline_shm",
+      "transport": "shared memory (mmap)",
+      "msg_size": 1024,
+      "msgs_s": 3760,
+      "gib_s": 0.004,
+      "wall_s": 5.32
+    },
+    {
+      "backend": "dsline_shm",
+      "transport": "shared memory (mmap)",
+      "msg_size": 4096,
+      "msgs_s": 8147,
+      "gib_s": 0.031,
+      "wall_s": 1.227
+    },
+    {
+      "backend": "dsline_shm",
+      "transport": "shared memory (mmap)",
+      "msg_size": 65536,
+      "msgs_s": 2359,
+      "gib_s": 0.144,
+      "wall_s": 4.239
+    },
+    {
+      "backend": "dsline_file",
+      "transport": "mmap file",
+      "msg_size": 64,
+      "msgs_s": 10717,
+      "gib_s": 0.001,
+      "wall_s": 1.866
+    },
+    {
+      "backend": "dsline_file",
+      "transport": "mmap file",
+      "msg_size": 1024,
+      "msgs_s": 9311,
+      "gib_s": 0.009,
+      "wall_s": 2.148
+    },
+    {
+      "backend": "dsline_file",
+      "transport": "mmap file",
+      "msg_size": 4096,
+      "msgs_s": 7944,
+      "gib_s": 0.03,
+      "wall_s": 1.259
+    },
+    {
+      "backend": "dsline_file",
+      "transport": "mmap file",
+      "msg_size": 65536,
+      "msgs_s": 2411,
+      "gib_s": 0.147,
+      "wall_s": 4.148
+    },
+    {
+      "backend": "mp_queue",
+      "transport": "pipe + pickle",
+      "msg_size": 64,
+      "msgs_s": 162219,
+      "gib_s": 0.01,
+      "wall_s": 0.123
+    },
+    {
+      "backend": "mp_queue",
+      "transport": "pipe + pickle",
+      "msg_size": 1024,
+      "msgs_s": 87401,
+      "gib_s": 0.083,
+      "wall_s": 0.229
+    },
+    {
+      "backend": "mp_queue",
+      "transport": "pipe + pickle",
+      "msg_size": 4096,
+      "msgs_s": 78361,
+      "gib_s": 0.299,
+      "wall_s": 0.128
+    },
+    {
+      "backend": "mp_queue",
+      "transport": "pipe + pickle",
+      "msg_size": 65536,
+      "msgs_s": 23821,
+      "gib_s": 1.454,
+      "wall_s": 0.42
+    },
+    {
+      "backend": "mp_pipe",
+      "transport": "pipe (raw)",
+      "msg_size": 64,
+      "msgs_s": 289711,
+      "gib_s": 0.017,
+      "wall_s": 0.069
+    },
+    {
+      "backend": "mp_pipe",
+      "transport": "pipe (raw)",
+      "msg_size": 1024,
+      "msgs_s": 110127,
+      "gib_s": 0.105,
+      "wall_s": 0.182
+    },
+    {
+      "backend": "mp_pipe",
+      "transport": "pipe (raw)",
+      "msg_size": 4096,
+      "msgs_s": 98124,
+      "gib_s": 0.374,
+      "wall_s": 0.102
+    },
+    {
+      "backend": "mp_pipe",
+      "transport": "pipe (raw)",
+      "msg_size": 65536,
+      "msgs_s": 32771,
+      "gib_s": 2.0,
+      "wall_s": 0.305
+    },
+    {
+      "backend": "shm_stdlib",
+      "transport": "shared memory (spin)",
+      "msg_size": 64,
+      "msgs_s": 1969357,
+      "gib_s": 0.117,
+      "wall_s": 0.01
+    },
+    {
+      "backend": "shm_stdlib",
+      "transport": "shared memory (spin)",
+      "msg_size": 1024,
+      "msgs_s": 1650356,
+      "gib_s": 1.574,
+      "wall_s": 0.012
+    },
+    {
+      "backend": "shm_stdlib",
+      "transport": "shared memory (spin)",
+      "msg_size": 4096,
+      "msgs_s": 1147263,
+      "gib_s": 4.376,
+      "wall_s": 0.009
+    },
+    {
+      "backend": "shm_stdlib",
+      "transport": "shared memory (spin)",
+      "msg_size": 65536,
+      "msgs_s": 210440,
+      "gib_s": 12.844,
+      "wall_s": 0.048
+    },
+    {
+      "backend": "zmq_tcp",
+      "transport": "tcp loopback",
+      "msg_size": 64,
+      "msgs_s": 974061,
+      "gib_s": 0.058,
+      "wall_s": 0.021
+    },
+    {
+      "backend": "zmq_tcp",
+      "transport": "tcp loopback",
+      "msg_size": 1024,
+      "msgs_s": 64219,
+      "gib_s": 0.061,
+      "wall_s": 0.311
+    },
+    {
+      "backend": "zmq_tcp",
+      "transport": "tcp loopback",
+      "msg_size": 4096,
+      "msgs_s": 17528,
+      "gib_s": 0.067,
+      "wall_s": 0.571
+    },
+    {
+      "backend": "zmq_tcp",
+      "transport": "tcp loopback",
+      "msg_size": 65536,
+      "msgs_s": 1164,
+      "gib_s": 0.071,
+      "wall_s": 8.591
+    },
+    {
+      "backend": "pynng_tcp",
+      "transport": "tcp loopback",
+      "msg_size": 64,
+      "msgs_s": 28023,
+      "gib_s": 0.002,
+      "wall_s": 0.714
+    },
+    {
+      "backend": "pynng_tcp",
+      "transport": "tcp loopback",
+      "msg_size": 1024,
+      "msgs_s": 23128,
+      "gib_s": 0.022,
+      "wall_s": 0.865
+    },
+    {
+      "backend": "pynng_tcp",
+      "transport": "tcp loopback",
+      "msg_size": 4096,
+      "msgs_s": 12158,
+      "gib_s": 0.046,
+      "wall_s": 0.823
+    },
+    {
+      "backend": "pynng_tcp",
+      "transport": "tcp loopback",
+      "msg_size": 65536,
+      "msgs_s": 1110,
+      "gib_s": 0.068,
+      "wall_s": 9.007
+    }
+  ],
+  "latency": [
+    {
+      "backend": "dsline_shm",
+      "msg_size": 64,
+      "n": 2000,
+      "p50_us": 130.02,
+      "p99_us": 290.62,
+      "p999_us": 1157.65
+    },
+    {
+      "backend": "dsline_shm",
+      "msg_size": 4096,
+      "n": 2000,
+      "p50_us": 162.7,
+      "p99_us": 786.74,
+      "p999_us": 1942.2
+    },
+    {
+      "backend": "mp_pipe",
+      "msg_size": 64,
+      "n": 2000,
+      "p50_us": 10.15,
+      "p99_us": 27.8,
+      "p999_us": 63.0
+    },
+    {
+      "backend": "mp_pipe",
+      "msg_size": 4096,
+      "n": 2000,
+      "p50_us": 19.4,
+      "p99_us": 47.24,
+      "p999_us": 79.75
+    },
+    {
+      "backend": "shm_stdlib",
+      "msg_size": 64,
+      "n": 2000,
+      "p50_us": 1.1,
+      "p99_us": 2.1,
+      "p999_us": 14.14
+    },
+    {
+      "backend": "shm_stdlib",
+      "msg_size": 4096,
+      "n": 2000,
+      "p50_us": 2.35,
+      "p99_us": 3.85,
+      "p999_us": 19.34
+    },
+    {
+      "backend": "zmq_tcp",
+      "msg_size": 64,
+      "n": 2000,
+      "p50_us": 94.1,
+      "p99_us": 188.02,
+      "p999_us": 249.69
+    },
+    {
+      "backend": "zmq_tcp",
+      "msg_size": 4096,
+      "n": 2000,
+      "p50_us": 98.05,
+      "p99_us": 176.5,
+      "p999_us": 221.54
+    },
+    {
+      "backend": "pynng_tcp",
+      "msg_size": 64,
+      "n": 2000,
+      "p50_us": 40.6,
+      "p99_us": 71.3,
+      "p999_us": 99.49
+    },
+    {
+      "backend": "pynng_tcp",
+      "msg_size": 4096,
+      "n": 2000,
+      "p50_us": 66.13,
+      "p99_us": 112.58,
+      "p999_us": 147.49
+    }
+  ],
+  "inproc": []
+}
