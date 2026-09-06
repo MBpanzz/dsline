@@ -11,6 +11,35 @@
 
 ---
 
+## Update — 2026-09-06: declarative Pipeline API and region-management CLI
+
+Two 0.1 工程 items land, both closing documented roadmap surfaces:
+
+- **The roadmap's chaining API now works as written** (§11.2):
+  `dsline.Pipeline().from_transport("shm://sensor").pipe(
+  ops.filter_expr(...), ops.map_expr(...), ops.batch(...)).sink("shm://out")
+  .run()`. A pure-Python layer (`python/dsline/ops.py` deferred operator
+  specs + a `Pipeline` wrapper with `pipe`/`sink`/`run`) composes the
+  existing Rust pull engine: `run()` drains the transport source (or an
+  explicit iterable), applies the operators, and sends each result into the
+  sink channel as bytes. All imperative methods (`filter_expr`, `collect`,
+  `send_to`, `receive_from`, ...) delegate unchanged, so the existing bench
+  and tests keep working.
+- **`dsline shm` CLI** (§11.5): `dir`, `list`, `inspect <name>`,
+  `cleanup --older-than 1h`, `remove <name>`, all with `--json`. The
+  name→file mapping mirrors `dsline-shm` exactly (FNV-1a checksum32), with
+  the runtime directory from `LOCALAPPDATA` / `XDG_RUNTIME_DIR`. On
+  Windows named channels leave no files (paging-file sections), so the
+  commands honestly report empty state there.
+- Tests: 99 Python tests (14 new: declarative chaining, end-to-end
+  `from_transport → pipe → sink → run` through real named channels, and
+  CLI region management against a redirected runtime dir).
+
+Still not implemented: multi-consumer, `alloc/publish` zero-copy (safety
+gate pending), crash recovery, arena allocator, metrics/`BusTransport`.
+
+---
+
 ## Update — 2026-09-06: MPSC — CAS reservation protocol
 
 The channel layer gains the 0.1.0 milestone's multi-producer capability,

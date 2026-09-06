@@ -2,6 +2,7 @@ import argparse
 
 from ._bench import format_results, run_pipeline_bench, run_shm_bench
 from ._info import format_info, get_info
+from ._shm import cleanup, dir_path, inspect, list_regions, remove
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -11,6 +12,42 @@ def build_parser() -> argparse.ArgumentParser:
     # ── info ──
     info = subcommands.add_parser("info")
     info.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    # ── shm: named-channel region management ──
+    shm = subcommands.add_parser(
+        "shm",
+        help="Manage named-channel regions (runtime directory).",
+        description=(
+            "Named channels on Windows live in paging-file sections (no files); "
+            "elsewhere they live as dsline-*.bin files in the runtime directory."
+        ),
+    )
+    shm_subcommands = shm.add_subparsers(dest="shm_command", required=True)
+
+    shm_dir = shm_subcommands.add_parser("dir", help="Print the runtime directory.")
+    shm_dir.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    list_parser = shm_subcommands.add_parser("list", help="List region files.")
+    list_parser.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    inspect_parser = shm_subcommands.add_parser("inspect", help="Inspect one channel's region file.")
+    inspect_parser.add_argument("name")
+    inspect_parser.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    cleanup_parser = shm_subcommands.add_parser(
+        "cleanup", help="Delete region files older than --older-than."
+    )
+    cleanup_parser.add_argument(
+        "--older-than",
+        required=True,
+        metavar="DURATION",
+        help="Age threshold, e.g. 90s, 30m, 2h, 1d.",
+    )
+    cleanup_parser.add_argument("--json", action="store_true", help="Emit JSON.")
+
+    remove_parser = shm_subcommands.add_parser("remove", help="Delete one channel's region file.")
+    remove_parser.add_argument("name")
+    remove_parser.add_argument("--json", action="store_true", help="Emit JSON.")
 
     # ── bench ──
     bench = subcommands.add_parser("bench")
@@ -57,11 +94,35 @@ def main(argv: list[str] | None = None) -> int:
         print(format_info(get_info(), args.json))
         return 0
 
+    if args.command == "shm":
+        return _handle_shm(args, parser)
+
     if args.command == "bench":
         return _handle_bench(args, parser)
 
     parser.error("unsupported command")
     return 2
+
+
+def _handle_shm(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    try:
+        if args.shm_command == "dir":
+            print(dir_path(args.json))
+        elif args.shm_command == "list":
+            print(list_regions(args.json))
+        elif args.shm_command == "inspect":
+            print(inspect(args.name, args.json))
+        elif args.shm_command == "cleanup":
+            print(cleanup(args.older_than, args.json))
+        elif args.shm_command == "remove":
+            print(remove(args.name, args.json))
+        else:
+            parser.error("unsupported shm command")
+            return 2
+    except ValueError as exc:
+        parser.error(str(exc))
+        return 2
+    return 0
 
 
 def _handle_bench(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

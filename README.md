@@ -84,12 +84,17 @@ Implemented prototype pieces:
 - `dsline-core`: fixed-slot SPSC bytes ring, checksum, Frame header, chunk flags, and metadata TLV encode/decode.
 - `dsline-shm`: slot-region byte-range storage trait with file and memory-mapped (OS shared memory) backends, region state model, cross-process SPSC bytes channel over `FREE`, `WRITING`, `COMMITTED`, `PINNED`, and `CORRUPTED` with shared head/tail cursor words in the region header (O(1) per-operation refresh; the slot-header scan runs once at open for sequence recovery and crashed-writer cleanup), multi-slot chunked messages, an opt-in multi-producer (MPSC) mode that reserves head with a hardware CAS, and name→region resolution for named channels.
 - `dsline-python`: PyO3 `ShmChannel` (named, cross-process shared memory) and `FileChannel` (mmap-backed file) bindings over the `dsline-shm` core, Python exception exports, `send()` support for bytes-like inputs (`bytes`, `bytearray`, `memoryview`, and compatible buffer objects), `recv_with_seq()`, `Block`/`Raise`/`DropNewest`/`DropOldest` backpressure, and `stats()` with queue, sequence, and message-size limits.
+- The Python `Pipeline` supports the declarative roadmap API: `from_transport("shm://...").pipe(ops.filter_expr(...), ops.map_expr(...), ops.batch(...)).sink("shm://...")` with `dsline.ops` deferred operators, plus `run()` that drains the source, applies the operators, and sends each result into the sink channel as bytes.
 
 ## CLI
 
 ```bash
 python -m dsline info
 python -m dsline bench shm --message-size 4096 --count 100000 --json
+python -m dsline shm list
+python -m dsline shm inspect demo
+python -m dsline shm cleanup --older-than 1h
+python -m dsline shm remove demo
 ```
 
 After installation, the console script is also available:
@@ -97,7 +102,16 @@ After installation, the console script is also available:
 ```bash
 dsline info
 dsline bench shm --message-size 4096 --count 100000 --json
+dsline shm list
 ```
+
+`dsline shm` manages named-channel regions in the platform runtime
+directory (`dsline-*.bin` files; on Windows named channels use paging-file
+sections and leave no files, so the commands mostly report empty state
+there). `dir` prints the runtime directory, `list` shows the region files,
+`inspect <name>` shows one channel's region file, `cleanup --older-than
+<90s|30m|2h|1d>` deletes stale regions, and `remove <name>` deletes one
+channel's region file.
 
 ## Verification
 

@@ -1022,20 +1022,20 @@ dsline/
 
 ### Pipeline
 
-- [ ] `Pipeline` API。
-- [ ] `from_transport("shm://...")`。
-- [ ] `pipe(...)`。
-- [ ] `sink(...)`。
-- [ ] `run/start/stop`。
-- [ ] 后台 tokio runtime。
+- [x] `Pipeline` API。
+- [x] `from_transport("shm://...")`。
+- [x] `pipe(...)`（`dsline.ops` 延迟算子；2026-09-06）。
+- [x] `sink(...)`（shm:// / file://；2026-09-06）。
+- [x] `run()`（同步排空源 → 算子 → sink；2026-09-06）。
+- [ ] run/start/stop 异步化与后台 tokio runtime。
 - [ ] 有界队列和背压传播。
 
 ### Operators
 
-- [ ] `select`
-- [ ] `batch`
-- [ ] `filter_expr`，expr-lite。
-- [ ] `map_expr`，expr-lite。
+- [x] `select`
+- [x] `batch`
+- [x] `filter_expr`，expr-lite。
+- [x] `map_expr`，expr-lite。
 - [ ] `map_py`
 - [ ] `filter_py`
 
@@ -1046,6 +1046,7 @@ dsline/
 - [ ] bytes channel 示例。
 - [ ] numpy 单次拷贝示例。
 - [ ] Pipeline 示例。
+- [x] `dsline shm` CLI（list/inspect/cleanup/remove，§11.5；2026-09-06）。
 - [ ] benchmark 文档。
 - [ ] Linux/macOS CI。
 - [ ] Windows experimental CI，允许非阻塞失败或单独 job。

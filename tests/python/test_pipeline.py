@@ -1,6 +1,7 @@
 import unittest
 
 import dsline
+from dsline import ops
 
 
 class PipelineTests(unittest.TestCase):
@@ -379,6 +380,95 @@ class PipelineTests(unittest.TestCase):
         p2.filter_expr("x > 3")
         result = p2.receive_from(ch)
         self.assertEqual(result, [4.0, 5.0, 6.0])
+
+    # ── declarative chaining API (dsline.ops + pipe/sink/run) ──
+
+    def test_pipe_chain_matches_imperative_form(self) -> None:
+        source = [
+            {"temperature": 25.0, "humidity": 60.0},
+            {"temperature": 30.0, "humidity": 90.0},
+            {"temperature": 10.0, "humidity": 50.0},
+        ]
+        p = dsline.Pipeline()
+        p.pipe(
+            ops.filter_expr("temperature > 20 and humidity < 80"),
+            ops.map_expr("temperature * 1.8 + 32"),
+        )
+        self.assertEqual(p.collect(source), [77.0])
+
+    def test_pipe_batch_and_select(self) -> None:
+        source = [
+            {"temperature": 25.0, "humidity": 60.0},
+            {"temperature": 30.0, "humidity": 90.0},
+        ]
+        p = dsline.Pipeline()
+        p.pipe(ops.batch(2), ops.MapPyBatch(lambda d: d["temperature"]))
+        result = p.collect(source)
+        self.assertEqual(result, [[25.0, 30.0]])
+
+        p2 = dsline.Pipeline()
+        p2.pipe(ops.select(["temperature"]))
+        self.assertEqual(p2.collect(source), [{"temperature": 25.0}, {"temperature": 30.0}])
+
+    def test_pipe_rejects_non_operator(self) -> None:
+        p = dsline.Pipeline()
+        with self.assertRaises(TypeError):
+            p.pipe("temperature > 20")
+
+    def test_chaining_returns_self(self) -> None:
+        p = dsline.Pipeline()
+        self.assertIs(p.filter_expr("x > 1"), p)
+        self.assertIs(p.map_expr("x * 2"), p)
+        self.assertIs(p.batch(2), p)
+        self.assertIs(p.select(["x"]), p)
+
+    def test_run_without_sink_raises(self) -> None:
+        p = dsline.Pipeline()
+        with self.assertRaises(RuntimeError):
+            p.run([1, 2, 3])
+
+    def test_run_sends_results_to_named_sink(self) -> None:
+        sink_name = f"dsline-test-sink-{id(self)}"
+        p = dsline.Pipeline()
+        p.pipe(
+            ops.filter_expr("temperature > 20"),
+            ops.map_expr("temperature * 1.8 + 32"),
+        ).sink(f"shm://{sink_name}?capacity=8&slot_size=64")
+        sent = p.run(
+            [
+                {"temperature": 25.0},
+                {"temperature": 10.0},
+                {"temperature": 30.0},
+            ]
+        )
+        self.assertEqual(sent, 2)
+        with dsline.ShmChannel(sink_name, capacity=8, slot_size=64) as out:
+            self.assertEqual(out.recv(), b"77.0")
+            self.assertEqual(out.recv(), b"86.0")
+
+    def test_run_end_to_end_transport_source_to_sink(self) -> None:
+        # The roadmap's full shape: from_transport(...).pipe(...).sink(...).
+        # A producer seeds the input channel; run() drains it, applies the
+        # operators, and writes the results into the sink channel.
+        in_name = f"dsline-test-in-{id(self)}"
+        out_name = f"dsline-test-out-{id(self)}"
+        seeder = dsline.ShmChannel(in_name, capacity=8, slot_size=64)
+        seeder.send(b"25")
+        seeder.send(b"11")
+        seeder.send(b"4")
+        seeder.close()
+
+        p = dsline.Pipeline()
+        p.from_transport(f"shm://{in_name}?capacity=8&slot_size=64").pipe(
+            ops.filter_expr("x > 10"),
+            ops.map_expr("x - 10"),
+        ).sink(f"shm://{out_name}?capacity=8&slot_size=64")
+        sent = p.run()
+        self.assertEqual(sent, 2)
+
+        with dsline.ShmChannel(out_name, capacity=8, slot_size=64) as out:
+            self.assertEqual(out.recv(), b"15.0")
+            self.assertEqual(out.recv(), b"1.0")
 
 
 if __name__ == "__main__":
