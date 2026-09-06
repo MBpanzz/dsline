@@ -38,7 +38,7 @@ import sys
 CHUNK_METADATA_LEN = 42  # 3 TLVs x (2-byte type + 4-byte len + 8-byte value)
 FRAME_HEADER_LEN = 50
 PERSISTENT_SLOT_HEADER_LEN = 13
-REGION_HEADER_LEN = 16  # two u64 shared cursors: producer head, consumer tail
+REGION_HEADER_LEN = 20  # head: u64 @ 0, tail: u64 @ 8, init magic: u32 @ 16
 
 PASS = []
 FAIL = []
@@ -1077,7 +1077,7 @@ def check_replay():
             os.remove(path)
         except OSError:
             pass
-    record("R2 on-disk region size == 16 + capacity*(slot+63)", ok, detail)
+    record("R2 on-disk region size == 20 + capacity*(slot+63)", ok, detail)
 
     # ── R3: random schedule matches the reference model ──
     # The same bookkeeping the solvers model (depth = occupied slots,

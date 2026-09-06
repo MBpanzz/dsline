@@ -11,6 +11,16 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
+/// Backend for named shared-memory channels: a named paging-file section on
+/// Windows (coherent across processes without any flush), the file-backed
+/// mapping elsewhere (already flush-free there).
+#[cfg(windows)]
+use dsline_shm::SectionShmSlotStorage;
+#[cfg(windows)]
+type NamedShmStorage = SectionShmSlotStorage;
+#[cfg(not(windows))]
+type NamedShmStorage = MmapSlotStorage;
+
 // ── Python exceptions ──
 
 create_exception!(_dsline, DslineErrorPy, PyException);
@@ -56,7 +66,7 @@ impl From<Backpressure> for CoreBackpressure {
 struct ShmChannel {
     name: String,
     path: String,
-    channel: Mutex<PersistentShmChannel>,
+    channel: Mutex<PersistentShmChannel<NamedShmStorage>>,
 }
 
 #[pymethods]
@@ -77,7 +87,7 @@ impl ShmChannel {
         let config = channel_config(capacity, slot_size, backpressure, timeout)?;
         let path = shm_region_path(&name).map_err(to_py_err)?;
         let path = path.to_string_lossy().into_owned();
-        let channel = PersistentShmChannel::<MmapSlotStorage>::create_or_open(&path, config)
+        let channel = PersistentShmChannel::<NamedShmStorage>::create_or_open(&path, config)
             .map_err(to_py_err)?;
 
         Ok(Self {
@@ -181,7 +191,9 @@ impl ShmChannel {
 }
 
 impl ShmChannel {
-    fn lock_channel(&self) -> PyResult<std::sync::MutexGuard<'_, PersistentShmChannel>> {
+    fn lock_channel(
+        &self,
+    ) -> PyResult<std::sync::MutexGuard<'_, PersistentShmChannel<NamedShmStorage>>> {
         self.channel
             .lock()
             .map_err(|_| PyRuntimeError::new_err("channel lock is poisoned"))
@@ -226,7 +238,7 @@ fn set_message_size_limit_items(
 #[pyclass]
 struct FileChannel {
     path: String,
-    channel: Mutex<PersistentShmChannel>,
+    channel: Mutex<PersistentShmChannel<MmapSlotStorage>>,
 }
 
 #[pymethods]
@@ -491,7 +503,7 @@ impl PyPipeline {
             "shm" => {
                 let path = shm_region_path(parsed.target()).map_err(to_py_err)?;
                 let mut channel =
-                    PersistentShmChannel::<MmapSlotStorage>::create_or_open(&path, config)
+                    PersistentShmChannel::<NamedShmStorage>::create_or_open(&path, config)
                         .map_err(to_py_err)?;
                 while let Ok(data) = channel.recv() {
                     push_parsed_item(&data, &mut items, py);

@@ -17,4 +17,5 @@ build/
 .idea/
 .vscode/
 .claude/
+.zcode/
 *.log

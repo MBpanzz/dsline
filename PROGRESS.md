@@ -11,6 +11,45 @@
 
 ---
 
+## Update — 2026-09-06: Windows named channels move to paging-file sections
+
+The flush cost measured in the September 4 update (FlushViewOfFile, ~45 µs
+per call) is gone from the Windows send/recv path:
+
+- **`ShmChannel` on Windows is now backed by a named paging-file section**
+  (`SectionShmSlotStorage`): `CreateFileMappingW` with `INVALID_HANDLE_VALUE`
+  backs the region with the system paging file, the same mechanism
+  `multiprocessing.shared_memory` uses minus the file. The memory manager
+  keeps views coherent without any flush, so a named channel round trip
+  drops the measured per-message flush cost entirely. The section name is
+  derived from the resolved region path (`Local\dsline-<digest>.bin`), no
+  backing file is created on Windows, and the section is destroyed when the
+  last handle closes — no stale-region cleanup. The Python `ShmChannel`
+  selects the backend per platform (`SectionShmSlotStorage` on Windows,
+  file-backed `MmapSlotStorage` elsewhere); `FileChannel` keeps the file
+  mapping.
+- **Region header grows to 20 bytes** — `[head: u64 @ 0] [tail: u64 @ 8]
+  [magic: u32 @ 16]` — and gains an initialization-magic protocol: the
+  creator zero-fills every slot header and publishes `REGION_MAGIC` last
+  (release store); every other opener polls for the magic before recovering
+  the ring (acquire load). Required because a fresh section is zero-filled,
+  which is both the empty-ring state and the mid-init state — without the
+  magic an opener could mistake a half-initialized region for an empty one.
+  `create_or_open` is now atomic on named sections (the OS guarantees
+  exactly one creator), so exactly one process runs the init pass.
+- Tests: 48 Rust unit tests in `dsline-shm` (6 new section-backend tests:
+  byte-range I/O, create-or-open single-creator arbitration, open-without-
+  create failure, message exchange through one section, magic wait on a
+  creator that died mid-init, and section lifetime), 81 Python tests, 40/40
+  solver checks (verify script constants updated for the 20-byte header).
+
+Still not implemented: `alloc/publish` zero-copy (safety gate pending), MPSC,
+crash recovery, arena allocator, cleanup CLI. (Anonymous OS shared memory is
+now effectively delivered on Windows via the paging-file section; it remains
+future work on Unix.)
+
+---
+
 ## Update — 2026-09-04: shared cursors replace the per-operation ring scan
 
 The benchmark analysis identified two design costs dominating the channel's

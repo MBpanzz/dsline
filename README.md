@@ -10,12 +10,12 @@ This repository is at the first test-version stage. It is suitable for API, pack
 
 Current boundaries:
 
-- `ShmChannel` is a named shared-memory channel: every process that uses the same `name` (and the same capacity and slot_size) connects to the same memory-mapped region. Region files live in the platform runtime directory (e.g. `%LOCALAPPDATA%\dsline\shm\` on Windows, `$XDG_RUNTIME_DIR`/`$TMPDIR` on Unix). `FileChannel` memory-maps an explicit file path the same way.
+- `ShmChannel` is a named shared-memory channel: every process that uses the same `name` (and the same capacity and slot_size) connects to the same memory-mapped region. On Windows the region lives in a named paging-file section (no backing file, destroyed when the last handle closes); elsewhere region files live in the platform runtime directory (e.g. `%LOCALAPPDATA%\dsline\shm\` on Windows, `$XDG_RUNTIME_DIR`/`$TMPDIR` on Unix, used only when falling back to the file backend). `FileChannel` memory-maps an explicit file path the same way.
 - `send/recv` for existing bytes uses a copy path.
 - Messages larger than one slot are supported through multi-slot chunking; each chunk still uses fixed-slot storage.
 - `alloc/publish` zero-copy APIs are not exposed.
 - MPSC, multi-consumer, crash recovery, and anonymous OS shared memory (no backing file) are still future work.
-- On Windows a region file cannot be deleted while a channel still holds its mapping (standard memory-mapped file behavior); drop the channel first.
+- On Windows a `FileChannel` region file cannot be deleted while a channel still holds its mapping (standard memory-mapped file behavior); drop the channel first.
 
 ## Install for development
 

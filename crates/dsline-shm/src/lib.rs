@@ -391,6 +391,25 @@ pub trait SlotRegionIo: std::fmt::Debug + Sized {
         total_len: usize,
     ) -> Result<Self>;
 
+    /// Open the region if it exists, otherwise create it.
+    ///
+    /// Returns `(storage, created)`. Named backends use an atomic
+    /// create-or-open (the OS guarantees exactly one creator); the default
+    /// implementation is open-then-create, which can truncate a store that
+    /// another process is racing with and is only suitable for reference
+    /// backends.
+    fn create_or_open(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<(Self, bool)> {
+        match Self::open(path.as_ref(), capacity, slot_size, total_len) {
+            Ok(storage) => Ok((storage, false)),
+            Err(_) => Ok((Self::create(path, capacity, slot_size, total_len)?, true)),
+        }
+    }
+
     fn capacity(&self) -> usize;
     fn slot_size(&self) -> usize;
     fn path(&self) -> &Path;
@@ -804,6 +823,18 @@ impl SlotRegionIo for MmapSlotStorage {
         Self::open(path, capacity, slot_size, total_len)
     }
 
+    fn create_or_open(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<(Self, bool)> {
+        match Self::create_new(&path, capacity, slot_size, total_len) {
+            Ok(storage) => Ok((storage, true)),
+            Err(_) => Ok((Self::open(path, capacity, slot_size, total_len)?, false)),
+        }
+    }
+
     fn capacity(&self) -> usize {
         self.capacity
     }
@@ -900,6 +931,363 @@ impl SlotRegionIo for MmapSlotStorage {
         // ~1ms per call — never use it per message.
         map.flush_async_range(offset, len)
             .map_err(|_| ChannelError::StorageIo("flush mmap storage").into())
+    }
+}
+
+// ── Named paging-file section backend (Windows) ──
+
+/// A slot region backed by a named paging-file section.
+///
+/// `CreateFileMappingW` with `INVALID_HANDLE_VALUE` backs the region with
+/// the system paging file: every process that opens the same section name
+/// shares the same physical pages, and the memory manager keeps the views
+/// coherent **without** `FlushViewOfFile` — unlike file-backed mappings,
+/// whose cross-process visibility on Windows requires a flush (measured at
+/// ~45 µs per call, see `docs/benchmarks.md`). This is the same mechanism
+/// `multiprocessing.shared_memory` uses, minus the file: the section lives
+/// as long as any handle or view is open and is destroyed when the last one
+/// closes — no backing files, no stale-region cleanup.
+///
+/// The section name is derived from the resolved region path's file name
+/// (e.g. `Local\dsline-3dd8a08e.bin`), so named channels keep their stable
+/// name → region mapping. The backing store is zero-filled at creation,
+/// which is already the empty-ring state (FREE = 0); the channel still runs
+/// its initialization pass and publishes the `REGION_MAGIC` last, and
+/// openers wait for it (see `PersistentSlotRegion::wait_initialized`).
+#[cfg(windows)]
+#[derive(Debug)]
+pub struct SectionShmSlotStorage {
+    capacity: usize,
+    slot_size: usize,
+    total_len: usize,
+    path: PathBuf,
+    /// The section handle (`CreateFileMappingW` / `OpenFileMappingW`
+    /// result), kept for the lifetime of the storage.
+    section: usize,
+    /// The mapped view (base address + length), guarded by the mutex.
+    view: Mutex<SectionView>,
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct SectionView {
+    base: usize,
+}
+
+#[cfg(windows)]
+mod section_ffi {
+    use std::os::raw::c_void;
+
+    #[allow(non_camel_case_types)]
+    type HANDLE = *mut c_void;
+
+    pub const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
+    pub const PAGE_READWRITE: u32 = 0x04;
+    pub const FILE_MAP_ALL_ACCESS: u32 = 0x000F_001F;
+    pub const ERROR_ALREADY_EXISTS: u32 = 183;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn CreateFileMappingW(
+            h_file: HANDLE,
+            lp_attributes: *mut c_void,
+            fl_protect: u32,
+            dw_maximum_size_high: u32,
+            dw_maximum_size_low: u32,
+            lp_name: *const u16,
+        ) -> HANDLE;
+        pub fn OpenFileMappingW(
+            dw_desired_access: u32,
+            b_inherit_handle: i32,
+            lp_name: *const u16,
+        ) -> HANDLE;
+        pub fn MapViewOfFile(
+            h_file_mapping: HANDLE,
+            dw_desired_access: u32,
+            dw_file_offset_high: u32,
+            dw_file_offset_low: u32,
+            dw_number_of_bytes_to_map: usize,
+        ) -> *mut c_void;
+        pub fn UnmapViewOfFile(lp_base_address: *const c_void) -> i32;
+        pub fn CloseHandle(h_object: HANDLE) -> i32;
+        pub fn GetLastError() -> u32;
+    }
+}
+
+#[cfg(windows)]
+impl SectionShmSlotStorage {
+    /// Section name derived from the resolved region path's file name,
+    /// session-scoped (`Local\`).
+    fn section_name(path: &Path) -> Result<Vec<u16>> {
+        let file = path
+            .file_name()
+            .ok_or(ChannelError::StorageIo("region path has no file name"))?;
+        let name = format!("Local\\dsline-{}", file.to_string_lossy());
+        Ok(name.encode_utf16().chain(std::iter::once(0)).collect())
+    }
+
+    fn validate(total_len: usize, capacity: usize, slot_size: usize) -> Result<()> {
+        if capacity == 0 {
+            return Err(ChannelError::InvalidConfig("capacity must be greater than zero").into());
+        }
+        if slot_size == 0 {
+            return Err(ChannelError::InvalidConfig("slot_size must be greater than zero").into());
+        }
+        let expected = capacity
+            .checked_mul(slot_size)
+            .and_then(|v| v.checked_add(REGION_HEADER_LEN))
+            .ok_or(ChannelError::InvalidConfig("storage size overflow"))?;
+        if total_len != expected {
+            return Err(ChannelError::InvalidConfig("storage size mismatch").into());
+        }
+        Ok(())
+    }
+
+    /// Map `total_len` bytes of the section into this process.
+    ///
+    /// # Safety
+    /// The section handle must be valid for the lifetime of the returned
+    /// view; the view is unmapped in `Drop`.
+    fn map_view(section: usize, total_len: usize) -> Result<SectionView> {
+        let base = unsafe {
+            section_ffi::MapViewOfFile(
+                section as *mut std::ffi::c_void,
+                section_ffi::FILE_MAP_ALL_ACCESS,
+                0,
+                0,
+                total_len,
+            )
+        };
+        if base.is_null() {
+            return Err(ChannelError::StorageIo("map shared memory section").into());
+        }
+        Ok(SectionView {
+            base: base as usize,
+        })
+    }
+
+    fn create_or_open_impl(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<(Self, bool)> {
+        Self::validate(total_len, capacity, slot_size)?;
+        let path = path.as_ref().to_path_buf();
+        let name = Self::section_name(&path)?;
+        let section = unsafe {
+            let hi = (total_len as u64 >> 32) as u32;
+            let lo = total_len as u32;
+            section_ffi::CreateFileMappingW(
+                section_ffi::INVALID_HANDLE_VALUE,
+                std::ptr::null_mut(),
+                section_ffi::PAGE_READWRITE,
+                hi,
+                lo,
+                name.as_ptr(),
+            )
+        };
+        if section.is_null() {
+            return Err(ChannelError::StorageIo("create shared memory section").into());
+        }
+        let created = unsafe { section_ffi::GetLastError() } != section_ffi::ERROR_ALREADY_EXISTS;
+        let view = Self::map_view(section as usize, total_len)?;
+        Ok((
+            Self {
+                capacity,
+                slot_size,
+                total_len,
+                path,
+                section: section as usize,
+                view: Mutex::new(view),
+            },
+            created,
+        ))
+    }
+
+    fn open_impl(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
+        Self::validate(total_len, capacity, slot_size)?;
+        let path = path.as_ref().to_path_buf();
+        let name = Self::section_name(&path)?;
+        let section = unsafe {
+            section_ffi::OpenFileMappingW(section_ffi::FILE_MAP_ALL_ACCESS, 0, name.as_ptr())
+        };
+        if section.is_null() {
+            return Err(ChannelError::StorageIo("open shared memory section").into());
+        }
+        let view = Self::map_view(section as usize, total_len)?;
+        Ok(Self {
+            capacity,
+            slot_size,
+            total_len,
+            path,
+            section: section as usize,
+            view: Mutex::new(view),
+        })
+    }
+
+    fn validate_range(&self, offset: usize, len: usize) -> Result<()> {
+        if offset > self.total_len || len > self.total_len - offset {
+            return Err(ChannelError::InvalidConfig("section storage range out of bounds").into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SectionShmSlotStorage {
+    fn drop(&mut self) {
+        let view = self
+            .view
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("section storage lock poisoned"))
+            .ok();
+        if let Some(view) = view {
+            if view.base != 0 {
+                // SAFETY: the view was produced by `MapViewOfFile` and no
+                // operation can outlive the storage (the mutex guard is
+                // held here, and `self` is being dropped).
+                unsafe {
+                    section_ffi::UnmapViewOfFile(view.base as *const std::ffi::c_void);
+                }
+            }
+        }
+        if self.section != 0 {
+            // SAFETY: the section handle was produced by
+            // `CreateFileMappingW` / `OpenFileMappingW` and is only closed
+            // once, here.
+            unsafe {
+                section_ffi::CloseHandle(self.section as *mut std::ffi::c_void);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl SlotRegionIo for SectionShmSlotStorage {
+    fn create(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
+        // A named section cannot be truncated while other processes hold
+        // it; `create` is create-or-open with the flag dropped.
+        Ok(Self::create_or_open_impl(path, capacity, slot_size, total_len)?.0)
+    }
+
+    fn open(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<Self> {
+        Self::open_impl(path, capacity, slot_size, total_len)
+    }
+
+    fn create_or_open(
+        path: impl AsRef<Path>,
+        capacity: usize,
+        slot_size: usize,
+        total_len: usize,
+    ) -> Result<(Self, bool)> {
+        Self::create_or_open_impl(path, capacity, slot_size, total_len)
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn slot_size(&self) -> usize {
+        self.slot_size
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn read_at(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.validate_range(offset, len)?;
+        let view = self
+            .view
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("section storage lock poisoned"))?;
+        // SAFETY: the view outlives the guard; `offset + len` is within the
+        // mapped range (validated above).
+        let src = unsafe { std::slice::from_raw_parts((view.base + offset) as *const u8, len) };
+        Ok(src.to_vec())
+    }
+
+    fn write_at(&self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.validate_range(offset, bytes.len())?;
+        let view = self
+            .view
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("section storage lock poisoned"))?;
+        // SAFETY: as in `read_at`.
+        let dst =
+            unsafe { std::slice::from_raw_parts_mut((view.base + offset) as *mut u8, bytes.len()) };
+        dst.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn clear_at(&self, offset: usize, len: usize) -> Result<()> {
+        self.validate_range(offset, len)?;
+        let view = self
+            .view
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("section storage lock poisoned"))?;
+        // SAFETY: as in `read_at`.
+        let dst = unsafe { std::slice::from_raw_parts_mut((view.base + offset) as *mut u8, len) };
+        dst.fill(0);
+        Ok(())
+    }
+
+    // `flush_range` intentionally falls back to the no-op default: the
+    // paging-file section is coherent across views without flushing.
+
+    fn load_u64(&self, offset: usize) -> Result<u64> {
+        self.validate_range(offset, 8)?;
+        let view = self
+            .view
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("section storage lock poisoned"))?;
+        // SAFETY: `offset` is 8-aligned (region header cursor constants) and
+        // within the mapping, which outlives the lock guard; the underlying
+        // memory is shared with other processes, where the hardware provides
+        // the atomicity of aligned 8-byte accesses.
+        let ptr = (view.base + offset) as *const AtomicU64;
+        Ok(unsafe { (&*ptr).load(Ordering::Acquire) })
+    }
+
+    fn store_u64(&self, offset: usize, value: u64) -> Result<()> {
+        self.validate_range(offset, 8)?;
+        let view = self
+            .view
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("section storage lock poisoned"))?;
+        // SAFETY: as in `load_u64`; a release store publishes the slot
+        // writes that precede it.
+        let ptr = (view.base + offset) as *mut AtomicU64;
+        unsafe { (&*ptr).store(value, Ordering::Release) };
+        Ok(())
+    }
+
+    fn fetch_max_u64(&self, offset: usize, value: u64) -> Result<u64> {
+        self.validate_range(offset, 8)?;
+        let view = self
+            .view
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("section storage lock poisoned"))?;
+        // SAFETY: as in `load_u64`; the RMW advances the shared cursor
+        // monotonically even when two roles advance it concurrently.
+        let ptr = (view.base + offset) as *mut AtomicU64;
+        Ok(unsafe { (&*ptr).fetch_max(value, Ordering::Release) })
     }
 }
 
@@ -1081,12 +1469,27 @@ impl<S: FixedSlotStorage> FixedSlotRegion<S> {
 pub const PERSISTENT_SLOT_HEADER_LEN: usize = 13;
 
 /// Size of the region header at the start of the backing store, holding the
-/// SPSC cursors: `head` (producer-owned, monotonic slot count) at offset 0
-/// and `tail` (consumer-owned) at offset 8.
-pub const REGION_HEADER_LEN: usize = 16;
+/// SPSC cursors and the initialization magic:
+///
+/// ```text
+/// [head: u64 @ 0] [tail: u64 @ 8] [magic: u32 @ 16]
+/// ```
+///
+/// `head` is producer-owned (monotonic slot count), `tail` is consumer-owned.
+/// The magic is written last by the initializer (release store) and polled
+/// by the open path (acquire load), so a peer can never observe a
+/// half-initialized region: the caller that creates the store first fills
+/// every slot header and only then publishes the magic; everyone else waits
+/// for it before recovering the ring.
+pub const REGION_HEADER_LEN: usize = 20;
+
+/// Magic value published once initialization completes
+/// (bytes `DSL1` little-endian).
+pub const REGION_MAGIC: u32 = 0x3153_4c44;
 
 const CURSOR_HEAD_OFFSET: usize = 0;
 const CURSOR_TAIL_OFFSET: usize = 8;
+const MAGIC_OFFSET: usize = 16;
 
 /// Resolve a channel name to a stable region file path in the runtime
 /// directory. The same name always maps to the same path, in every process,
@@ -1311,6 +1714,40 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
     /// consumer on consume and by the producer for DropOldest.
     pub fn fetch_max_tail(&self, tail: u64) -> Result<u64> {
         self.storage.fetch_max_u64(CURSOR_TAIL_OFFSET, tail)
+    }
+
+    /// Load the initialization magic (acquire).
+    pub fn load_magic(&self) -> Result<u32> {
+        let raw = self
+            .storage
+            .read_at(MAGIC_OFFSET, std::mem::size_of::<u32>())?;
+        Ok(u32::from_le_bytes(
+            raw.try_into().expect("magic is 4 bytes"),
+        ))
+    }
+
+    /// Publish the initialization magic after all FREE headers (release).
+    fn publish_magic(&self) -> Result<()> {
+        fence(Ordering::Release);
+        self.storage
+            .write_at(MAGIC_OFFSET, &REGION_MAGIC.to_le_bytes())
+    }
+
+    /// Wait (bounded) for another process to finish initializing the region.
+    ///
+    /// The initializer publishes the magic only after every slot header is
+    /// FREE, so an opener that observes the magic (acquire) is guaranteed to
+    /// see the whole initialized region — never a half-written one. Returns
+    /// an error if the store never becomes initialized (a creator that died
+    /// mid-initialization, or an incompatible store).
+    pub fn wait_initialized(&self) -> Result<()> {
+        for _ in 0..2048 {
+            if self.load_magic()? == REGION_MAGIC {
+                return Ok(());
+            }
+            thread::yield_now();
+        }
+        Err(ChannelError::InvalidConfig("region is not initialized").into())
     }
 
     // ── public state-transition API ──
@@ -1608,15 +2045,22 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     /// Open an existing persistent channel.
     ///
     /// The caller is responsible for knowing whether it is the producer or
-    /// consumer. This method scans the slot headers once to recover the
-    /// sequence state (a fresh process must rebuild the producer's next
-    /// sequence and the consumer's expected sequence from storage); ring
-    /// position thereafter comes from the shared cursors.
+    /// consumer. This method waits for the region to be initialized (the
+    /// creator publishes the `REGION_MAGIC` last), then scans the slot
+    /// headers once to recover the sequence state (a fresh process must
+    /// rebuild the producer's next sequence and the consumer's expected
+    /// sequence from storage); ring position thereafter comes from the
+    /// shared cursors.
     pub fn open(path: impl AsRef<Path>, config: SpscConfig) -> Result<Self> {
         config.validate()?;
         let region_slot_size = persistent_region_slot_size(&config)?;
         let region = PersistentSlotRegion::<S>::open(path, config.capacity, region_slot_size)?;
+        region.wait_initialized()?;
+        Self::opened(region, config)
+    }
 
+    /// Build the channel state for an existing, initialized region.
+    fn opened(region: PersistentSlotRegion<S>, config: SpscConfig) -> Result<Self> {
         let mut channel = Self {
             region,
             config,
@@ -1650,11 +2094,20 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             last_received_seq: None,
             closed: false,
         };
-        // Initialise all slots as FREE.
-        for i in 0..channel.config.capacity {
-            channel.region.write_header(i, SlotState::Free, 0, 0)?;
-        }
+        channel.initialize_region()?;
         Ok(channel)
+    }
+
+    /// Fill a fresh backing store with the empty-ring state and publish the
+    /// `REGION_MAGIC` last: a peer that observes the magic (acquire) is
+    /// guaranteed to observe every slot header written before it (release),
+    /// so concurrent openers can never see a half-initialized region.
+    fn initialize_region(&self) -> Result<()> {
+        // Initialise all slots as FREE.
+        for i in 0..self.config.capacity {
+            self.region.write_header(i, SlotState::Free, 0, 0)?;
+        }
+        self.region.publish_magic()
     }
 
     pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
@@ -1944,10 +2397,6 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         Ok(head)
     }
 
-    fn tail_is_committed(&self) -> Result<bool> {
-        Ok(self.region.read_header(self.tail)?.0 == SlotState::Committed)
-    }
-
     /// Bounded poll for the COMMITTED state at the tail. Returns `false`
     /// when the slot is still not committed after the grace period — a
     /// crash leftover (WRITING) or a release that was never republished
@@ -2079,27 +2528,30 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         Ok(())
     }
 }
-impl PersistentShmChannel<MmapSlotStorage> {
+
+impl<S: SlotRegionIo> PersistentShmChannel<S> {
     /// Create the region if it does not exist yet, otherwise open it and
     /// recover the current state. Used for named shared-memory channels
-    /// where the first caller initialises the region.
+    /// where the first caller initialises the region. The storage backend
+    /// decides the create-or-open semantics (the OS guarantees exactly one
+    /// creator for named sections; file backends use create-if-missing).
     pub fn create_or_open(path: impl AsRef<Path>, config: SpscConfig) -> Result<Self> {
         config.validate()?;
         let region_slot_size = persistent_region_slot_size(&config)?;
-
-        if let Ok(storage) = MmapSlotStorage::create_new(
-            &path,
-            config.capacity,
-            region_slot_size,
-            PersistentSlotRegion::<MmapSlotStorage>::total_len(config.capacity, region_slot_size)?,
-        ) {
-            // Freshly created: initialise all slots as FREE.
-            let region = PersistentSlotRegion::from_storage(storage)?;
-            return Self::new_initialized(region, config);
+        let total_len = PersistentSlotRegion::<S>::total_len(config.capacity, region_slot_size)?;
+        let (storage, created) =
+            S::create_or_open(&path, config.capacity, region_slot_size, total_len)?;
+        let region = PersistentSlotRegion::<S>::from_storage(storage)?;
+        if created {
+            // Freshly created: initialise all slots as FREE and publish the
+            // region magic last.
+            Self::new_initialized(region, config)
+        } else {
+            // The region already exists: wait for the creator's magic, then
+            // recover.
+            region.wait_initialized()?;
+            Self::opened(region, config)
         }
-
-        // The region already exists: open and recover.
-        Self::open(path, config)
     }
 }
 
@@ -2441,7 +2893,8 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
 mod tests {
     use super::{
         shm_region_path, FileSlotStorage, FixedSlotRegion, FixedSlotStorage, MemorySlotStorage,
-        MmapSlotStorage, PersistentShmChannel, ShmSpscChannel, SlotRegionIo, SlotState,
+        MmapSlotStorage, PersistentShmChannel, PersistentSlotRegion, ShmSpscChannel, SlotRegionIo,
+        SlotState,
     };
     use dsline_core::error::{ChannelError, DslineError};
     use dsline_core::{
@@ -3240,5 +3693,147 @@ mod tests {
 
         let parent = first.parent().expect("parent dir");
         assert!(parent.ends_with("shm"), "runtime dir: {parent:?}");
+    }
+
+    // ── named paging-file section backend tests (Windows) ──
+
+    #[cfg(windows)]
+    use super::SectionShmSlotStorage;
+
+    #[cfg(windows)]
+    fn section_config() -> SpscConfig {
+        // Capacity 8: an 80-byte payload spans 4 slots (20 payload bytes per
+        // slot at slot_size 64), so "one" + chunked + "two" needs 6 slots.
+        persistent_config(8, 64)
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section_storage_writes_reads_and_clears() {
+        let path = test_file_path("section-basic");
+        let storage = <SectionShmSlotStorage as SlotRegionIo>::create(&path, 4, 127, 20 + 4 * 127)
+            .expect("storage");
+
+        storage.write_at(21, b"hello").expect("write");
+        assert_eq!(storage.read_at(21, 5).expect("read"), b"hello");
+        storage.clear_at(21, 5).expect("clear");
+        assert_eq!(storage.read_at(21, 5).expect("read cleared"), &[0; 5]);
+        assert!(!path.exists(), "section backend leaves no backing file");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section_storage_create_or_open_reports_exactly_one_creator() {
+        let path = test_file_path("section-created");
+        let (first, created1) =
+            <SectionShmSlotStorage as SlotRegionIo>::create_or_open(&path, 4, 127, 20 + 4 * 127)
+                .expect("create");
+        let (second, created2) =
+            <SectionShmSlotStorage as SlotRegionIo>::create_or_open(&path, 4, 127, 20 + 4 * 127)
+                .expect("open");
+
+        assert!(created1, "the first caller creates the section");
+        assert!(!created2, "the second caller opens the existing section");
+        first.write_at(21, b"shared").expect("write");
+        assert_eq!(second.read_at(21, 6).expect("read"), b"shared");
+
+        drop(first);
+        drop(second);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section_storage_open_without_create_fails() {
+        let path = test_file_path("section-missing");
+        assert!(matches!(
+            <SectionShmSlotStorage as SlotRegionIo>::open(&path, 4, 127, 20 + 4 * 127),
+            Err(DslineError::Channel(ChannelError::StorageIo(_)))
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section_channels_exchange_messages_through_one_section() {
+        let path = test_file_path("section-channels");
+        let cfg = section_config();
+        let mut producer =
+            PersistentShmChannel::<SectionShmSlotStorage>::create_or_open(&path, cfg.clone())
+                .expect("producer handle");
+        let mut consumer =
+            PersistentShmChannel::<SectionShmSlotStorage>::create_or_open(&path, cfg.clone())
+                .expect("consumer handle");
+        let large = vec![b'z'; 80]; // 4-slot chunked message
+
+        producer.send(b"one").expect("send one");
+        producer.send(&large).expect("send chunked");
+        producer.send(b"two").expect("send two");
+
+        assert_eq!(consumer.recv_with_seq().expect("recv one").payload, b"one");
+        let chunked = consumer.recv_with_seq().expect("recv chunked");
+        assert_eq!(chunked.seq, 1);
+        assert_eq!(chunked.payload, large);
+        assert_eq!(consumer.recv_with_seq().expect("recv two").payload, b"two");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section_region_open_waits_for_the_initialization_magic() {
+        // A storage handle exists but the initializer never ran: the
+        // channel-level open must poll for the REGION_MAGIC and fail
+        // cleanly when it never appears (a creator that died mid-init).
+        let path = test_file_path("section-no-magic");
+        let storage =
+            <SectionShmSlotStorage as SlotRegionIo>::create_or_open(&path, 4, 127, 20 + 4 * 127)
+                .expect("storage without init");
+        drop(storage);
+
+        // Recreate the section, then open a channel over it without the
+        // initialization pass: the magic stays zero and the open fails.
+        let (storage, _created) =
+            <SectionShmSlotStorage as SlotRegionIo>::create_or_open(&path, 4, 127, 20 + 4 * 127)
+                .expect("storage again");
+        let region =
+            PersistentSlotRegion::<SectionShmSlotStorage>::from_storage(storage).expect("region");
+        assert!(matches!(
+            region.wait_initialized(),
+            Err(DslineError::Channel(ChannelError::InvalidConfig(_)))
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section_create_or_open_initialization_is_skipped_on_reopen() {
+        // The second handle must open the existing section (created=false),
+        // so the channel's init pass does not run over live data: a message
+        // sent through the first handle survives the second opener.
+        let path = test_file_path("section-reopen");
+        let cfg = section_config();
+        let mut first =
+            PersistentShmChannel::<SectionShmSlotStorage>::create_or_open(&path, cfg.clone())
+                .expect("first");
+        first.send(b"hello").expect("send");
+
+        let mut second = PersistentShmChannel::<SectionShmSlotStorage>::create_or_open(&path, cfg)
+            .expect("second");
+        assert_eq!(second.recv_with_seq().expect("recv").payload, b"hello");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn section_lifetime_dies_with_the_last_handle() {
+        // The section is destroyed when the last handle closes: a fresh
+        // create_or_open afterwards starts from an empty ring (unlike the
+        // file backend, whose data survives on disk).
+        let path = test_file_path("section-lifetime");
+        let cfg = section_config();
+        {
+            let mut ch =
+                PersistentShmChannel::<SectionShmSlotStorage>::create_or_open(&path, cfg.clone())
+                    .expect("first life");
+            ch.send(b"gone").expect("send");
+        }
+        let reopened = PersistentShmChannel::<SectionShmSlotStorage>::create_or_open(&path, cfg)
+            .expect("second life");
+        assert!(reopened.is_empty(), "the section died with its last handle");
     }
 }
