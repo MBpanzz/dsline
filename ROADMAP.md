@@ -183,7 +183,7 @@ BufferLease: alloc 阶段的独占写入权限
 |---|---|
 | 0.0.1 | 固定槽位 SPSC bytes |
 | 0.1.0 | 变长消息、MPSC、背压、可选 alloc/publish |
-| 0.2.0 | 分片 MPMC、BusTransport、metrics |
+| 0.2.0 | 分片 MPMC（`ShardedChannel`，2026-09-06）、BusTransport、metrics |
 | 后续 | unix socket、broker、持久化 |
 
 第 0 阶段不直接实现复杂变长 allocator，不公开 alloc/publish。
@@ -241,11 +241,11 @@ BufferLease: alloc 阶段的独占写入权限
 N 个 SPSC / MPSC channel + 路由层
 ```
 
-路由策略：
+路由策略（已实现于 `dsline.ShardedChannel`；2026-09-06）：
 
-- round-robin
-- hash-based
-- broadcast
+- round-robin（每生产者本地计数器；Z5.1 证明 N 次连续发送恰好覆盖每个分片一次）
+- hash-based（FNV-1a-32(key) % shards，无状态跨进程一致；Z5.2 证明折叠可组合）
+- broadcast（每个分片接收全量流；每分片一个消费者组）
 
 ---
 
@@ -1014,9 +1014,9 @@ dsline/
 
 - [ ] 变长消息。
 - [x] MPSC（`multi_producer=True`，CAS 预留协议；2026-09-06）。
-- [ ] 背压策略：BLOCK / RAISE / DROP_NEWEST / DROP_OLDEST。
+- [x] 背压策略：BLOCK / RAISE / DROP_NEWEST / DROP_OLDEST（`ShmChannel`/`FileChannel` 已实现）。
 - [x] crash recovery：PID + start_time + checksum（写入者身份记录于 WRITING 槽头 + 平台存活探测回收；2026-09-06）。
-- [ ] buffer protocol 单次拷贝路径。
+- [x] buffer protocol 单次拷贝路径（`send()` 接受 bytes/bytearray/memoryview）。
 - [ ] alloc/publish 仅在 safety gate 通过后公开。
 - [ ] Windows shared memory 技术 spike，不作为稳定承诺。
 
@@ -1036,8 +1036,8 @@ dsline/
 - [x] `batch`
 - [x] `filter_expr`，expr-lite。
 - [x] `map_expr`，expr-lite。
-- [ ] `map_py`
-- [ ] `filter_py`
+- [x] `map_py`
+- [x] `filter_py`（含 batch 变体）
 
 ### 工程
 

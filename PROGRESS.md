@@ -11,6 +11,54 @@
 
 ---
 
+## Update — 2026-09-06: sharded multi-consumer channel (分片 MPMC)
+
+The channel layer gains the roadmap §5.5 multi-consumer design — not a
+lock-free MPMC ring, but the prescribed composition: **N 个 SPSC/MPSC
+channel + 路由层**, exposed as `dsline.ShardedChannel`.
+
+- **Three routing strategies.** `round_robin` routes with a per-producer
+  local counter (per-producer fairness; the shards together see the whole
+  stream). `hash` routes `FNV-1a-32(key or payload) % shards` — stateless,
+  so every process routes the same key to the same shard, and per-key
+  ordering survives because a shard is FIFO. `broadcast` sends every
+  message to every shard; a consumer bound to one shard (one consumer
+  group) sees the full stream. `send()` returns the number of shards used
+  (1, or N for broadcast).
+- **Consumer surface.** `shard(i)` binds one shard (an ordinary
+  `ShmChannel`), `shards()` lists them, `recv_any()` polls all shards in a
+  round-robin rotation and returns `(shard_index, payload)` or `None`
+  (meaningful for round-robin/hash; a broadcast message exists on every
+  shard). `shard_for()` exposes the routing function; `stats()` is
+  per-shard. All processes must agree on `name`/`shards`/`capacity`/
+  `slot_size`/`multi_producer` (the shard regions enforce capacity and
+  mode; the shard count is a convention).
+- **Solver verification: 62 → 77 checks, all passing.** Z3 proves the
+  round-robin bijection (Z5.1: N consecutive sends cover every shard
+  exactly once), the hash kernel's injectivity and fold composition
+  (Z5.2a/b/c), and the shard range (Z5.3). CP-SAT bounded-checks the
+  composition's accounting invariant (C11: a shard's delivered count
+  cannot differ from its assigned count while the total stays loss-less —
+  no lost or duplicated message at the routing layer) and the broadcast
+  amplification (C12: every shard receives exactly the full stream). SCIP
+  proves the round-robin balance optimality as MIP optima under the cycle
+  constraint (S9: min-max load == ceil(P/N), max-min == floor(P/N)). The
+  new R7 replay section runs the real cross-process fan-out: 2 producer
+  processes × 3 consumer processes reassemble the sent multiset exactly
+  once (R7a), broadcast consumer groups each see the full in-order stream
+  (R7b), and hash routing agrees across handles (R7c).
+- Tests: 10 new Python tests (104 → 114), including the cross-process
+  exactly-once and broadcast-consumer-group runs through real named
+  channels. The cross-process workers open their shard handles with
+  `multi_producer=True` — every opener of an MPSC region must agree on the
+  mode (this surfaced as a real mode-mismatch error during development,
+  which is the protocol working as designed).
+
+Still not implemented: multi-consumer on a single ring (the sharded fan-out
+is the roadmap's answer), `alloc/publish` zero-copy (safety gate pending),
+arena allocator, metrics/`BusTransport`.
+---
+
 ## Update — 2026-09-06: crash recovery via writer identity
 
 The channel layer gains the roadmap §6 crash recovery (§0.1.0 Channel

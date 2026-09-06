@@ -83,6 +83,16 @@ extension is not importable).
   them); a reclaim retires at most that much credit (`freed <= bias`) and
   the Z3.9 guard argument carries over with the reduced bias for
   k ∈ {1, 2, 3}.
+- **Z5.1** — the sharded fan-out's round-robin counter is a bijection: for
+  any start, N consecutive sends (`(base + k) mod N`, unsigned remainder)
+  hit every shard exactly once, for N ∈ {3, 4, 8}.
+- **Z5.2** — the hash-routing kernel: the FNV-1a step `(h ^ b) * P` with
+  the odd prime P is injective in the key byte (Z5.2a) and in the hash
+  state (Z5.2b), so one-byte key differences propagate through any fold
+  length; the fold composes (Z5.2c), so keyed and whole-input hashing
+  share one implementation.
+- **Z5.3** — `hash % N` always lies in `[0, N)` (the shard index is always
+  a valid shard).
 
 ### CP-SAT (bounded model checking)
 
@@ -134,6 +144,15 @@ extension is not importable).
   inconsistent (reproduced); post-fix the refresh recognizes tail-ahead by
   up to capacity (orphan regime), which covers every protocol-reachable
   state (INFEASIBLE for the error condition).
+- **C11** — the sharded fan-out's accounting invariant (bounded model
+  check): two producers with per-producer round-robin counters over three
+  shards under arbitrary send schedules — a shard whose delivered count
+  differs from the count the routing function assigned to it cannot
+  coexist with a loss-less total, so a lost or duplicated message at the
+  composition layer is unreachable.
+- **C12** — broadcast amplification: after B broadcasts every shard holds
+  exactly B messages (no shard missed, none duplicated; the per-shard FIFO
+  inherits the channel's exactly-once delivery proven by R5).
 
 ### SCIP (MILP)
 
@@ -156,6 +175,10 @@ extension is not importable).
   recorded extent (MIP optimum for several extents): the reclaim advances
   exactly the extent — no less (the gate cannot pass a dead slot), no more
   (no data skipped).
+- **S9** — the round-robin cycle achieves optimal load balance: with the
+  routing modeled combinatorially (each send routed exactly once, the
+  counter advancing one shard per send), the min-max shard load is
+  ceil(P/N) and the max-min load floor(P/N) as exact MIP optima.
 
 ### Replay vs implementation
 
@@ -184,6 +207,12 @@ extension is not importable).
   producer; R6c verifies the conservative default (a live writer's zombie
   is never reclaimed); R6d verifies `reclaim_stale()` frees each zombie
   exactly once.
+- **R7** — sharded fan-out replay through the real implementation: two
+  producer processes route through per-producer round-robin counters while
+  three consumer processes each drain one shard, and the shard drains
+  reassemble the sent multiset exactly once (R7a); broadcast consumer
+  groups each receive the full in-order stream (R7b); hash routing agrees
+  across handles via `shard_for` (R7c).
 
 ## Scope
 

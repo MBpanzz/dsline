@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from . import ops
+from .sharded import ShardedChannel, shard_for
 from ._dsline import (
     Backpressure,
     BufferEmptyError,
@@ -34,9 +35,11 @@ __all__ = [
     "Pipeline",
     "PipelineBuildError",
     "SequenceMismatchError",
+    "ShardedChannel",
     "ShmChannel",
     "ops",
     "process_identity",
+    "shard_for",
     "__version__",
 ]
 
