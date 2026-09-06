@@ -1013,7 +1013,7 @@ dsline/
 ### Channel
 
 - [ ] 变长消息。
-- [ ] MPSC。
+- [x] MPSC（`multi_producer=True`，CAS 预留协议；2026-09-06）。
 - [ ] 背压策略：BLOCK / RAISE / DROP_NEWEST / DROP_OLDEST。
 - [ ] crash recovery：PID + start_time + checksum。
 - [ ] buffer protocol 单次拷贝路径。

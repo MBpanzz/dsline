@@ -14,7 +14,7 @@ Current boundaries:
 - `send/recv` for existing bytes uses a copy path.
 - Messages larger than one slot are supported through multi-slot chunking; each chunk still uses fixed-slot storage.
 - `alloc/publish` zero-copy APIs are not exposed.
-- MPSC, multi-consumer, crash recovery, and anonymous OS shared memory (no backing file) are still future work.
+- Multi-consumer, crash recovery, and anonymous OS shared memory (no backing file) are still future work. (`multi_producer=True` gives multi-producer / single-consumer; a crashed producer's in-flight slots surface as an empty ring, exactly as in single-producer mode.)
 - On Windows a `FileChannel` region file cannot be deleted while a channel still holds its mapping (standard memory-mapped file behavior); drop the channel first.
 
 ## Install for development
@@ -59,6 +59,17 @@ strategies keep `send()` as a successful call: `DropNewest` discards the
 incoming message when full, while `DropOldest` releases the oldest queued
 message before writing the new one.
 
+Multi-producer channels: pass `multi_producer=True` to `ShmChannel` /
+`FileChannel` to allow several processes (or threads with one handle each)
+to `send()` concurrently into the same ring. Producers claim disjoint
+slot ranges with a CAS reservation on the shared head cursor; the consumer
+waits per slot through the COMMITTED gate. The mode is fixed when the
+region is created (it is encoded in the region magic), so every opener must
+agree on `multi_producer` — a mismatch fails at open. Note the tradeoff:
+the single-producer mode publishes the head cursor only after a commit, so
+a crash-free consumer never polls; the multi-producer mode publishes the
+reservation first and the consumer briefly polls in-flight slots.
+
 Messages may exceed `slot_size` when the channel has enough capacity. The
 current prototype splits larger payloads into multiple fixed slots and
 reassembles them on `recv()`. This is variable-length framing over fixed-slot
@@ -71,7 +82,7 @@ Zero-copy wording follows the project rule:
 Implemented prototype pieces:
 
 - `dsline-core`: fixed-slot SPSC bytes ring, checksum, Frame header, chunk flags, and metadata TLV encode/decode.
-- `dsline-shm`: slot-region byte-range storage trait with file and memory-mapped (OS shared memory) backends, region state model, cross-process SPSC bytes channel over `FREE`, `WRITING`, `COMMITTED`, `PINNED`, and `CORRUPTED` with shared head/tail cursor words in the region header (O(1) per-operation refresh; the slot-header scan runs once at open for sequence recovery and crashed-writer cleanup), multi-slot chunked messages, and name→region resolution for named channels.
+- `dsline-shm`: slot-region byte-range storage trait with file and memory-mapped (OS shared memory) backends, region state model, cross-process SPSC bytes channel over `FREE`, `WRITING`, `COMMITTED`, `PINNED`, and `CORRUPTED` with shared head/tail cursor words in the region header (O(1) per-operation refresh; the slot-header scan runs once at open for sequence recovery and crashed-writer cleanup), multi-slot chunked messages, an opt-in multi-producer (MPSC) mode that reserves head with a hardware CAS, and name→region resolution for named channels.
 - `dsline-python`: PyO3 `ShmChannel` (named, cross-process shared memory) and `FileChannel` (mmap-backed file) bindings over the `dsline-shm` core, Python exception exports, `send()` support for bytes-like inputs (`bytes`, `bytearray`, `memoryview`, and compatible buffer objects), `recv_with_seq()`, `Block`/`Raise`/`DropNewest`/`DropOldest` backpressure, and `stats()` with queue, sequence, and message-size limits.
 
 ## CLI

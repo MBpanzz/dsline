@@ -11,6 +11,49 @@
 
 ---
 
+## Update — 2026-09-06: MPSC — CAS reservation protocol
+
+The channel layer gains the 0.1.0 milestone's multi-producer capability,
+opt-in so the verified SPSC path (head published only after commit, crash-free
+consumer never polls) is untouched:
+
+- **`multi_producer=True`** on `ShmChannel` / `FileChannel` lets several
+  processes (or threads with one handle each) send concurrently. Producers
+  claim disjoint slot ranges with a hardware CAS on the shared head cursor —
+  the reservation *is* the linearization point, and the send guard runs on
+  the reservation attempt, so concurrent producers can never over-commit the
+  ring even when both observe free space at once (CP-SAT/SMT-backed: W1/W2
+  prove the guard keeps every reserved count free and winning CAS
+  reservations disjoint). The whole message is written `WRITING` →
+  `COMMITTED` as in SPSC, and the consumer's existing per-slot COMMITTED
+  gate absorbs the in-flight window (the SPSC gate theorem still holds for
+  the default mode).
+- **Per-message sequences are not enforced for contiguity in MPSC mode**:
+  the head is reserved before the write and messages commit in reservation
+  order, so a single counter's order is not the ring order; ordering and
+  integrity come from ring position + the commit gate + checksum. Sequences
+  remain per-handle informational counters.
+- **Mode is baked into the region magic** (`DSL1` SPSC / `DSL2` MPSC,
+  published last by the initializer): openers that disagree on
+  `multi_producer` fail fast at open instead of misinterpreting the ring.
+- **`DropOldest` under concurrency**: the tail advance is a CAS over the
+  dropped message's slot count (concurrent droppers never drop the same
+  message twice), and the winning dropper force-releases the slot (the
+  consumer may have pinned it between peek and CAS). The write side waits
+  out the release window of a concurrent drop, and the drop side retries
+  through torn reads; the only refusal without progress is the COMMITTED
+  gate rejecting a crashed writer's leftover, exactly like SPSC.
+- Tests: 53 Rust unit tests in `dsline-shm` (5 new MPSC tests, including a
+  two-thread producer stress with chunked interleaving and a concurrent
+  DropOldest double-drop check), 85 Python tests (two-process producer
+  round trip, FileChannel round trip, mode-mismatch rejection), 43/43
+  solver checks (W1/W2 added to Z3, R5 two-producer replay added).
+
+Still not implemented: multi-consumer, `alloc/publish` zero-copy (safety
+gate pending), crash recovery, arena allocator, cleanup CLI.
+
+---
+
 ## Update — 2026-09-06: Windows named channels move to paging-file sections
 
 The flush cost measured in the September 4 update (FlushViewOfFile, ~45 µs

@@ -218,6 +218,32 @@ def check_z3():
     record("Z2.2 chunk count always covers the payload (needed*chunk >= len)",
            s.check() == unsat)
 
+    # ── W1: MPSC reservation guard implies every reserved count is free ──
+    # A reservation [h, h+n) passes the guard iff h+n <= t+cap. The ring
+    # slot of count k is physically free iff the previous occupant k-cap was
+    # consumed, i.e. k-cap < t. Prove: every k in [h, h+n) satisfies it.
+    h, t, k, n, cap = Ints("h t k n cap")
+    s = Solver()
+    s.add(cap >= 1, n >= 1, n <= cap, h >= t, h + n <= t + cap)
+    s.add(k >= h, k < h + n, k - cap >= t)  # a reserved count whose slot is busy
+    s.set(timeout=20000)
+    record("W1 reservation count k in [h,h+n) has k-cap < t (slot is free)",
+           s.check() == unsat)
+
+    # ── W2: linearized CAS reservations are disjoint and in-window ──
+    # Two producers that both win their head CAS claim [e1, e1+n1) and
+    # [e2, e2+n2). CAS semantics give e2 >= e1+n1 (the second expected value
+    # was read after the first advanced the cursor), so the ranges cannot
+    # overlap; the guard keeps both inside the free window [t, t+cap).
+    e1, e2, n1, n2, t, cap = Ints("e1 e2 n1 n2 t cap")
+    s = Solver()
+    s.add(cap >= 1, n1 >= 1, n2 >= 1, n1 <= cap, n2 <= cap)
+    s.add(e1 >= t, e2 >= e1 + n1, e1 + n1 <= t + cap, e2 + n2 <= t + cap)
+    s.add(e2 < e1 + n1)  # overlap — impossible under CAS linearizability
+    s.set(timeout=20000)
+    record("W2 winning CAS reservations never overlap (disjoint ranges)",
+           s.check() == unsat)
+
     # Z2.3: single-slot path is used exactly for len <= slot_size.
     s = Solver()
     s.add(cap >= 1, cap <= 64, slot >= 1, slot <= 4096, length >= 0, length <= 1 << 31)
@@ -1209,6 +1235,95 @@ def check_replay():
         pass
     record("R4 dual-handle (producer+consumer) schedule matches the model "
            "through the shared cursors", ok, detail)
+
+    # ── R5: MPSC two-producer replay through the real implementation ──
+    # Two producer handles over one multi-producer region, in one process
+    # (so the sends are serialized and the receipt order is deterministic —
+    # the reservation order). Every message must arrive exactly once, the
+    # chunked ones intact, with the consumer's depth tracking the model.
+    rng = random.Random(20260906)
+    C, SLOT = 8, 64
+    path = temp_path("r5")
+    producer_a = dsline.FileChannel.create(
+        path, capacity=C, slot_size=SLOT, multi_producer=True,
+        backpressure=dsline.Backpressure.Raise,
+    )
+    producer_b = dsline.FileChannel.open(
+        path, capacity=C, slot_size=SLOT, multi_producer=True,
+        backpressure=dsline.Backpressure.Raise,
+    )
+    consumer = dsline.FileChannel.open(
+        path, capacity=C, slot_size=SLOT, multi_producer=True,
+    )
+    if not (producer_a.stats()["multi_producer"]
+            and consumer.stats()["multi_producer"]):
+        ok = False
+        detail = "multi_producer flag not reported by stats; "
+    chunk = SLOT - CHUNK_METADATA_LEN
+    model = []  # (payload, slots) in reservation order
+    model_depth = 0
+    ok = True
+    detail = ""
+    for step in range(250):
+        action = rng.choice(["send_a", "send_b", "recv"])
+        if action in ("send_a", "send_b"):
+            length = rng.randint(0, 100)
+            slots = 1 if length <= SLOT else (length + chunk - 1) // chunk
+            if model_depth + slots > C:
+                try:
+                    producer_a.send(b"x" * length)
+                    ok = False
+                    detail += f"step {step}: expected full error, send succeeded; "
+                except (dsline.BufferFullError, dsline.MessageTooLargeError):
+                    pass
+            else:
+                payload = bytes(rng.randrange(256) for _ in range(length))
+                sender = producer_a if action == "send_a" else producer_b
+                try:
+                    sender.send(payload)
+                except dsline.BufferFullError:
+                    ok = False
+                    detail += f"step {step}: send {action} failed though the model has room; "
+                    continue
+                model.append((payload, slots))
+                model_depth += slots
+        else:
+            if not model:
+                try:
+                    consumer.recv()
+                    ok = False
+                    detail += f"step {step}: expected empty error, recv succeeded; "
+                except dsline.BufferEmptyError:
+                    pass
+            else:
+                payload, slots = model.pop(0)
+                got = consumer.recv()
+                if got != payload:
+                    ok = False
+                    detail += f"step {step}: payload mismatch; "
+                model_depth -= slots
+                stats = consumer.stats()
+                if stats["queue_depth"] != model_depth:
+                    ok = False
+                    detail += (f"step {step}: consumer queue_depth "
+                               f"{stats['queue_depth']} != model {model_depth}; ")
+    # Drain the remainder: everything the model still holds must arrive.
+    while model:
+        payload, slots = model.pop(0)
+        got = consumer.recv()
+        if got != payload:
+            ok = False
+            detail += "end-of-run payload mismatch; "
+        model_depth -= slots
+    _release(producer_a)
+    _release(producer_b)
+    _release(consumer)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    record("R5 MPSC two-producer schedule delivers every message exactly once",
+           ok, detail)
 
 
 def main():

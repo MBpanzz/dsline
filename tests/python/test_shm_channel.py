@@ -191,6 +191,133 @@ class ShmChannelTests(unittest.TestCase):
         self.assertEqual(stats["max_message_size"], 88)
 
 
+def _mpsc_producer(name, capacity, slot_size, label, count, result_queue):
+    """Child process worker: send `count` labeled messages into a named
+    multi-producer channel, then report completion."""
+    with dsline.ShmChannel(
+        name,
+        capacity=capacity,
+        slot_size=slot_size,
+        multi_producer=True,
+        timeout=30.0,
+    ) as ch:
+        for i in range(count):
+            ch.send(f"{label}-{i}".encode())
+    result_queue.put((label, count))
+
+
+class MultiProducerShmChannelTests(unittest.TestCase):
+    def test_multi_producer_flag_in_stats(self) -> None:
+        ch = dsline.ShmChannel(
+            unique_name("mp-stats"), capacity=4, slot_size=64, multi_producer=True
+        )
+        self.addCleanup(remove_region, ch)
+        self.assertTrue(ch.stats()["multi_producer"])
+        ch.send(b"one")
+        self.assertEqual(ch.recv(), b"one")
+
+    def test_multi_producer_mode_mismatch_is_rejected(self) -> None:
+        # The channel mode is baked into the region magic at creation: an
+        # opener that disagrees on multi_producer must fail instead of
+        # misinterpreting the ring.
+        name = unique_name("mp-mode")
+        ch = dsline.ShmChannel(name, capacity=4, slot_size=64)
+        self.addCleanup(remove_region, ch)
+        with self.assertRaises(ValueError):
+            dsline.ShmChannel(name, capacity=4, slot_size=64, multi_producer=True)
+
+    def test_two_producer_processes_deliver_every_message_once(self) -> None:
+        """Two producer processes race on one named channel; the consumer
+        receives every message exactly once regardless of interleaving."""
+        ctx = mp.get_context("spawn")
+        result_queue = ctx.Queue()
+        name = unique_name("mpsc")
+        capacity = 8
+        count = 30
+        ch = dsline.ShmChannel(
+            name,
+            capacity=capacity,
+            slot_size=64,
+            multi_producer=True,
+            timeout=30.0,
+        )
+        self.addCleanup(remove_region, ch)
+
+        producer_a = ctx.Process(
+            target=_mpsc_producer, args=(name, capacity, 64, "a", count, result_queue)
+        )
+        producer_b = ctx.Process(
+            target=_mpsc_producer, args=(name, capacity, 64, "b", count, result_queue)
+        )
+        producer_a.start()
+        producer_b.start()
+
+        received = []
+        while len(received) < 2 * count:
+            try:
+                _, payload = ch.recv_with_seq()
+            except dsline.BufferEmptyError:
+                time.sleep(0.001)
+                continue
+            received.append(payload)
+        producer_a.join(timeout=30)
+        producer_b.join(timeout=30)
+        if producer_a.is_alive():
+            producer_a.terminate()
+        if producer_b.is_alive():
+            producer_b.terminate()
+
+        self.assertEqual(producer_a.exitcode, 0)
+        self.assertEqual(producer_b.exitcode, 0)
+        expected = {
+            f"{label}-{i}".encode()
+            for label in ("a", "b")
+            for i in range(count)
+        }
+        self.assertEqual(set(received), expected, "every message delivered")
+        self.assertEqual(len(received), 2 * count, "no duplicate deliveries")
+        completions = {result_queue.get(timeout=5) for _ in range(2)}
+        self.assertEqual(
+            completions,
+            {("a", count), ("b", count)},
+            "both producers finished",
+        )
+
+    def test_multi_producer_file_channel_roundtrip(self) -> None:
+        path = os.path.join(
+            os.environ.get("TEMP", os.getcwd()), f"dsline-mpsc-{uuid.uuid4().hex[:12]}.bin"
+        )
+        self.addCleanup(self._remove_file, path)
+        ch1 = dsline.FileChannel.create(
+            path, capacity=8, slot_size=64, multi_producer=True
+        )
+        ch2 = dsline.FileChannel.open(
+            path, capacity=8, slot_size=64, multi_producer=True
+        )
+        ch3 = dsline.FileChannel.open(
+            path, capacity=8, slot_size=64, multi_producer=True
+        )
+        self.assertTrue(ch1.stats()["multi_producer"])
+        ch1.send(b"alpha")
+        ch2.send(b"beta")
+        ch1.send(b"x" * 80)  # chunked (4 slots at slot_size 64)
+        ch2.send(b"gamma")
+        self.assertEqual(ch3.recv(), b"alpha")
+        self.assertEqual(ch3.recv(), b"beta")
+        self.assertEqual(ch3.recv(), b"x" * 80)
+        self.assertEqual(ch3.recv(), b"gamma")
+        ch1.close()
+        ch2.close()
+        ch3.close()
+
+    @staticmethod
+    def _remove_file(path: str) -> None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 class CrossProcessShmChannelTests(unittest.TestCase):
     def test_cross_process_roundtrip_with_backpressure(self) -> None:
         """A producer and a consumer in separate processes exchange messages

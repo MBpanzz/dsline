@@ -72,19 +72,20 @@ struct ShmChannel {
 #[pymethods]
 impl ShmChannel {
     #[new]
-    #[pyo3(signature = (name, capacity=1024, slot_size=4096, backpressure=Backpressure::Block, timeout=None))]
+    #[pyo3(signature = (name, capacity=1024, slot_size=4096, backpressure=Backpressure::Block, timeout=None, multi_producer=false))]
     fn new(
         name: String,
         capacity: usize,
         slot_size: usize,
         backpressure: Backpressure,
         timeout: Option<f64>,
+        multi_producer: bool,
     ) -> PyResult<Self> {
         if name.trim().is_empty() {
             return Err(PyValueError::new_err("channel name must not be empty"));
         }
 
-        let config = channel_config(capacity, slot_size, backpressure, timeout)?;
+        let config = channel_config(capacity, slot_size, backpressure, timeout, multi_producer)?;
         let path = shm_region_path(&name).map_err(to_py_err)?;
         let path = path.to_string_lossy().into_owned();
         let channel = PersistentShmChannel::<NamedShmStorage>::create_or_open(&path, config)
@@ -173,6 +174,7 @@ impl ShmChannel {
         stats.set_item("name", &self.name)?;
         stats.set_item("path", &self.path)?;
         stats.set_item("backend", "shm")?;
+        stats.set_item("multi_producer", channel.multi_producer())?;
         stats.set_item("queue_depth", channel.len())?;
         stats.set_item("queue_capacity", channel.capacity())?;
         stats.set_item("slot_size", channel.payload_slot_size())?;
@@ -205,6 +207,7 @@ fn channel_config(
     slot_size: usize,
     backpressure: Backpressure,
     timeout: Option<f64>,
+    multi_producer: bool,
 ) -> PyResult<SpscConfig> {
     if matches!(timeout, Some(value) if value < 0.0) {
         return Err(PyValueError::new_err("timeout must be non-negative"));
@@ -215,6 +218,7 @@ fn channel_config(
         slot_size,
         backpressure: backpressure.into(),
         timeout: timeout.map(Duration::from_secs_f64),
+        multi_producer,
     })
 }
 
@@ -245,15 +249,16 @@ struct FileChannel {
 impl FileChannel {
     /// Create a new file-backed channel, initialising the backing file.
     #[staticmethod]
-    #[pyo3(signature = (path, capacity, slot_size, backpressure=Backpressure::Raise, timeout=None))]
+    #[pyo3(signature = (path, capacity, slot_size, backpressure=Backpressure::Raise, timeout=None, multi_producer=false))]
     fn create(
         path: String,
         capacity: usize,
         slot_size: usize,
         backpressure: Backpressure,
         timeout: Option<f64>,
+        multi_producer: bool,
     ) -> PyResult<Self> {
-        let config = channel_config(capacity, slot_size, backpressure, timeout)?;
+        let config = channel_config(capacity, slot_size, backpressure, timeout, multi_producer)?;
         let channel =
             PersistentShmChannel::<MmapSlotStorage>::create(&path, config).map_err(to_py_err)?;
         Ok(Self {
@@ -264,15 +269,16 @@ impl FileChannel {
 
     /// Open an existing file-backed channel.
     #[staticmethod]
-    #[pyo3(signature = (path, capacity, slot_size, backpressure=Backpressure::Raise, timeout=None))]
+    #[pyo3(signature = (path, capacity, slot_size, backpressure=Backpressure::Raise, timeout=None, multi_producer=false))]
     fn open(
         path: String,
         capacity: usize,
         slot_size: usize,
         backpressure: Backpressure,
         timeout: Option<f64>,
+        multi_producer: bool,
     ) -> PyResult<Self> {
-        let config = channel_config(capacity, slot_size, backpressure, timeout)?;
+        let config = channel_config(capacity, slot_size, backpressure, timeout, multi_producer)?;
         let channel =
             PersistentShmChannel::<MmapSlotStorage>::open(&path, config).map_err(to_py_err)?;
         Ok(Self {
@@ -364,6 +370,7 @@ impl FileChannel {
         let stats = PyDict::new_bound(py);
         stats.set_item("path", &self.path)?;
         stats.set_item("backend", "file")?;
+        stats.set_item("multi_producer", channel.multi_producer())?;
         stats.set_item("queue_depth", channel.len())?;
         stats.set_item("queue_capacity", channel.capacity())?;
         stats.set_item("slot_size", channel.payload_slot_size())?;
@@ -495,6 +502,7 @@ impl PyPipeline {
             slot_size,
             backpressure: CoreBackpressure::Raise,
             timeout: None,
+            multi_producer: false,
         };
 
         let mut items: Vec<PyObject> = Vec::new();

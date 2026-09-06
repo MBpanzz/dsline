@@ -19,6 +19,10 @@ pub struct SpscConfig {
     pub slot_size: usize,
     pub backpressure: Backpressure,
     pub timeout: Option<Duration>,
+    /// `true` allows multiple concurrent producers (MPSC). Only the
+    /// persistent shared-memory channel (dsline-shm) uses this; the
+    /// in-memory prototype rings are single-handle and ignore it.
+    pub multi_producer: bool,
 }
 
 impl SpscConfig {
@@ -179,6 +183,7 @@ mod tests {
             slot_size,
             backpressure: Backpressure::Raise,
             timeout: None,
+            multi_producer: false,
         })
         .expect("valid config")
     }
@@ -225,6 +230,7 @@ mod tests {
             slot_size: 8,
             backpressure: Backpressure::Block,
             timeout: Some(Duration::from_millis(1)),
+            multi_producer: false,
         })
         .expect("valid config");
         ring.send(b"a").expect("first send");
@@ -242,6 +248,7 @@ mod tests {
             slot_size: 8,
             backpressure: Backpressure::DropNewest,
             timeout: None,
+            multi_producer: false,
         })
         .expect("valid config");
         ring.send(b"a").expect("first send");
@@ -262,6 +269,7 @@ mod tests {
             slot_size: 8,
             backpressure: Backpressure::DropOldest,
             timeout: None,
+            multi_producer: false,
         })
         .expect("valid config");
         ring.send(b"a").expect("send a");

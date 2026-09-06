@@ -4,10 +4,10 @@
 //! API is intentionally conservative until ADR-001 is accepted.
 
 use dsline_core::{
-    checksum::checksum32, decode_frame, encode_frame, Backpressure, ChannelError, Frame, FrameKind,
-    Metadata, Result, SpscConfig, CHUNK_METADATA_LEN, FRAME_FLAG_CHUNKED, FRAME_FLAG_CHUNK_END,
-    FRAME_FLAG_CHUNK_START, FRAME_HEADER_LEN, TLV_CHUNK_INDEX, TLV_CHUNK_MESSAGE_LEN,
-    TLV_CHUNK_TOTAL,
+    checksum::checksum32, decode_frame, encode_frame, Backpressure, ChannelError, DslineError,
+    Frame, FrameKind, Metadata, Result, SpscConfig, CHUNK_METADATA_LEN, FRAME_FLAG_CHUNKED,
+    FRAME_FLAG_CHUNK_END, FRAME_FLAG_CHUNK_START, FRAME_HEADER_LEN, TLV_CHUNK_INDEX,
+    TLV_CHUNK_MESSAGE_LEN, TLV_CHUNK_TOTAL,
 };
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -460,6 +460,27 @@ pub trait SlotRegionIo: std::fmt::Debug + Sized {
             Ok(current)
         }
     }
+
+    /// Compare-and-exchange an 8-byte word at `offset`.
+    ///
+    /// Returns `(current, true)` when the word equaled `expected` and was
+    /// replaced with `new`, or `(current, false)` otherwise (with the word
+    /// left unchanged). Used by the MPSC reservation protocol, where several
+    /// producers must atomically claim disjoint ranges of the head cursor.
+    ///
+    /// Default implementation: a non-atomic check-then-write with SeqCst
+    /// fences. Only safe for the single-process reference backends (the
+    /// file-based store) — the shared-memory backends override it with a
+    /// hardware CAS.
+    fn compare_exchange_u64(&self, offset: usize, expected: u64, new: u64) -> Result<(u64, bool)> {
+        let current = self.load_u64(offset)?;
+        if current == expected {
+            self.store_u64(offset, new)?;
+            Ok((new, true))
+        } else {
+            Ok((current, false))
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -907,6 +928,23 @@ impl SlotRegionIo for MmapSlotStorage {
         Ok(unsafe { (&*ptr).fetch_max(value, Ordering::Release) })
     }
 
+    fn compare_exchange_u64(&self, offset: usize, expected: u64, new: u64) -> Result<(u64, bool)> {
+        self.validate_range(offset, 8)?;
+        let mut map = self
+            .map
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("mmap storage lock poisoned"))?;
+        // SAFETY: as in `load_u64`; the CAS is the MPSC reservation
+        // linearization point — exactly one producer wins per head value.
+        let ptr = unsafe { map.as_mut_ptr().add(offset) } as *mut AtomicU64;
+        let current =
+            unsafe { (&*ptr).compare_exchange(expected, new, Ordering::AcqRel, Ordering::Acquire) };
+        match current {
+            Ok(actual) => Ok((actual, true)),
+            Err(actual) => Ok((actual, false)),
+        }
+    }
+
     fn clear_at(&self, offset: usize, len: usize) -> Result<()> {
         self.validate_range(offset, len)?;
         let mut map = self
@@ -1289,6 +1327,23 @@ impl SlotRegionIo for SectionShmSlotStorage {
         let ptr = (view.base + offset) as *mut AtomicU64;
         Ok(unsafe { (&*ptr).fetch_max(value, Ordering::Release) })
     }
+
+    fn compare_exchange_u64(&self, offset: usize, expected: u64, new: u64) -> Result<(u64, bool)> {
+        self.validate_range(offset, 8)?;
+        let view = self
+            .view
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("section storage lock poisoned"))?;
+        // SAFETY: as in `load_u64`; the CAS is the MPSC reservation
+        // linearization point (see `MmapSlotStorage::compare_exchange_u64`).
+        let ptr = (view.base + offset) as *mut AtomicU64;
+        let current =
+            unsafe { (&*ptr).compare_exchange(expected, new, Ordering::AcqRel, Ordering::Acquire) };
+        match current {
+            Ok(actual) => Ok((actual, true)),
+            Err(actual) => Ok((actual, false)),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1484,8 +1539,24 @@ pub const PERSISTENT_SLOT_HEADER_LEN: usize = 13;
 pub const REGION_HEADER_LEN: usize = 20;
 
 /// Magic value published once initialization completes
-/// (bytes `DSL1` little-endian).
+/// (bytes `DSL1` little-endian) — single-producer (SPSC) mode.
 pub const REGION_MAGIC: u32 = 0x3153_4c44;
+
+/// Magic for multi-producer (MPSC) mode (`DSL2` little-endian).
+///
+/// The mode is fixed at creation: every opener must agree on it, because
+/// the send protocol differs (single producer publishes head after commit;
+/// multi-producer reserves head with a CAS before writing). An opener whose
+/// `multi_producer` flag does not match the creator's fails at open.
+pub const REGION_MAGIC_MPSC: u32 = 0x3253_4c44;
+
+pub fn region_magic(multi_producer: bool) -> u32 {
+    if multi_producer {
+        REGION_MAGIC_MPSC
+    } else {
+        REGION_MAGIC
+    }
+}
 
 const CURSOR_HEAD_OFFSET: usize = 0;
 const CURSOR_TAIL_OFFSET: usize = 8;
@@ -1716,6 +1787,30 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
         self.storage.fetch_max_u64(CURSOR_TAIL_OFFSET, tail)
     }
 
+    /// MPSC reservation: CAS the head cursor from `expected` to `new`.
+    /// Returns `(actual, true)` on success. The linearization point of the
+    /// reservation protocol — exactly one producer's CAS wins per value, so
+    /// reserved slot ranges are disjoint (verify W-checks).
+    pub fn compare_exchange_head(&self, expected: u64, new: u64) -> Result<(u64, bool)> {
+        self.storage
+            .compare_exchange_u64(CURSOR_HEAD_OFFSET, expected, new)
+    }
+
+    /// MPSC DropOldest: CAS the tail cursor forward by the dropped message's
+    /// slot count, so concurrent droppers never advance it twice.
+    pub fn compare_exchange_tail(&self, expected: u64, new: u64) -> Result<(u64, bool)> {
+        self.storage
+            .compare_exchange_u64(CURSOR_TAIL_OFFSET, expected, new)
+    }
+
+    /// Flush the region header page (the cursor words). No-op for backends
+    /// that are coherent without flushing; on Windows file-backed mappings
+    /// this publishes an MPSC reservation so other producers' CAS attempts
+    /// observe it before claiming their own ranges.
+    pub fn flush_header(&self) -> Result<()> {
+        self.storage.flush_range(0, REGION_HEADER_LEN)
+    }
+
     /// Load the initialization magic (acquire).
     pub fn load_magic(&self) -> Result<u32> {
         let raw = self
@@ -1727,10 +1822,12 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
     }
 
     /// Publish the initialization magic after all FREE headers (release).
-    fn publish_magic(&self) -> Result<()> {
+    /// The magic encodes the channel mode (`REGION_MAGIC` for SPSC,
+    /// `REGION_MAGIC_MPSC` for MPSC), so an opener with a mismatched mode
+    /// fails instead of misinterpreting the ring.
+    fn publish_magic(&self, magic: u32) -> Result<()> {
         fence(Ordering::Release);
-        self.storage
-            .write_at(MAGIC_OFFSET, &REGION_MAGIC.to_le_bytes())
+        self.storage.write_at(MAGIC_OFFSET, &magic.to_le_bytes())
     }
 
     /// Wait (bounded) for another process to finish initializing the region.
@@ -1739,11 +1836,19 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
     /// FREE, so an opener that observes the magic (acquire) is guaranteed to
     /// see the whole initialized region — never a half-written one. Returns
     /// an error if the store never becomes initialized (a creator that died
-    /// mid-initialization, or an incompatible store).
-    pub fn wait_initialized(&self) -> Result<()> {
+    /// mid-initialization, or an incompatible store). A nonzero magic that
+    /// is not `expected` is an immediate mode mismatch, not a wait.
+    pub fn wait_initialized(&self, expected: u32) -> Result<()> {
         for _ in 0..2048 {
-            if self.load_magic()? == REGION_MAGIC {
+            let magic = self.load_magic()?;
+            if magic == expected {
                 return Ok(());
+            }
+            if magic != 0 {
+                return Err(ChannelError::InvalidConfig(
+                    "region channel mode mismatch (all processes must agree on multi_producer)",
+                )
+                .into());
             }
             thread::yield_now();
         }
@@ -1846,14 +1951,6 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
         self.release_slot(index)
     }
 
-    pub fn release_committed(&self, index: usize) -> Result<()> {
-        let (state, _, _) = self.read_header(index)?;
-        if state != SlotState::Committed {
-            return Err(ChannelError::InvalidConfig("slot is not committed").into());
-        }
-        self.release_slot(index)
-    }
-
     /// As `release_pinned`, deferring the cross-process flush (see
     /// `release_slot_no_flush`). Channel-private: the channel publishes the
     /// released slot together with the tail cursor in one batch flush.
@@ -1861,15 +1958,6 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
         let (state, _, _) = self.read_header(index)?;
         if state != SlotState::Pinned {
             return Err(ChannelError::InvalidConfig("slot is not pinned").into());
-        }
-        self.release_slot_no_flush(index)
-    }
-
-    /// As `release_committed`, deferring the cross-process flush.
-    fn release_committed_no_flush(&self, index: usize) -> Result<()> {
-        let (state, _, _) = self.read_header(index)?;
-        if state != SlotState::Committed {
-            return Err(ChannelError::InvalidConfig("slot is not committed").into());
         }
         self.release_slot_no_flush(index)
     }
@@ -1886,6 +1974,17 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
         // Order the payload clear before the FREE header: a producer that
         // observes FREE (and pairs with an Acquire fence) never overwrites a
         // slot whose payload is still visible to the consumer.
+        fence(Ordering::Release);
+        self.write_header(index, SlotState::Free, 0, 0)
+    }
+
+    /// As `release_slot_no_flush`, but without the COMMITTED/PINNED state
+    /// check. Only the MPSC DropOldest path uses this: its tail CAS has
+    /// already linearized the discard (the winning dropper is the sole
+    /// releaser of that slot), so the slot must be freed even when the
+    /// consumer pinned it between the peek and the CAS.
+    fn force_release_no_flush(&self, index: usize) -> Result<()> {
+        self.clear_payload(index)?;
         fence(Ordering::Release);
         self.write_header(index, SlotState::Free, 0, 0)
     }
@@ -2055,7 +2154,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         config.validate()?;
         let region_slot_size = persistent_region_slot_size(&config)?;
         let region = PersistentSlotRegion::<S>::open(path, config.capacity, region_slot_size)?;
-        region.wait_initialized()?;
+        region.wait_initialized(region_magic(config.multi_producer))?;
         Self::opened(region, config)
     }
 
@@ -2099,7 +2198,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     }
 
     /// Fill a fresh backing store with the empty-ring state and publish the
-    /// `REGION_MAGIC` last: a peer that observes the magic (acquire) is
+    /// mode magic last: a peer that observes the magic (acquire) is
     /// guaranteed to observe every slot header written before it (release),
     /// so concurrent openers can never see a half-initialized region.
     fn initialize_region(&self) -> Result<()> {
@@ -2107,7 +2206,8 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         for i in 0..self.config.capacity {
             self.region.write_header(i, SlotState::Free, 0, 0)?;
         }
-        self.region.publish_magic()
+        self.region
+            .publish_magic(region_magic(self.config.multi_producer))
     }
 
     pub fn send(&mut self, bytes: &[u8]) -> Result<()> {
@@ -2116,6 +2216,9 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         }
         self.refresh_cursors()?;
         let plan = send_plan(&self.config, bytes.len())?;
+        if self.config.multi_producer {
+            return self.send_mpsc(bytes, plan);
+        }
         if !self.prepare_send_slots(plan.needed_slots)? {
             return Ok(());
         }
@@ -2140,6 +2243,105 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         Ok(())
     }
 
+    /// MPSC send: claim a slot range with a CAS reservation, write the
+    /// message into it, and publish with one flush. The reservation is the
+    /// linearization point: concurrent producers' CAS attempts serialize on
+    /// the head cursor and end up with disjoint ranges, and the send guard
+    /// runs *on the reservation attempt*, so two producers can never
+    /// over-commit the ring even when both observe free space at once.
+    fn send_mpsc(&mut self, bytes: &[u8], plan: SendPlan) -> Result<()> {
+        let Some(start) = self.reserve_slots(plan.needed_slots)? else {
+            return Ok(()); // dropped (DropNewest)
+        };
+        // Windows file-backed mappings: publish the reservation before any
+        // other producer's CAS can claim an overlapping range (a no-op on
+        // section and Unix mappings, which are coherent without flushing).
+        self.region.flush_header()?;
+
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let frames = encode_message_frames(&self.config, plan, seq, bytes)?;
+        let first_index = (start % self.config.capacity as u64) as usize;
+        for (k, frame) in frames.iter().enumerate() {
+            let index = ((start + k as u64) % self.config.capacity as u64) as usize;
+            self.write_reserved_slot(index, seq, frame)?;
+        }
+        // One flush publishes the batch and the reservation together; the
+        // consumer's per-slot COMMITTED gate absorbs the in-flight window.
+        self.region.publish_batch(&frames, first_index)?;
+        self.head = (first_index + frames.len()) % self.config.capacity;
+        self.len = (self.len + frames.len()).min(self.config.capacity);
+        Ok(())
+    }
+
+    /// Write one frame into a reserved slot, waiting out a concurrent
+    /// DropOldest release.
+    ///
+    /// The drop CAS advances the shared tail before the physical release
+    /// (so concurrent droppers never release the same message twice), so
+    /// a producer that reserved immediately after the CAS can observe
+    /// the previous occupant still COMMITTED. The release completes in
+    /// the winner's drop loop, so the wait is bounded in practice; only
+    /// a crashed releaser leaves the slot occupied forever, hence the
+    /// bound.
+    fn write_reserved_slot(&self, index: usize, seq: u64, frame: &[u8]) -> Result<()> {
+        const RELEASE_WAIT: u32 = 100_000;
+        for _ in 0..RELEASE_WAIT {
+            match self.region.write_committed_no_flush(index, seq, frame) {
+                Ok(()) => return Ok(()),
+                Err(DslineError::Channel(ChannelError::BufferFull)) => thread::yield_now(),
+                Err(err) => return Err(err),
+            }
+        }
+        Err(ChannelError::BufferFull.into())
+    }
+
+    /// Claim `needed_slots` ring slots for this producer.
+    ///
+    /// Returns `Some(start)` (the head slot count before the reservation)
+    /// on success, or `None` when the message was dropped by `DropNewest`.
+    /// The guard and the reservation are one CAS: the check `head - tail +
+    /// needed <= capacity` runs against freshly loaded cursors and the CAS
+    /// wins only if no other producer advanced head in between, so the
+    /// reservation itself enforces the ring bound.
+    fn reserve_slots(&mut self, needed_slots: usize) -> Result<Option<u64>> {
+        if needed_slots > self.config.capacity {
+            return Err(ChannelError::MessageTooLarge {
+                len: needed_slots,
+                slot_size: self.config.capacity,
+            }
+            .into());
+        }
+        loop {
+            self.refresh_cursors()?;
+            if self.config.capacity - self.len >= needed_slots {
+                let head_c = self.head_cursor;
+                let (actual, ok) = self
+                    .region
+                    .compare_exchange_head(head_c, head_c + needed_slots as u64)?;
+                if ok {
+                    return Ok(Some(actual));
+                }
+                // Another producer won the CAS first; re-evaluate the guard
+                // against the new head.
+                continue;
+            }
+            match self.config.backpressure {
+                Backpressure::Raise => return Err(ChannelError::BufferFull.into()),
+                Backpressure::Block => {
+                    self.wait_for_space(needed_slots)?;
+                    // Re-run the guard and the reservation.
+                }
+                Backpressure::DropNewest => return Ok(None),
+                Backpressure::DropOldest => {
+                    while self.config.capacity - self.len < needed_slots {
+                        self.drop_oldest_message()?;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn recv(&mut self) -> Result<Vec<u8>> {
         Ok(self.recv_with_seq()?.payload)
     }
@@ -2161,7 +2363,14 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
 
         let snapshot = self.region.read_committed(self.tail)?;
 
-        if snapshot.seq != self.expected_recv_seq {
+        // SPSC: the producer publishes head only after commit, so the tail
+        // slot's sequence must be exactly the next expected one. MPSC: the
+        // head cursor is reserved before the write and the reservation order
+        // of messages is not a single writer's order, so per-message
+        // sequence contiguity is not enforced — ordering and integrity come
+        // from the ring position, the COMMITTED gate, and the checksum
+        // instead (see `send_mpsc`).
+        if !self.config.multi_producer && snapshot.seq != self.expected_recv_seq {
             return Err(ChannelError::SequenceMismatch {
                 expected: self.expected_recv_seq,
                 actual: snapshot.seq,
@@ -2249,6 +2458,9 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
 
     pub fn message_size_limits(&self) -> MessageSizeLimits {
         message_size_limits(&self.config)
+    }
+    pub fn multi_producer(&self) -> bool {
+        self.config.multi_producer
     }
 
     fn prepare_send_slots(&mut self, needed_slots: usize) -> Result<bool> {
@@ -2500,6 +2712,9 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     }
 
     fn drop_oldest_message(&mut self) -> Result<()> {
+        if self.config.multi_producer {
+            return self.drop_oldest_message_mpsc();
+        }
         if self.len == 0 {
             return Ok(());
         }
@@ -2517,7 +2732,10 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
 
         for _ in 0..slots_to_drop {
             let index = self.tail;
-            self.region.release_committed_no_flush(index)?;
+            // Force-release: the message was validated COMMITTED by the
+            // peek, and the consumer may have pinned the slot in between —
+            // the drop still discards it (see `force_release_no_flush`).
+            self.region.force_release_no_flush(index)?;
             self.tail = (self.tail + 1) % self.config.capacity;
             self.tail_cursor = self.tail_cursor.wrapping_add(1);
             self.region.fetch_max_tail(self.tail_cursor)?;
@@ -2526,6 +2744,78 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         }
         self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
         Ok(())
+    }
+
+    /// MPSC DropOldest. The tail may be another producer's in-flight
+    /// reservation, so the bounded COMMITTED gate runs first; and the tail
+    /// advance is a CAS over the dropped message's slot count, so concurrent
+    /// droppers never drop the same message twice. A lost CAS just means
+    /// another dropper made progress first — the caller's guard loop
+    /// re-evaluates.
+    ///
+    /// The peek/decode is retried (unbounded) because a concurrent dropper
+    /// can tear the tail slot mid-release: every competing drop is bounded
+    /// work, so the retry loop always reaches a stable tail. The only exit
+    /// without progress is the COMMITTED gate rejecting a crashed writer's
+    /// leftover — a WRITING slot at a tail that does not advance, where no
+    /// amount of waiting helps.
+    fn drop_oldest_message_mpsc(&mut self) -> Result<()> {
+        loop {
+            self.refresh_cursors()?;
+            if self.len == 0 {
+                return Ok(());
+            }
+            let tail_count = self.tail_cursor;
+            if !self.poll_tail_committed()? {
+                // Refuse only when the cursors did not move during the
+                // grace period (a crash leftover); a transient FREE from a
+                // concurrent release resolves as soon as the tail advances.
+                self.refresh_cursors()?;
+                if self.tail_cursor == tail_count {
+                    return Err(ChannelError::BufferFull.into());
+                }
+                continue;
+            }
+            let snapshot = match self.region.peek_committed(self.tail) {
+                Ok(snapshot) => snapshot,
+                Err(_) => continue, // released while peeking; re-evaluate
+            };
+            let frame = match decode_frame(&snapshot.data) {
+                Ok(frame) => frame,
+                Err(_) => continue, // concurrent release tore the frame
+            };
+            let slots_to_drop = if is_chunked(&frame) {
+                let info = match chunk_info(&frame) {
+                    Ok(info) => info,
+                    Err(_) => continue, // torn chunk metadata; re-evaluate
+                };
+                if info.index != 0 {
+                    return Err(ChannelError::CorruptedMessage.into());
+                }
+                info.total
+            } else {
+                1
+            };
+            let (_, ok) = self
+                .region
+                .compare_exchange_tail(tail_count, tail_count + slots_to_drop as u64)?;
+            if !ok {
+                return Ok(());
+            }
+            for _ in 0..slots_to_drop {
+                let index = self.tail;
+                // Force-release: the winning CAS already linearized the
+                // discard, so the slot is freed even when the consumer
+                // pinned it between the peek and the CAS.
+                self.region.force_release_no_flush(index)?;
+                self.tail = (self.tail + 1) % self.config.capacity;
+                self.tail_cursor = self.tail_cursor.wrapping_add(1);
+                self.region.flush_release(index)?;
+                self.len = self.len.saturating_sub(1);
+            }
+            self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
+            return Ok(());
+        }
     }
 }
 
@@ -2549,7 +2839,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         } else {
             // The region already exists: wait for the creator's magic, then
             // recover.
-            region.wait_initialized()?;
+            region.wait_initialized(region_magic(config.multi_producer))?;
             Self::opened(region, config)
         }
     }
@@ -2892,9 +3182,9 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        shm_region_path, FileSlotStorage, FixedSlotRegion, FixedSlotStorage, MemorySlotStorage,
-        MmapSlotStorage, PersistentShmChannel, PersistentSlotRegion, ShmSpscChannel, SlotRegionIo,
-        SlotState,
+        region_magic, shm_region_path, FileSlotStorage, FixedSlotRegion, FixedSlotStorage,
+        MemorySlotStorage, MmapSlotStorage, PersistentShmChannel, PersistentSlotRegion,
+        ShmSpscChannel, SlotRegionIo, SlotState,
     };
     use dsline_core::error::{ChannelError, DslineError};
     use dsline_core::{
@@ -2982,6 +3272,7 @@ mod tests {
             slot_size,
             backpressure: Backpressure::Raise,
             timeout: None,
+            multi_producer: false,
         })
         .expect("channel")
     }
@@ -3125,6 +3416,7 @@ mod tests {
             slot_size: 16,
             backpressure: Backpressure::Block,
             timeout: Some(Duration::from_millis(1)),
+            multi_producer: false,
         })
         .expect("channel");
         channel.send(b"one").expect("send one");
@@ -3142,6 +3434,7 @@ mod tests {
             slot_size: 16,
             backpressure: Backpressure::DropNewest,
             timeout: None,
+            multi_producer: false,
         })
         .expect("channel");
         channel.send(b"one").expect("send one");
@@ -3165,6 +3458,7 @@ mod tests {
             slot_size: 16,
             backpressure: Backpressure::DropOldest,
             timeout: None,
+            multi_producer: false,
         })
         .expect("channel");
         channel.send(b"one").expect("send one");
@@ -3189,6 +3483,7 @@ mod tests {
             slot_size: 64,
             backpressure: Backpressure::DropOldest,
             timeout: None,
+            multi_producer: false,
         })
         .expect("channel");
         let large = vec![b'a'; 80];
@@ -3257,6 +3552,7 @@ mod tests {
             slot_size: 16,
             backpressure: Backpressure::Raise,
             timeout: None,
+            multi_producer: false,
         };
         let storage = MemorySlotStorage::new(2, 16 + FRAME_HEADER_LEN).expect("storage");
         let mut channel = ShmSpscChannel::with_storage(config, storage).expect("channel");
@@ -3273,6 +3569,7 @@ mod tests {
             slot_size: 16,
             backpressure: Backpressure::Raise,
             timeout: None,
+            multi_producer: false,
         };
         let storage = MemorySlotStorage::new(1, 16 + FRAME_HEADER_LEN).expect("storage");
 
@@ -3289,6 +3586,7 @@ mod tests {
             slot_size: 16,
             backpressure: Backpressure::Raise,
             timeout: None,
+            multi_producer: false,
         };
         let storage = MemorySlotStorage::new(1, 16).expect("storage");
 
@@ -3322,6 +3620,7 @@ mod tests {
             slot_size: 16,
             backpressure: Backpressure::Raise,
             timeout: None,
+            multi_producer: false,
         };
         let storage =
             FileSlotStorage::create(&path, 2, 16 + FRAME_HEADER_LEN, 2 * (16 + FRAME_HEADER_LEN))
@@ -3362,6 +3661,7 @@ mod tests {
                 slot_size: 16,
                 backpressure: Backpressure::DropOldest,
                 timeout: None,
+                multi_producer: false,
             },
         )
         .expect("persistent channel");
@@ -3391,6 +3691,7 @@ mod tests {
                 slot_size: 64,
                 backpressure: Backpressure::Raise,
                 timeout: None,
+                multi_producer: false,
             },
         )
         .expect("persistent channel");
@@ -3473,6 +3774,7 @@ mod tests {
             slot_size: 64,
             backpressure: Backpressure::Raise,
             timeout: None,
+            multi_producer: false,
         };
         let mut created =
             PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
@@ -3498,6 +3800,7 @@ mod tests {
             slot_size: 16,
             backpressure: Backpressure::Raise,
             timeout: None,
+            multi_producer: false,
         };
         let mut first =
             PersistentShmChannel::<MmapSlotStorage>::create_or_open(&path, config.clone())
@@ -3520,6 +3823,7 @@ mod tests {
             slot_size,
             backpressure: Backpressure::Raise,
             timeout: None,
+            multi_producer: false,
         }
     }
 
@@ -3795,7 +4099,7 @@ mod tests {
         let region =
             PersistentSlotRegion::<SectionShmSlotStorage>::from_storage(storage).expect("region");
         assert!(matches!(
-            region.wait_initialized(),
+            region.wait_initialized(region_magic(false)),
             Err(DslineError::Channel(ChannelError::InvalidConfig(_)))
         ));
     }
@@ -3835,5 +4139,212 @@ mod tests {
         let reopened = PersistentShmChannel::<SectionShmSlotStorage>::create_or_open(&path, cfg)
             .expect("second life");
         assert!(reopened.is_empty(), "the section died with its last handle");
+    }
+
+    // ── multi-producer (MPSC) tests ──
+
+    fn mpsc_config(capacity: usize) -> SpscConfig {
+        SpscConfig {
+            capacity,
+            slot_size: 64,
+            backpressure: Backpressure::Block,
+            timeout: Some(Duration::from_secs(10)),
+            multi_producer: true,
+        }
+    }
+
+    #[test]
+    fn mpsc_mode_mismatch_is_rejected_at_open() {
+        // The channel mode is baked into the region magic at creation;
+        // opening an SPSC region as MPSC fails fast instead of
+        // misinterpreting the ring.
+        let path = test_file_path("mpsc-mode");
+        PersistentShmChannel::<MmapSlotStorage>::create(&path, persistent_config(4, 64))
+            .expect("spsc region");
+        assert!(matches!(
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, mpsc_config(4)),
+            Err(DslineError::Channel(ChannelError::InvalidConfig(_)))
+        ));
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn mpsc_two_producer_threads_deliver_every_message_exactly_once() {
+        let path = test_file_path("mpsc-threads");
+        let config = mpsc_config(8);
+        const PER_PRODUCER: usize = 200;
+        let mut producer_a =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        let mut producer_b =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config.clone()).expect("open b");
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let done_b = done_tx.clone();
+        let join_a = std::thread::spawn(move || {
+            for i in 0..PER_PRODUCER {
+                // 0..60 payload bytes: single-slot and chunked messages mix.
+                let payload = format!("a-{i}-{}", "x".repeat((i * 7) % 60));
+                producer_a.send(payload.as_bytes()).expect("send a");
+            }
+            done_tx.send(()).unwrap();
+        });
+        let join_b = std::thread::spawn(move || {
+            for i in 0..PER_PRODUCER {
+                let payload = format!("b-{i}-{}", "y".repeat((i * 13) % 60));
+                producer_b.send(payload.as_bytes()).expect("send b");
+            }
+            done_b.send(()).unwrap();
+        });
+
+        // Drain until both producers finished and the ring is empty. The
+        // reservations are disjoint by construction, so every payload must
+        // appear exactly once regardless of interleaving.
+        let mut consumer =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("open consumer");
+        let mut received = Vec::with_capacity(2 * PER_PRODUCER);
+        let mut producers_done = 0;
+        loop {
+            match consumer.recv_with_seq() {
+                Ok(message) => received.push(String::from_utf8(message.payload).expect("utf8")),
+                Err(DslineError::Channel(ChannelError::BufferEmpty)) => {
+                    while done_rx.try_recv().is_ok() {
+                        producers_done += 1;
+                    }
+                    if producers_done == 2 {
+                        break;
+                    }
+                }
+                Err(err) => panic!("unexpected recv error: {err:?}"),
+            }
+        }
+
+        join_a.join().expect("join a");
+        join_b.join().expect("join b");
+        assert_eq!(received.len(), 2 * PER_PRODUCER);
+        let mut expected: Vec<String> = Vec::with_capacity(2 * PER_PRODUCER);
+        for i in 0..PER_PRODUCER {
+            expected.push(format!("a-{i}-{}", "x".repeat((i * 7) % 60)));
+            expected.push(format!("b-{i}-{}", "y".repeat((i * 13) % 60)));
+        }
+        let mut got = received.clone();
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected, "every message delivered exactly once");
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn mpsc_drop_oldest_two_producers_never_drop_the_same_message_twice() {
+        let path = test_file_path("mpsc-drop-oldest");
+        let config = SpscConfig {
+            capacity: 4,
+            slot_size: 64,
+            backpressure: Backpressure::DropOldest,
+            timeout: None,
+            multi_producer: true,
+        };
+        const PER_PRODUCER: usize = 100;
+        let mut producer_a =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        let mut producer_b =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config.clone()).expect("open b");
+        // Both producers race on a full ring: their tail-drop CAS attempts
+        // must never drop the same message twice (over-advance the tail).
+        let join_a = std::thread::spawn(move || {
+            for i in 0..PER_PRODUCER {
+                let payload = format!("a-{i}");
+                producer_a.send(payload.as_bytes()).expect("send a");
+            }
+        });
+        let join_b = std::thread::spawn(move || {
+            for i in 0..PER_PRODUCER {
+                let payload = format!("b-{i}");
+                producer_b.send(payload.as_bytes()).expect("send b");
+            }
+        });
+        join_a.join().expect("join a");
+        join_b.join().expect("join b");
+
+        let mut consumer =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("open consumer");
+        let mut survivors = Vec::new();
+        while let Ok(message) = consumer.recv() {
+            survivors.push(String::from_utf8(message).expect("utf8"));
+        }
+        let mut unique = survivors.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(survivors.len(), unique.len(), "no duplicate deliveries");
+        assert!(!survivors.is_empty(), "the last messages must survive");
+        assert!(survivors.len() <= 2 * PER_PRODUCER);
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn mpsc_crashed_writer_leftover_counts_in_depth_and_surfaces_as_empty() {
+        // MPSC zombie semantics: the reservation protocol already advanced
+        // the head past the crashed producer's range, so the depth counts
+        // the leftover with bias 0 — the send guard can never over-commit.
+        let path = test_file_path("mpsc-crash");
+        let config = mpsc_config(4);
+        let mut channel =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        channel.send(b"one").expect("send");
+        // Crash mid-write: slot 1 holds a WRITING header (seq 1) and the
+        // head cursor was reserved to 2 before the producer died.
+        channel
+            .region
+            .write_header(1, SlotState::Writing, 1, 10)
+            .expect("zombie header");
+        channel.region.store_head(2).expect("head past zombie");
+
+        let mut recovered =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("open");
+        // Committed "one" + the reservation both count; no bias is needed.
+        assert_eq!(recovered.len(), 2);
+        // The producer writes after the reservation, never into the zombie.
+        recovered.send(b"two").expect("send past zombie");
+        assert_eq!(recovered.region.load_head().expect("head"), 3);
+
+        assert_eq!(recovered.recv_with_seq().expect("recv one").payload, b"one");
+        // The zombie is surfaced as an empty ring, not an infinite poll.
+        assert!(matches!(
+            recovered.recv(),
+            Err(DslineError::Channel(ChannelError::BufferEmpty))
+        ));
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mpsc_section_backend_two_handles_exchange_in_order() {
+        // The paging-file section backend provides the CAS reservation too:
+        // two producer handles interleave sends through one section and the
+        // consumer reads them back in reservation order.
+        let path = test_file_path("mpsc-section");
+        let config = mpsc_config(8);
+        let mut a =
+            PersistentShmChannel::<SectionShmSlotStorage>::create_or_open(&path, config.clone())
+                .expect("producer a");
+        let mut b =
+            PersistentShmChannel::<SectionShmSlotStorage>::create_or_open(&path, config.clone())
+                .expect("producer b");
+        let mut consumer =
+            PersistentShmChannel::<SectionShmSlotStorage>::create_or_open(&path, config.clone())
+                .expect("consumer");
+
+        a.send(b"alpha").expect("send alpha");
+        b.send(b"beta").expect("send beta");
+        let chunked = vec![b'c'; 90]; // 5-slot message
+        a.send(&chunked).expect("send chunked");
+        b.send(b"gamma").expect("send gamma");
+
+        assert_eq!(consumer.recv_with_seq().expect("alpha").payload, b"alpha");
+        assert_eq!(consumer.recv_with_seq().expect("beta").payload, b"beta");
+        assert_eq!(consumer.recv_with_seq().expect("chunked").payload, chunked);
+        assert_eq!(consumer.recv_with_seq().expect("gamma").payload, b"gamma");
+        assert!(consumer.is_empty());
     }
 }
