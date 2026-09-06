@@ -18,6 +18,7 @@ from ._dsline import (
     SequenceMismatchError,
     ShmChannel,
     __version__,
+    process_identity,
 )
 
 __all__ = [
@@ -35,6 +36,7 @@ __all__ = [
     "SequenceMismatchError",
     "ShmChannel",
     "ops",
+    "process_identity",
     "__version__",
 ]
 

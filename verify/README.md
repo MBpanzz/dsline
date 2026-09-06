@@ -59,6 +59,30 @@ extension is not importable).
   recovered producer writes from `head + bias` (stepping over the crashed
   batch) and the biased guard `head - tail + bias + k <= N` still implies
   disjoint write/occupied index sets.
+- **Z4.1 / Z4.1b / Z4.1c** — the crash-recovery reclaim decision table
+  (mirrors `reclaim_dead_writing`): `reclaim ⇔ stable-reads ∧ identity-magic
+  ∧ pid ≠ 0 ∧ liveness = Gone`, with the platform liveness probe axiomatized
+  (`Gone → not live`, `Alive → live`, pid 0 → `Unknown`). Z4.1 proves a
+  firing decision implies the recorded writer is not live; Z4.1b that no
+  input combination reclaims a live writer; Z4.1c that identityless (no
+  magic), torn, or pid-0 headers are never auto-reclaimed. A regression that
+  turns the conservative `Unknown` into reclaim breaks the check.
+- **Z4.2** — the torn-read defense: the writer stores the identity fields
+  and publishes the identity magic last (Release fence), so a snapshot that
+  shows the magic shows the complete true identity; reads are monotone.
+  Model: progress `p ∈ {0, 1}` with `snapshot(1) = (magic, true identity)`;
+  two agreeing magic-bearing reads observe the true identity — a partial
+  write can never fabricate one (UNSAT for a counterexample).
+- **Z4.3** — the sequence resync rule: after a reclaim (or an open with
+  nothing readable) the strict `+1` chain legitimately breaks. The bounded
+  trace shows the strict consumer rejects the post-crash restart while the
+  resync consumer adopts it exactly once and continues the chain (no
+  skipped, no duplicated acceptance).
+- **Z4.4** — bias accounting after an SPSC reclaim: the crashed batch's
+  slots are credited through `recovery_bias` (the cursors never counted
+  them); a reclaim retires at most that much credit (`freed <= bias`) and
+  the Z3.9 guard argument carries over with the reduced bias for
+  k ∈ {1, 2, 3}.
 
 ### CP-SAT (bounded model checking)
 
@@ -91,13 +115,32 @@ extension is not importable).
   phantom slot over the crashed batch): reachability check with witness.
   This is why the recv path gates on COMMITTED instead of polling
   forever — the gate converts the zombie state into an empty-ring decision.
+- **C8** — reclaim restores progress (multi-producer mode): with a dead
+  2-slot reservation WRITING between two live messages, the pre-fix ring
+  (no reclaim) can never deliver the message behind the reservation
+  (INFEASIBLE — the wedge); with the gate reclaim enabled the solver finds
+  the delivering schedule (`R@0 X@1+2 R@3`): the recorded extent is freed
+  and the tail advances past it.
+- **C9** — the reclaim never crosses a live message: over arbitrary
+  reservation placements (start/extent per reservation, both in the cursor
+  window, exclusivity on the ring), a firing reclaim's crossed run
+  `[tail, tail + extent)` cannot contain a live reservation's slots — the
+  per-slot verification pass in `try_reclaim_at_tail_mpsc` is backed by
+  reservation exclusivity (the reclaim-specific form of W2).
+- **C10** — the orphan cursor regime: a consumer that reads a COMMITTED
+  slot whose head count was not yet published (producer mid-batch or
+  crashed between slot commits and the head store) advances tail past
+  head. Pre-fix the refresh rejected the resulting wrapped distance as
+  inconsistent (reproduced); post-fix the refresh recognizes tail-ahead by
+  up to capacity (orphan regime), which covers every protocol-reachable
+  state (INFEASIBLE for the error condition).
 
 ### SCIP (MILP)
 
 - **S1 / S2** — `max_message_size = capacity * (slot_size - 42)` and
   `ceil(len / chunk)` hold as optima of the natural MILP formulations.
 - **S3** — worst-case region file size over the config domain
-  (64 × (4096 + 50 + 13) bytes, plus the 16-byte region header) matches the
+  (64 × (4096 + 50 + 48) bytes, plus the 24-byte region header) matches the
   layout formula.
 - **S4** — SCIP and CP-SAT independently compute `max_message_size` for the
   same configs and agree with the formula (differential cross-check).
@@ -106,14 +149,21 @@ extension is not importable).
 - **S6** — the per-message flush end offset (region header + last slot +
   frame, maximized over the index domain and frame length) equals the total
   region size: the Windows batch flush range never exceeds the mapping.
+- **S7** — SCIP and CP-SAT independently compute the worst-case region size
+  with the writer-identity header (48-byte slot header, 24-byte region
+  header) and agree with the formula (differential cross-check).
+- **S8** — the minimal tail advance past a dead reservation equals its
+  recorded extent (MIP optimum for several extents): the reclaim advances
+  exactly the extent — no less (the gate cannot pass a dead slot), no more
+  (no data skipped).
 
 ### Replay vs implementation
 
 - **R1** — `stats()` chunk/max-size limits equal the formulas for real
   channels.
 - **R2** — the on-disk region file is exactly
-  `16 + capacity * (slot_size + 50 + 13)` bytes (16 = the two shared cursor
-  words in the region header).
+  `24 + capacity * (slot_size + 50 + 48)` bytes (24 = the two shared cursor
+  words, the init magic, and the format word in the region header).
 - **R3** — a 400-step seeded random schedule of sends (including chunked
   messages) and receives under `Raise` backpressure matches the reference
   model (queue depth, sequence numbers, full/empty errors).
@@ -122,6 +172,18 @@ extension is not importable).
   cross-process SPSC, exercising the shared cursors end to end). A 300-step
   seeded random schedule matches the reference model on sequences, payloads,
   and the cursor-derived queue depth.
+- **R5** — MPSC replay: two producer handles over one multi-producer
+  region deliver every message (single-slot and chunked) exactly once in
+  reservation order through the real implementation.
+- **R6** — crash-recovery replay through the real implementation: a
+  "crashed" writer is simulated with the test-only `_debug_leave_zombie`
+  helper using a real, reaped child PID (the liveness probe answers Gone).
+  R6a verifies open-time reclaim (the zombie is freed, its slot reused,
+  sequences continue); R6b verifies the gate-time reclaim for a consumer
+  opened before the crash plus the sequence resync for the recovered
+  producer; R6c verifies the conservative default (a live writer's zombie
+  is never reclaimed); R6d verifies `reclaim_stale()` frees each zombie
+  exactly once.
 
 ## Scope
 

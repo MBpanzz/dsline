@@ -19,6 +19,10 @@ use std::time::Instant;
 
 use memmap2::MmapMut;
 
+pub mod process;
+
+pub use process::{current_process_identity, process_liveness, ProcessIdentity, ProcessLiveness};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SlotState {
@@ -27,6 +31,18 @@ pub enum SlotState {
     Committed = 2,
     Pinned = 3,
     Corrupted = 4,
+}
+
+impl SlotState {
+    fn from_byte(raw: u8) -> SlotState {
+        match raw {
+            0 => SlotState::Free,
+            1 => SlotState::Writing,
+            2 => SlotState::Committed,
+            3 => SlotState::Pinned,
+            _ => SlotState::Corrupted,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1520,14 +1536,48 @@ impl<S: FixedSlotStorage> FixedSlotRegion<S> {
 
 // ── Persistent slot region (shared-memory, cross-process) ──
 
-/// Size of the per-slot header stored in persistent storage.
-pub const PERSISTENT_SLOT_HEADER_LEN: usize = 13;
-
-/// Size of the region header at the start of the backing store, holding the
-/// SPSC cursors and the initialization magic:
+/// Size of the per-slot header stored in persistent storage:
 ///
 /// ```text
-/// [head: u64 @ 0] [tail: u64 @ 8] [magic: u32 @ 16]
+/// [0]       state: u8
+/// [1..9]    seq: u64 LE
+/// [9..13]   payload_len: u32 LE
+/// [13..17]  writer_pid: u32 LE
+/// [17..25]  writer_start_time: u64 LE   (platform-local start timestamp)
+/// [25..29]  writer_epoch: u32 LE        (per-handle diagnostic id)
+/// [29..37]  writer_timestamp_ns: u64 LE (unix ns when WRITING was marked)
+/// [37..41]  reserved_slots: u32 LE      (slots claimed by this message)
+/// [41..45]  identity_magic: u32 LE      (published last; see below)
+/// [45..48]  reserved (zero)
+/// ```
+///
+/// The writer-identity fields are present exactly when `identity_magic`
+/// equals [`SLOT_IDENTITY_MAGIC`]. The writer stores the identity fields
+/// first, issues a Release fence, and publishes the magic last, so a reader
+/// that observes the magic (after an Acquire fence) never sees a torn or
+/// partially written identity — the property the reclaim decision relies on
+/// (verify Z4 checks).
+pub const PERSISTENT_SLOT_HEADER_LEN: usize = 48;
+
+/// Identity magic published last in a WRITING slot header (bytes `WIV1`
+/// little-endian).
+pub const SLOT_IDENTITY_MAGIC: u32 = 0x3156_4957;
+
+const ID_STATE_OFFSET: usize = 0;
+const ID_SEQ_OFFSET: usize = 1;
+const ID_PAYLOAD_LEN_OFFSET: usize = 9;
+const ID_PID_OFFSET: usize = 13;
+const ID_START_TIME_OFFSET: usize = 17;
+const ID_EPOCH_OFFSET: usize = 25;
+const ID_TIMESTAMP_OFFSET: usize = 29;
+const ID_RESERVED_SLOTS_OFFSET: usize = 37;
+const ID_MAGIC_OFFSET: usize = 41;
+
+/// Size of the region header at the start of the backing store, holding the
+/// SPSC cursors, the initialization magic, and the region format version:
+///
+/// ```text
+/// [head: u64 @ 0] [tail: u64 @ 8] [magic: u32 @ 16] [format: u32 @ 20]
 /// ```
 ///
 /// `head` is producer-owned (monotonic slot count), `tail` is consumer-owned.
@@ -1535,8 +1585,14 @@ pub const PERSISTENT_SLOT_HEADER_LEN: usize = 13;
 /// by the open path (acquire load), so a peer can never observe a
 /// half-initialized region: the caller that creates the store first fills
 /// every slot header and only then publishes the magic; everyone else waits
-/// for it before recovering the ring.
-pub const REGION_HEADER_LEN: usize = 20;
+/// for it before recovering the ring. The format word distinguishes the
+/// current on-region layout (48-byte slot headers with writer identity) from
+/// the previous 13-byte one; a region written by an older build is rejected
+/// at open instead of being misinterpreted.
+pub const REGION_HEADER_LEN: usize = 24;
+
+/// On-region layout version (`REGION_FORMAT` word).
+pub const REGION_FORMAT: u32 = 2;
 
 /// Magic value published once initialization completes
 /// (bytes `DSL1` little-endian) — single-producer (SPSC) mode.
@@ -1561,6 +1617,7 @@ pub fn region_magic(multi_producer: bool) -> u32 {
 const CURSOR_HEAD_OFFSET: usize = 0;
 const CURSOR_TAIL_OFFSET: usize = 8;
 const MAGIC_OFFSET: usize = 16;
+const FORMAT_OFFSET: usize = 20;
 
 /// Resolve a channel name to a stable region file path in the runtime
 /// directory. The same name always maps to the same path, in every process,
@@ -1594,12 +1651,41 @@ fn shm_runtime_base() -> Result<PathBuf> {
     Ok(base.unwrap_or_else(std::env::temp_dir))
 }
 
+/// A slot header snapshot including the writer identity fields. The
+/// identity is meaningful only when `state` is `Writing` and
+/// `identity_magic == SLOT_IDENTITY_MAGIC`; every other state (or a header
+/// written by a build without identity support) reports `identity: None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotHeaderFull {
+    pub state: SlotState,
+    pub seq: u64,
+    pub payload_len: usize,
+    /// Writer identity and reservation extent (WRITING slots with a
+    /// published identity only).
+    pub identity: Option<WriterIdentity>,
+}
+
+/// The writer identity recorded in a WRITING slot header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriterIdentity {
+    pub pid: u32,
+    pub start_time: u64,
+    /// Per-handle diagnostic id (not part of the liveness decision).
+    pub epoch: u32,
+    /// Unix nanoseconds when the WRITING header was marked.
+    pub timestamp_ns: u64,
+    /// Slots claimed by this message's reservation (the reclaim extent in
+    /// multi-producer mode).
+    pub reserved_slots: u32,
+}
+
 /// A slot region that stores metadata (state, seq, length) in the storage
 /// layer alongside frame data, enabling cross-process access.
 ///
 /// Slot layout in storage:
 /// ```text
-/// [state: u8] [seq: u64 LE] [payload_len: u32 LE] [frame bytes…]
+/// [state: u8] [seq: u64 LE] [payload_len: u32 LE] [writer identity…]
+/// [frame bytes…]
 /// ```
 /// Total per-slot region size for a channel config (header + frame space).
 fn persistent_region_slot_size(config: &SpscConfig) -> Result<usize> {
@@ -1615,7 +1701,8 @@ fn persistent_region_slot_size(config: &SpscConfig) -> Result<usize> {
 ///
 /// Slot layout in storage:
 /// ```text
-/// [state: u8] [seq: u64 LE] [payload_len: u32 LE] [frame bytes…]
+/// [state: u8] [seq: u64 LE] [payload_len: u32 LE] [writer identity…]
+/// [frame bytes…]
 /// ```
 #[derive(Debug)]
 pub struct PersistentSlotRegion<S: SlotRegionIo = MmapSlotStorage> {
@@ -1701,19 +1788,115 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
         let raw = self
             .storage
             .read_at(self.slot_offset(index), PERSISTENT_SLOT_HEADER_LEN)?;
-        let state = match raw[0] {
-            0 => SlotState::Free,
-            1 => SlotState::Writing,
-            2 => SlotState::Committed,
-            3 => SlotState::Pinned,
-            4 => SlotState::Corrupted,
-            _ => SlotState::Corrupted,
-        };
-        let seq = u64::from_le_bytes(raw[1..9].try_into().expect("seq slice is 8 bytes"));
-        let payload_len =
-            u32::from_le_bytes(raw[9..13].try_into().expect("payload_len slice is 4 bytes"))
-                as usize;
+        let state = SlotState::from_byte(raw[ID_STATE_OFFSET]);
+        let seq = u64::from_le_bytes(
+            raw[ID_SEQ_OFFSET..ID_SEQ_OFFSET + 8]
+                .try_into()
+                .expect("seq slice is 8 bytes"),
+        );
+        let payload_len = u32::from_le_bytes(
+            raw[ID_PAYLOAD_LEN_OFFSET..ID_PAYLOAD_LEN_OFFSET + 4]
+                .try_into()
+                .expect("payload_len slice is 4 bytes"),
+        ) as usize;
         Ok((state, seq, payload_len))
+    }
+
+    /// Read the full header including the writer identity. The identity is
+    /// reported only for a WRITING slot whose identity magic is published
+    /// (see [`SLOT_IDENTITY_MAGIC`]); anything else reports `None`.
+    pub fn read_header_full(&self, index: usize) -> Result<SlotHeaderFull> {
+        let raw = self
+            .storage
+            .read_at(self.slot_offset(index), PERSISTENT_SLOT_HEADER_LEN)?;
+        Ok(Self::parse_header_full(&raw))
+    }
+
+    /// Parse a full header from raw bytes. Visible for tests.
+    fn parse_header_full(raw: &[u8]) -> SlotHeaderFull {
+        let state = SlotState::from_byte(raw[ID_STATE_OFFSET]);
+        let seq = u64::from_le_bytes(
+            raw[ID_SEQ_OFFSET..ID_SEQ_OFFSET + 8]
+                .try_into()
+                .expect("seq slice is 8 bytes"),
+        );
+        let payload_len = u32::from_le_bytes(
+            raw[ID_PAYLOAD_LEN_OFFSET..ID_PAYLOAD_LEN_OFFSET + 4]
+                .try_into()
+                .expect("payload_len slice is 4 bytes"),
+        ) as usize;
+        let magic = u32::from_le_bytes(
+            raw[ID_MAGIC_OFFSET..ID_MAGIC_OFFSET + 4]
+                .try_into()
+                .expect("magic slice is 4 bytes"),
+        );
+        let identity = if magic == SLOT_IDENTITY_MAGIC {
+            Some(WriterIdentity {
+                pid: u32::from_le_bytes(
+                    raw[ID_PID_OFFSET..ID_PID_OFFSET + 4]
+                        .try_into()
+                        .expect("pid slice is 4 bytes"),
+                ),
+                start_time: u64::from_le_bytes(
+                    raw[ID_START_TIME_OFFSET..ID_START_TIME_OFFSET + 8]
+                        .try_into()
+                        .expect("start_time slice is 8 bytes"),
+                ),
+                epoch: u32::from_le_bytes(
+                    raw[ID_EPOCH_OFFSET..ID_EPOCH_OFFSET + 4]
+                        .try_into()
+                        .expect("epoch slice is 4 bytes"),
+                ),
+                timestamp_ns: u64::from_le_bytes(
+                    raw[ID_TIMESTAMP_OFFSET..ID_TIMESTAMP_OFFSET + 8]
+                        .try_into()
+                        .expect("timestamp slice is 8 bytes"),
+                ),
+                reserved_slots: u32::from_le_bytes(
+                    raw[ID_RESERVED_SLOTS_OFFSET..ID_RESERVED_SLOTS_OFFSET + 4]
+                        .try_into()
+                        .expect("reserved_slots slice is 4 bytes"),
+                ),
+            })
+        } else {
+            None
+        };
+        SlotHeaderFull {
+            state,
+            seq,
+            payload_len,
+            identity,
+        }
+    }
+
+    /// Encode a 48-byte header image.
+    fn encode_header(
+        state: SlotState,
+        seq: u64,
+        payload_len: usize,
+        identity: Option<WriterIdentity>,
+        publish_magic: bool,
+    ) -> Vec<u8> {
+        let mut header = vec![0u8; PERSISTENT_SLOT_HEADER_LEN];
+        header[ID_STATE_OFFSET] = state as u8;
+        header[ID_SEQ_OFFSET..ID_SEQ_OFFSET + 8].copy_from_slice(&seq.to_le_bytes());
+        header[ID_PAYLOAD_LEN_OFFSET..ID_PAYLOAD_LEN_OFFSET + 4]
+            .copy_from_slice(&(payload_len as u32).to_le_bytes());
+        if let Some(id) = identity {
+            header[ID_PID_OFFSET..ID_PID_OFFSET + 4].copy_from_slice(&id.pid.to_le_bytes());
+            header[ID_START_TIME_OFFSET..ID_START_TIME_OFFSET + 8]
+                .copy_from_slice(&id.start_time.to_le_bytes());
+            header[ID_EPOCH_OFFSET..ID_EPOCH_OFFSET + 4].copy_from_slice(&id.epoch.to_le_bytes());
+            header[ID_TIMESTAMP_OFFSET..ID_TIMESTAMP_OFFSET + 8]
+                .copy_from_slice(&id.timestamp_ns.to_le_bytes());
+            header[ID_RESERVED_SLOTS_OFFSET..ID_RESERVED_SLOTS_OFFSET + 4]
+                .copy_from_slice(&id.reserved_slots.to_le_bytes());
+            if publish_magic {
+                header[ID_MAGIC_OFFSET..ID_MAGIC_OFFSET + 4]
+                    .copy_from_slice(&SLOT_IDENTITY_MAGIC.to_le_bytes());
+            }
+        }
+        header
     }
 
     fn write_header(
@@ -1723,11 +1906,33 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
         seq: u64,
         payload_len: usize,
     ) -> Result<()> {
-        let mut header = vec![0u8; PERSISTENT_SLOT_HEADER_LEN];
-        header[0] = state as u8;
-        header[1..9].copy_from_slice(&seq.to_le_bytes());
-        header[9..13].copy_from_slice(&(payload_len as u32).to_le_bytes());
+        // No identity fields: the header image stays zero there, so the
+        // identity magic is absent and readers treat the slot as having no
+        // verifiable writer.
+        let header = Self::encode_header(state, seq, payload_len, None, false);
         self.storage.write_at(self.slot_offset(index), &header)
+    }
+
+    /// Mark a slot WRITING with the writer's identity: the identity fields
+    /// and a Release fence land first, the identity magic last — a reader
+    /// that observes the magic (after an Acquire fence) sees the complete
+    /// identity, never a torn one. The magic is also what makes the
+    /// identity trustworthy: a header written without it (older build, or
+    /// torn write) is never eligible for automatic reclaim.
+    pub fn write_writing_header(
+        &self,
+        index: usize,
+        seq: u64,
+        payload_len: usize,
+        identity: WriterIdentity,
+    ) -> Result<()> {
+        let fields =
+            Self::encode_header(SlotState::Writing, seq, payload_len, Some(identity), false);
+        self.storage.write_at(self.slot_offset(index), &fields)?;
+        fence(Ordering::Release);
+        let magic = SLOT_IDENTITY_MAGIC.to_le_bytes();
+        self.storage
+            .write_at(self.slot_offset(index) + ID_MAGIC_OFFSET, &magic)
     }
 
     /// Write frame data to slot payload area (after header).
@@ -1824,9 +2029,13 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
     /// Publish the initialization magic after all FREE headers (release).
     /// The magic encodes the channel mode (`REGION_MAGIC` for SPSC,
     /// `REGION_MAGIC_MPSC` for MPSC), so an opener with a mismatched mode
-    /// fails instead of misinterpreting the ring.
+    /// fails instead of misinterpreting the ring. The format word is
+    /// written just before the magic, so an opener that observes the magic
+    /// also observes the format.
     fn publish_magic(&self, magic: u32) -> Result<()> {
         fence(Ordering::Release);
+        self.storage
+            .write_at(FORMAT_OFFSET, &REGION_FORMAT.to_le_bytes())?;
         self.storage.write_at(MAGIC_OFFSET, &magic.to_le_bytes())
     }
 
@@ -1837,12 +2046,14 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
     /// see the whole initialized region — never a half-written one. Returns
     /// an error if the store never becomes initialized (a creator that died
     /// mid-initialization, or an incompatible store). A nonzero magic that
-    /// is not `expected` is an immediate mode mismatch, not a wait.
+    /// is not `expected` is an immediate mode mismatch, not a wait. After
+    /// the magic appears, the format word is checked so a region written by
+    /// a build with a different layout is rejected instead of misread.
     pub fn wait_initialized(&self, expected: u32) -> Result<()> {
         for _ in 0..2048 {
             let magic = self.load_magic()?;
             if magic == expected {
-                return Ok(());
+                return self.check_format();
             }
             if magic != 0 {
                 return Err(ChannelError::InvalidConfig(
@@ -1853,6 +2064,28 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
             thread::yield_now();
         }
         Err(ChannelError::InvalidConfig("region is not initialized").into())
+    }
+
+    /// Load the on-region format word.
+    pub fn load_format(&self) -> Result<u32> {
+        let raw = self
+            .storage
+            .read_at(FORMAT_OFFSET, std::mem::size_of::<u32>())?;
+        Ok(u32::from_le_bytes(
+            raw.try_into().expect("format is 4 bytes"),
+        ))
+    }
+
+    /// Reject regions whose layout version differs from this build's.
+    fn check_format(&self) -> Result<()> {
+        let format = self.load_format()?;
+        if format != REGION_FORMAT {
+            return Err(ChannelError::InvalidConfig(
+                "unsupported region format (delete stale dsline region files)",
+            )
+            .into());
+        }
+        Ok(())
     }
 
     // ── public state-transition API ──
@@ -1870,8 +2103,18 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
     /// header — on Windows, file-backed mappings are not coherent across
     /// views without a flush. No per-message disk sync (FlushFileBuffers);
     /// system-crash durability is out of scope.
-    pub fn write_committed(&self, index: usize, seq: u64, frame: &[u8]) -> Result<()> {
-        self.write_committed_no_flush(index, seq, frame)?;
+    ///
+    /// `stamp` records the writer identity in the WRITING header (crash
+    /// recovery). `None` writes a legacy-style header without an identity —
+    /// such a slot is never auto-reclaimed.
+    pub fn write_committed(
+        &self,
+        index: usize,
+        seq: u64,
+        frame: &[u8],
+        stamp: Option<&WriterIdentity>,
+    ) -> Result<()> {
+        self.write_committed_no_flush(index, seq, frame, stamp)?;
         // Make the whole slot visible to other processes' mappings.
         self.storage.flush_range(
             self.slot_offset(index),
@@ -1883,7 +2126,18 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
     /// caller must publish the writes with a `flush_range` (usually one
     /// batch flush covering the slots and the head cursor) before another
     /// process is allowed to observe them.
-    fn write_committed_no_flush(&self, index: usize, seq: u64, frame: &[u8]) -> Result<()> {
+    ///
+    /// `stamp` is the writer identity recorded in the WRITING header
+    /// (crash recovery): it lands in phase 1 with the identity magic
+    /// published last, so a reclaimer can later verify the writer's
+    /// process identity before freeing the slot.
+    fn write_committed_no_flush(
+        &self,
+        index: usize,
+        seq: u64,
+        frame: &[u8],
+        stamp: Option<&WriterIdentity>,
+    ) -> Result<()> {
         let (state, _, _) = self.read_header(index)?;
         if state != SlotState::Free {
             return Err(ChannelError::BufferFull.into());
@@ -1892,8 +2146,12 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
         // free (payload cleared) before we write into it.
         fence(Ordering::Acquire);
 
-        // Phase 1: mark WRITING
-        self.write_header(index, SlotState::Writing, seq, frame.len())?;
+        // Phase 1: mark WRITING, publishing the writer identity when given
+        // (identity fields + Release fence first, identity magic last).
+        match stamp {
+            Some(stamp) => self.write_writing_header(index, seq, frame.len(), *stamp)?,
+            None => self.write_header(index, SlotState::Writing, seq, frame.len())?,
+        };
 
         // Phase 2: write payload
         self.write_payload(index, frame)?;
@@ -1987,6 +2245,54 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
         self.clear_payload(index)?;
         fence(Ordering::Release);
         self.write_header(index, SlotState::Free, 0, 0)
+    }
+
+    /// Reclaim a WRITING slot whose writer identity is provably dead.
+    ///
+    /// The decision procedure (verify Z4 checks):
+    ///
+    /// 1. the slot must read WRITING in two consecutive full-header reads,
+    ///    with identical identity fields — a torn or transitional header
+    ///    aborts the reclaim;
+    /// 2. the identity magic must be published — a header without it (older
+    ///    build, torn write) is never auto-reclaimed;
+    /// 3. the identity must classify as [`ProcessLiveness::Gone`] — an
+    ///    `Alive` or `Unknown` classification aborts (the roadmap's
+    ///    conservative default: never risk a live writer);
+    ///
+    /// and only then the slot is force-released to FREE.
+    ///
+    /// Safe against a concurrent producer: while the slot stays inside the
+    /// cursor window `[tail, head)` no producer may claim it (the send
+    /// guard), and the caller advances the cursors only after the physical
+    /// release. The slot's ring position determines what the caller may do
+    /// next; this primitive only ever frees the one slot it verified.
+    pub fn reclaim_dead_writing(&self, index: usize) -> Result<bool> {
+        let first = self.read_header_full(index)?;
+        if first.state != SlotState::Writing {
+            return Ok(false);
+        }
+        let Some(identity) = first.identity else {
+            return Ok(false); // no published identity: never auto-reclaim
+        };
+        // Double-read agreement: the writer publishes the header exactly
+        // once, so a stable pair of reads means the write has fully landed
+        // (and that the slot is not being transitioned under us).
+        let second = self.read_header_full(index)?;
+        if second != first {
+            return Ok(false);
+        }
+        if process_liveness(ProcessIdentity {
+            pid: identity.pid,
+            start_time: identity.start_time,
+        }) != ProcessLiveness::Gone
+        {
+            return Ok(false);
+        }
+        self.force_release_no_flush(index)?;
+        self.storage
+            .flush_range(self.slot_offset(index), PERSISTENT_SLOT_HEADER_LEN)?;
+        Ok(true)
     }
 
     /// Publish the cursor words and one slot to other processes' mappings.
@@ -2119,10 +2425,49 @@ pub struct PersistentShmChannel<S: SlotRegionIo = MmapSlotStorage> {
     /// slots, and the shared head never advanced past them). Kept in the
     /// depth so the send guard never over-commits a physically full ring.
     recovery_bias: usize,
+    /// This handle's writer identity, recorded in every WRITING slot header
+    /// it produces (crash recovery, roadmap §6).
+    writer: process::ProcessIdentity,
+    writer_epoch: u32,
+    /// Slots this handle has reclaimed from provably dead writers.
+    reclaimed_slots: u64,
+    /// Set after a reclaim (or an open with nothing readable): the next
+    /// recv adopts whatever sequence it finds instead of enforcing the
+    /// strict +1 chain — a crash legitimately breaks sequence contiguity.
+    resync_expected: bool,
     next_seq: u64,
     expected_recv_seq: u64,
     last_received_seq: Option<u64>,
     closed: bool,
+}
+
+/// Per-handle writer epoch: distinguishes handles within one process for
+/// diagnostics only (liveness is decided from pid + start_time).
+static WRITER_EPOCH_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_writer_epoch() -> u32 {
+    // Mix the pid so epochs from different processes never collide.
+    (WRITER_EPOCH_COUNTER.fetch_add(1, Ordering::Relaxed) ^ u64::from(std::process::id())) as u32
+}
+
+fn unix_timestamp_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+impl process::ProcessIdentity {
+    /// Build the per-message WRITING-header stamp.
+    fn stamp(&self, epoch: u32, reserved_slots: u32) -> WriterIdentity {
+        WriterIdentity {
+            pid: self.pid,
+            start_time: self.start_time,
+            epoch,
+            timestamp_ns: unix_timestamp_ns(),
+            reserved_slots,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2169,6 +2514,10 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             head_cursor: 0,
             tail_cursor: 0,
             recovery_bias: 0,
+            writer: process::current_process_identity(),
+            writer_epoch: next_writer_epoch(),
+            reclaimed_slots: 0,
+            resync_expected: false,
             next_seq: 0,
             expected_recv_seq: 0,
             last_received_seq: None,
@@ -2188,6 +2537,10 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             head_cursor: 0,
             tail_cursor: 0,
             recovery_bias: 0,
+            writer: process::current_process_identity(),
+            writer_epoch: next_writer_epoch(),
+            reclaimed_slots: 0,
+            resync_expected: false,
             next_seq: 0,
             expected_recv_seq: 0,
             last_received_seq: None,
@@ -2226,10 +2579,13 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         let frames = encode_message_frames(&self.config, plan, seq, bytes)?;
+        let stamp = self
+            .writer
+            .stamp(self.writer_epoch, plan.needed_slots as u32);
         let first_index = self.head;
         for frame in &frames {
             self.region
-                .write_committed_no_flush(self.head, seq, frame)?;
+                .write_committed_no_flush(self.head, seq, frame, Some(&stamp))?;
             self.head = (self.head + 1) % self.config.capacity;
             self.len += 1;
         }
@@ -2261,10 +2617,13 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
         let frames = encode_message_frames(&self.config, plan, seq, bytes)?;
+        let stamp = self
+            .writer
+            .stamp(self.writer_epoch, plan.needed_slots as u32);
         let first_index = (start % self.config.capacity as u64) as usize;
         for (k, frame) in frames.iter().enumerate() {
             let index = ((start + k as u64) % self.config.capacity as u64) as usize;
-            self.write_reserved_slot(index, seq, frame)?;
+            self.write_reserved_slot(index, seq, frame, &stamp)?;
         }
         // One flush publishes the batch and the reservation together; the
         // consumer's per-slot COMMITTED gate absorbs the in-flight window.
@@ -2284,10 +2643,19 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     /// the winner's drop loop, so the wait is bounded in practice; only
     /// a crashed releaser leaves the slot occupied forever, hence the
     /// bound.
-    fn write_reserved_slot(&self, index: usize, seq: u64, frame: &[u8]) -> Result<()> {
+    fn write_reserved_slot(
+        &self,
+        index: usize,
+        seq: u64,
+        frame: &[u8],
+        stamp: &WriterIdentity,
+    ) -> Result<()> {
         const RELEASE_WAIT: u32 = 100_000;
         for _ in 0..RELEASE_WAIT {
-            match self.region.write_committed_no_flush(index, seq, frame) {
+            match self
+                .region
+                .write_committed_no_flush(index, seq, frame, Some(stamp))
+            {
                 Ok(()) => return Ok(()),
                 Err(DslineError::Channel(ChannelError::BufferFull)) => thread::yield_now(),
                 Err(err) => return Err(err),
@@ -2352,25 +2720,46 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             return Err(ChannelError::Closed.into());
         }
 
+        // A reclaim (or an open with nothing readable) breaks sequence
+        // contiguity legitimately: the next read adopts whatever sequence
+        // it actually observes instead of enforcing the +1 chain.
+        let resync = std::mem::take(&mut self.resync_expected);
+
         // Gate: only a fully COMMITTED slot is readable. The producer
         // publishes the batch and the head cursor with one flush, so in a
         // healthy run this polls for at most the flush window; a WRITING
         // slot that stays put past the grace period is a crash leftover
-        // (see verify C7), reported as an empty ring rather than hanging.
+        // (see verify C7), which crash recovery reclaims from a provably
+        // dead writer before giving up.
         if !self.poll_tail_committed()? {
-            return Err(ChannelError::BufferEmpty.into());
+            if self.try_reclaim_at_tail()? == 0 {
+                self.resync_expected = resync;
+                return Err(ChannelError::BufferEmpty.into());
+            }
+            // Retry once without the grace poll: the reclaim may have
+            // uncovered a live committed message right behind the dead
+            // reservation (multi-producer mode).
+            let (state, _, _) = self.region.read_header(self.tail)?;
+            if state != SlotState::Committed {
+                // Nothing readable yet. Keep the reclaim's resync flag: the
+                // next read must adopt the true post-crash sequence.
+                return Err(ChannelError::BufferEmpty.into());
+            }
         }
 
         let snapshot = self.region.read_committed(self.tail)?;
 
         // SPSC: the producer publishes head only after commit, so the tail
-        // slot's sequence must be exactly the next expected one. MPSC: the
-        // head cursor is reserved before the write and the reservation order
-        // of messages is not a single writer's order, so per-message
-        // sequence contiguity is not enforced — ordering and integrity come
-        // from the ring position, the COMMITTED gate, and the checksum
-        // instead (see `send_mpsc`).
-        if !self.config.multi_producer && snapshot.seq != self.expected_recv_seq {
+        // slot's sequence must be exactly the next expected one — unless a
+        // resync was pending, in which case the observed sequence is
+        // adopted. MPSC: the head cursor is reserved before the write and
+        // the reservation order of messages is not a single writer's order,
+        // so per-message sequence contiguity is not enforced — ordering and
+        // integrity come from the ring position, the COMMITTED gate, and
+        // the checksum instead (see `send_mpsc`).
+        if resync {
+            self.expected_recv_seq = snapshot.seq;
+        } else if !self.config.multi_producer && snapshot.seq != self.expected_recv_seq {
             return Err(ChannelError::SequenceMismatch {
                 expected: self.expected_recv_seq,
                 actual: snapshot.seq,
@@ -2463,6 +2852,33 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         self.config.multi_producer
     }
 
+    /// Test and diagnostics aid: write a WRITING header with an arbitrary
+    /// writer identity at the producer's next slot, exactly as a writer
+    /// killed mid-send would leave the region. Used by the test suites to
+    /// simulate a crashed writer deterministically; not part of the
+    /// production protocol.
+    pub fn debug_leave_zombie(
+        &mut self,
+        seq: u64,
+        pid: u32,
+        start_time: u64,
+        reserved_slots: u32,
+    ) -> Result<()> {
+        self.refresh_cursors()?;
+        let identity = WriterIdentity {
+            pid,
+            start_time,
+            epoch: 0,
+            timestamp_ns: unix_timestamp_ns(),
+            reserved_slots,
+        };
+        self.region
+            .write_writing_header(self.head, seq, 1, identity)?;
+        self.recovery_bias += 1;
+        self.len = (self.len + 1).min(self.config.capacity);
+        Ok(())
+    }
+
     fn prepare_send_slots(&mut self, needed_slots: usize) -> Result<bool> {
         if needed_slots > self.config.capacity {
             return Err(ChannelError::MessageTooLarge {
@@ -2513,21 +2929,38 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     /// queue depth and the consumer's read position. `head` (the producer's
     /// write position) is intentionally not touched — only the producer
     /// moves it, and on open it was recovered zombie-aware.
+    ///
+    /// Two cursor regimes exist:
+    ///
+    /// * head-ahead (normal): `head - tail <= capacity`. The depth is the
+    ///   committed prefix plus `recovery_bias` (crash leftovers beyond the
+    ///   published head).
+    /// * tail-ahead (orphan): `tail - head <= capacity`. The consumer
+    ///   consumed COMMITTED slots whose head counts were never published —
+    ///   a producer crashed (or is still mid-batch) between the slot
+    ///   commits and the head store. Everything readable then lives in the
+    ///   bias alone.
+    ///
+    /// Before the orphan regime existed, a consumer that read such a slot
+    /// advanced tail past head and the next refresh rejected the ring as
+    /// inconsistent — reachable deterministically after a mid-batch crash
+    /// (verify C11).
     fn refresh_cursors(&mut self) -> Result<()> {
         let head_c = self.region.load_head()?;
         let tail_c = self.region.load_tail()?;
-        // Both cursors must live in the same <2^63 window (the sequence
-        // comparison rule). head < tail means the counts have diverged —
-        // inconsistent region state, refuse rather than wrap into garbage.
-        let dist = head_c.wrapping_sub(tail_c);
-        if dist >= (1u64 << 63) {
-            return Err(ChannelError::InvalidConfig("ring cursors are inconsistent").into());
-        }
+        let cap = self.config.capacity as u64;
+        let fwd = head_c.wrapping_sub(tail_c);
+        let back = tail_c.wrapping_sub(head_c);
         self.head_cursor = head_c;
         self.tail_cursor = tail_c;
-        self.tail = (tail_c % self.config.capacity as u64) as usize;
-        self.len = (dist.min(self.config.capacity as u64) as usize + self.recovery_bias)
-            .min(self.config.capacity);
+        self.tail = (tail_c % cap) as usize;
+        if fwd <= cap {
+            self.len = ((fwd as usize) + self.recovery_bias).min(self.config.capacity);
+        } else if back <= cap {
+            self.len = self.recovery_bias.min(self.config.capacity);
+        } else {
+            return Err(ChannelError::InvalidConfig("ring cursors are inconsistent").into());
+        }
         Ok(())
     }
 
@@ -2539,16 +2972,39 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     /// readable slot — this also steps over any WRITING slot left by a
     /// crashed producer). `recovery_bias` keeps crash leftovers in the queue
     /// depth so the send guard never over-commits a physically full ring.
+    ///
+    /// Crash recovery runs first in SPSC mode: WRITING slots whose writer
+    /// identity is provably dead are freed before the scan (in SPSC mode
+    /// the crashed batch's slots always sit beyond the published head, so
+    /// freeing them changes no cursor). MPSC mode reclaims at the tail
+    /// instead (see `try_reclaim_at_tail_mpsc`): the dead reservation is
+    /// cursor-counted and only the tail can advance past it.
     fn recover_from_storage(&mut self) -> Result<()> {
+        if !self.config.multi_producer {
+            for index in 0..self.config.capacity {
+                if self.region.reclaim_dead_writing(index)? {
+                    self.reclaimed_slots += 1;
+                    self.resync_expected = true;
+                }
+            }
+        }
         let occupied = self.occupied_slot_headers()?;
         let head_c = self.region.load_head()?;
         let tail_c = self.region.load_tail()?;
-        let dist = head_c.wrapping_sub(tail_c);
-        let cursor_len = dist.min(self.config.capacity as u64) as usize;
+        let cap = self.config.capacity as u64;
+        let fwd = head_c.wrapping_sub(tail_c);
+        let back = tail_c.wrapping_sub(head_c);
+        let cursor_len = if fwd <= cap {
+            fwd.min(cap) as usize
+        } else if back <= cap {
+            0
+        } else {
+            return Err(ChannelError::InvalidConfig("ring cursors are inconsistent").into());
+        };
 
         self.head_cursor = head_c;
         self.tail_cursor = tail_c;
-        let tail_index = (tail_c % self.config.capacity as u64) as usize;
+        let tail_index = (tail_c % cap) as usize;
         self.tail = tail_index;
         self.head = self.infer_head_from_tail(tail_index)?;
         // The scan sees every occupied slot; the cursors only see fully
@@ -2565,13 +3021,16 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         }
         // Consumer sequence: the first message to read is the oldest
         // committed/pinned slot; with nothing readable yet the sequence
-        // restarts at 0 (the current-region convention).
+        // restarts at 0 (the current-region convention). The zero is a
+        // convention, not knowledge — resync mode makes the first read
+        // adopt whatever sequence actually arrives.
         let readable = occupied.iter().any(|s| s.state != SlotState::Writing);
         self.expected_recv_seq = if readable {
             self.region.read_header(self.tail)?.1
         } else {
             0
         };
+        self.resync_expected |= !readable;
         Ok(())
     }
 
@@ -2630,7 +3089,220 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         Ok(false)
     }
 
+    /// Reclaim a crashed writer's leftovers at the consumer's tail. Called
+    /// only after the COMMITTED gate failed its grace poll (never on the
+    /// hot path). Returns the number of slots freed (0 = nothing to do).
+    ///
+    /// The two modes differ in what the cursors count:
+    ///
+    /// * SPSC — the crashed batch's head was never published, so its
+    ///   WRITING slots sit beyond the cursors and are credited through
+    ///   `recovery_bias`. The reclaim frees the contiguous WRITING run at
+    ///   the tail and retires the matching bias; the tail cursor must NOT
+    ///   move (it would overtake the head cursor).
+    /// * MPSC — the head cursor is reserved before the write, so the dead
+    ///   reservation is cursor-counted. The reclaim frees exactly the
+    ///   reservation's slots and advances the shared tail cursor past them
+    ///   with a CAS (the same linearization the DropOldest path uses).
+    ///
+    /// Both variants only ever touch slots whose writer identity is
+    /// provably dead (see `reclaim_dead_writing`); a live writer's
+    /// in-flight slots classify as `Alive` and are left alone.
+    fn try_reclaim_at_tail(&mut self) -> Result<u64> {
+        if self.config.multi_producer {
+            self.try_reclaim_at_tail_mpsc()
+        } else {
+            self.try_reclaim_at_tail_spsc()
+        }
+    }
+
+    fn try_reclaim_at_tail_spsc(&mut self) -> Result<u64> {
+        // Only beyond-cursor leftovers are reclaimable here: cursor-counted
+        // slots sit in the committed prefix, where C6 proves a healthy run
+        // never exposes a WRITING slot — a WRITING slot inside the window
+        // would be corruption and is left untouched (freeing it without a
+        // cursor advance would strand a FREE slot inside the window).
+        let cap = self.config.capacity as u64;
+        let fwd = self.head_cursor.wrapping_sub(self.tail_cursor);
+        if fwd != 0 && fwd <= cap {
+            return Ok(0);
+        }
+        let mut freed = 0u64;
+        let mut index = self.tail;
+        for _ in 0..self.config.capacity {
+            let (state, _, _) = self.region.read_header(index)?;
+            if state != SlotState::Writing {
+                break;
+            }
+            if !self.region.reclaim_dead_writing(index)? {
+                break; // alive/unknown writer or a transitional header
+            }
+            freed += 1;
+            index = (index + 1) % self.config.capacity;
+        }
+        if freed == 0 {
+            return Ok(0);
+        }
+        self.recovery_bias = self.recovery_bias.saturating_sub(freed as usize);
+        self.reclaimed_slots += freed;
+        self.resync_expected = true;
+        self.len = self.len.saturating_sub(freed as usize);
+        Ok(freed)
+    }
+
+    fn try_reclaim_at_tail_mpsc(&mut self) -> Result<u64> {
+        // The reclaim extent comes from the tail slot's own reservation
+        // record. Everything is verified before a single slot is touched:
+        // a partial free without the cursor advance would strand FREE slots
+        // inside the cursor window, which the gate can never pass.
+        let head = self.head_cursor;
+        let tail = self.tail_cursor;
+        let cap = self.config.capacity as u64;
+        let window = head.wrapping_sub(tail);
+        if window == 0 || window > cap {
+            return Ok(0); // nothing cursor-counted at the tail
+        }
+        let first = self.region.read_header_full(self.tail)?;
+        if first.state != SlotState::Writing {
+            return Ok(0);
+        }
+        let Some(identity) = first.identity else {
+            return Ok(0); // no published identity: never auto-reclaim
+        };
+        if process_liveness(ProcessIdentity {
+            pid: identity.pid,
+            start_time: identity.start_time,
+        }) != ProcessLiveness::Gone
+        {
+            return Ok(0);
+        }
+        let extent = u64::from(identity.reserved_slots);
+        if extent == 0 || extent > window {
+            // An unknown or out-of-window extent cannot be reclaimed
+            // safely: advancing the tail could skip live messages.
+            return Ok(0);
+        }
+        // Verify the whole extent: only slots of the same dead writer
+        // (WRITING) or never-written reservation slots (FREE) may be
+        // crossed. Anything else means the extent record is untrustworthy.
+        let mut index = self.tail;
+        for _ in 0..extent {
+            let full = self.region.read_header_full(index)?;
+            match full.state {
+                SlotState::Free => {}
+                SlotState::Writing => match full.identity {
+                    Some(sid)
+                        if sid.pid == identity.pid && sid.start_time == identity.start_time => {}
+                    _ => return Ok(0),
+                },
+                _ => return Ok(0),
+            }
+            index = (index + 1) % self.config.capacity;
+        }
+        // Free the extent, then advance the tail with a CAS. While the
+        // slots stay inside [tail, head) no producer may claim them (the
+        // reservation guard runs on the CAS), so the frees are race-free;
+        // a competing reclaimer's CAS simply wins and this one re-evaluates.
+        let mut index = self.tail;
+        for _ in 0..extent {
+            self.region.force_release_no_flush(index)?;
+            self.region.flush_release(index)?;
+            index = (index + 1) % self.config.capacity;
+        }
+        let (actual, ok) = self.region.compare_exchange_tail(tail, tail + extent)?;
+        if !ok {
+            return Ok(0); // another handle advanced the tail first
+        }
+        let _ = actual;
+        self.tail_cursor = tail + extent;
+        self.tail = ((tail + extent) % cap) as usize;
+        self.reclaimed_slots += extent;
+        self.resync_expected = true;
+        self.len = self.len.saturating_sub(extent as usize);
+        self.region.flush_header()?;
+        Ok(extent)
+    }
+
+    /// Explicit owner cleanup (roadmap §6: "owner 明确执行 cleanup"):
+    /// repeatedly reclaim crashed writers' leftovers reachable from the
+    /// tail. Returns the number of slots freed. Leftovers deeper in the
+    /// ring are reclaimed by the same rule when the tail reaches them.
+    pub fn reclaim_stale(&mut self) -> Result<u64> {
+        self.refresh_cursors()?;
+        if self.config.multi_producer {
+            // MPSC: only the cursor-counted reservation at the tail can be
+            // reclaimed (the tail CAS is the only way past it).
+            let mut total = 0u64;
+            for _ in 0..self.config.capacity {
+                let freed = self.try_reclaim_at_tail_mpsc()?;
+                if freed == 0 {
+                    break;
+                }
+                total += freed;
+                self.refresh_cursors()?;
+            }
+            return Ok(total);
+        }
+        // SPSC: free every dead writer's WRITING slot outside the cursor
+        // window and recompute the bias from storage. The crashed batch's
+        // slots sit beyond the published head, so no cursor moves.
+        let head_c = self.region.load_head()?;
+        let tail_c = self.region.load_tail()?;
+        let cap = self.config.capacity as u64;
+        let mut covered = vec![false; self.config.capacity];
+        for count in tail_c..head_c {
+            covered[(count % cap) as usize] = true;
+        }
+        let mut total = 0u64;
+        for index in 0..self.config.capacity {
+            if covered[index] {
+                continue;
+            }
+            if self.region.reclaim_dead_writing(index)? {
+                total += 1;
+            }
+        }
+        if total > 0 {
+            self.reclaimed_slots += total;
+            self.resync_expected = true;
+            self.recovery_bias = self.recompute_spsc_bias()?;
+            self.refresh_cursors()?;
+        }
+        Ok(total)
+    }
+
+    /// Recompute the SPSC recovery bias from storage after a reclaim: the
+    /// occupied slot count minus the cursor-counted committed prefix.
+    fn recompute_spsc_bias(&mut self) -> Result<usize> {
+        let head_c = self.region.load_head()?;
+        let tail_c = self.region.load_tail()?;
+        let cap = self.config.capacity as u64;
+        let fwd = head_c.wrapping_sub(tail_c);
+        let back = tail_c.wrapping_sub(head_c);
+        let cursor_len = if fwd <= cap {
+            fwd.min(cap) as usize
+        } else if back <= cap {
+            0
+        } else {
+            return Err(ChannelError::InvalidConfig("ring cursors are inconsistent").into());
+        };
+        let occupied = self.occupied_slot_headers()?.len();
+        Ok(occupied.saturating_sub(cursor_len))
+    }
+
+    /// Slots this handle has reclaimed from provably dead writers.
+    pub fn reclaimed_slots(&self) -> u64 {
+        self.reclaimed_slots
+    }
+
     fn advance_tail_after_read(&mut self) -> Result<()> {
+        // Was the slot just consumed counted by the cursors? head strictly
+        // ahead means yes; head == tail (or already tail-ahead) means the
+        // slot was an orphan — occupied beyond the published head, credited
+        // to the recovery bias instead.
+        let cap = self.config.capacity as u64;
+        let fwd = self.head_cursor.wrapping_sub(self.tail_cursor);
+        let orphan = fwd == 0 || fwd > cap;
         let index = self.tail;
         self.region.release_pinned_no_flush(index)?;
         self.tail = (self.tail + 1) % self.config.capacity;
@@ -2644,6 +3316,11 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         // operation, so it can undercount while a producer is mid-write;
         // never go below zero (the next refresh recomputes the true depth).
         self.len = self.len.saturating_sub(1);
+        if orphan {
+            // The consumed slot was never cursor-counted: retire its bias
+            // credit so the send guard's view stays exact.
+            self.recovery_bias = self.recovery_bias.saturating_sub(1);
+        }
         Ok(())
     }
 
@@ -2731,6 +3408,9 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         };
 
         for _ in 0..slots_to_drop {
+            let cap = self.config.capacity as u64;
+            let fwd = self.head_cursor.wrapping_sub(self.tail_cursor);
+            let orphan = fwd == 0 || fwd > cap;
             let index = self.tail;
             // Force-release: the message was validated COMMITTED by the
             // peek, and the consumer may have pinned the slot in between —
@@ -2741,6 +3421,11 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             self.region.fetch_max_tail(self.tail_cursor)?;
             self.region.flush_release(index)?;
             self.len = self.len.saturating_sub(1);
+            if orphan {
+                // The dropped slot was occupied beyond the published head
+                // (orphan regime): retire its bias credit.
+                self.recovery_bias = self.recovery_bias.saturating_sub(1);
+            }
         }
         self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
         Ok(())
@@ -3182,16 +3867,17 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        region_magic, shm_region_path, FileSlotStorage, FixedSlotRegion, FixedSlotStorage,
+        process, region_magic, shm_region_path, FileSlotStorage, FixedSlotRegion, FixedSlotStorage,
         MemorySlotStorage, MmapSlotStorage, PersistentShmChannel, PersistentSlotRegion,
-        ShmSpscChannel, SlotRegionIo, SlotState,
+        ShmSpscChannel, SlotRegionIo, SlotState, REGION_HEADER_LEN,
     };
     use dsline_core::error::{ChannelError, DslineError};
     use dsline_core::{
         decode_frame, encode_frame, Backpressure, FrameKind, SpscConfig, CHUNK_METADATA_LEN,
         FRAME_HEADER_LEN,
     };
-    use std::fs;
+    use std::fs::{self, OpenOptions};
+    use std::io::{Seek as _, Write as _};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -3916,7 +4602,7 @@ mod tests {
             PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
         let frame = encode_frame(FrameKind::Bytes, 0, 0, 0, 0, &[], b"one").expect("encode");
         ch.region
-            .write_committed(0, 0, &frame)
+            .write_committed(0, 0, &frame, None)
             .expect("commit slot 0");
         ch.region
             .write_header(1, SlotState::Writing, 1, 10)
@@ -3950,6 +4636,325 @@ mod tests {
         assert!(matches!(
             other.recv(),
             Err(DslineError::Channel(ChannelError::BufferEmpty))
+        ));
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    // ── crash recovery tests (writer identity, roadmap §6) ──
+
+    /// Spawn a child that exits immediately and reap it: the returned PID
+    /// is afterwards a provably dead identity.
+    fn spawn_dead_identity() -> (u32, u64) {
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit"])
+            .spawn()
+            .expect("spawn probe child");
+        #[cfg(not(windows))]
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn probe child");
+        let pid = child.id();
+        child.wait().expect("reap probe child");
+        (pid, 0)
+    }
+
+    #[test]
+    fn process_identity_of_a_live_self_is_alive() {
+        let identity = process::current_process_identity();
+        assert_eq!(
+            process::process_liveness(identity),
+            process::ProcessLiveness::Alive
+        );
+    }
+
+    #[test]
+    fn open_reclaims_dead_writer_zombie_and_reuses_the_slot() {
+        // A producer that died mid-write with its identity recorded leaves
+        // a WRITING slot. A later open must verify the identity is dead,
+        // free the slot, and continue the ring THROUGH the freed slot
+        // (space is reused, sequences continue from the live messages).
+        let path = test_file_path("crash-reclaim-at-open");
+        let config = persistent_config(4, 64);
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        ch.send(b"one").expect("send");
+        let (dead_pid, dead_start) = spawn_dead_identity();
+        ch.debug_leave_zombie(1, dead_pid, dead_start, 1)
+            .expect("zombie");
+        drop(ch);
+
+        let mut recovered =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("reopen");
+        assert_eq!(recovered.reclaimed_slots(), 1, "the zombie is reclaimed");
+        assert_eq!(recovered.len(), 1, "only the committed message counts");
+        assert_eq!(recovered.next_sequence(), 1, "continue after 'one'");
+
+        // The recovered producer writes into the freed zombie slot.
+        recovered.send(b"two").expect("send into reclaimed slot");
+        assert_eq!(recovered.region.load_head().expect("head"), 2);
+        assert_eq!(recovered.recv_with_seq().expect("recv one").payload, b"one");
+        assert_eq!(recovered.recv_with_seq().expect("recv two").payload, b"two");
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn open_keeps_a_live_writer_zombie() {
+        // A WRITING slot whose writer identity is still alive (the current
+        // process) must never be reclaimed — the conservative roadmap rule.
+        let path = test_file_path("crash-keep-live-zombie");
+        let config = persistent_config(4, 64);
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        ch.send(b"one").expect("send");
+        let identity = process::current_process_identity();
+        ch.debug_leave_zombie(1, identity.pid, identity.start_time, 1)
+            .expect("zombie");
+        drop(ch);
+
+        let mut recovered =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("reopen");
+        assert_eq!(recovered.reclaimed_slots(), 0, "live writer: no reclaim");
+        assert_eq!(recovered.len(), 2, "the zombie still counts in the depth");
+        assert_eq!(recovered.next_sequence(), 2);
+        // The write position steps over the zombie as before.
+        recovered.send(b"two").expect("send past zombie");
+        assert_eq!(recovered.region.load_head().expect("head"), 2);
+        assert_eq!(recovered.recv_with_seq().expect("recv one").payload, b"one");
+        assert!(matches!(
+            recovered.recv(),
+            Err(DslineError::Channel(ChannelError::BufferEmpty))
+        ));
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn open_never_reclaims_an_identityless_zombie() {
+        // A WRITING header without the identity magic (older build or a
+        // torn write) must not be auto-reclaimed.
+        let path = test_file_path("crash-keep-identityless");
+        let config = persistent_config(4, 64);
+        let ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        ch.region
+            .write_header(0, SlotState::Writing, 0, 10)
+            .expect("legacy zombie header");
+        drop(ch);
+
+        let mut other =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("reopen");
+        assert_eq!(other.reclaimed_slots(), 0);
+        assert_eq!(other.len(), 1, "the zombie counts in the depth");
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn consumer_reclaims_dead_writer_at_the_gate() {
+        // The consumer handle opened while the ring was healthy, then the
+        // producer crashed mid-write. The recv gate's grace poll expires,
+        // the dead writer's slot is reclaimed, and the next message (from a
+        // recovered producer) is delivered with a resynced sequence.
+        let path = test_file_path("crash-gate-reclaim");
+        let config = persistent_config(4, 64);
+        let mut producer =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        let mut consumer =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config.clone()).expect("open");
+        producer.send(b"one").expect("send");
+        let (dead_pid, dead_start) = spawn_dead_identity();
+        producer
+            .debug_leave_zombie(1, dead_pid, dead_start, 1)
+            .expect("zombie");
+        drop(producer);
+
+        assert_eq!(consumer.recv_with_seq().expect("recv one").payload, b"one");
+        // The gate hits the zombie, reclaims it, and reports an empty ring.
+        assert!(matches!(
+            consumer.recv(),
+            Err(DslineError::Channel(ChannelError::BufferEmpty))
+        ));
+        assert_eq!(consumer.reclaimed_slots(), 1);
+
+        // A recovered producer reuses the freed slot; the consumer adopts
+        // its sequence through the resync rule.
+        let mut recovered =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("reopen");
+        // The crashed writer's sequence was abandoned with its slots; the
+        // recovered producer restarts at 0 and the consumer resyncs.
+        assert_eq!(recovered.next_sequence(), 0);
+        recovered.send(b"two").expect("send");
+        assert_eq!(consumer.recv_with_seq().expect("recv two").payload, b"two");
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn mpsc_gate_reclaims_a_dead_reservation_extent() {
+        // MPSC: the head cursor is reserved before the write, so a crashed
+        // producer's reservation is cursor-counted. The consumer's gate
+        // reclaim frees exactly the recorded extent and CAS-advances the
+        // tail past it, uncovering the live message behind it.
+        let path = test_file_path("crash-mpsc-extent");
+        let mut config = persistent_config(8, 64);
+        config.multi_producer = true;
+        let mut producer_a =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        let mut consumer =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config.clone()).expect("open");
+        producer_a.send(b"first").expect("send");
+
+        // Producer A "reserves" two more slots (head cursor 1 -> 3) and
+        // dies after marking them WRITING with its (dead) identity.
+        let (dead_pid, dead_start) = spawn_dead_identity();
+        let identity = crate::WriterIdentity {
+            pid: dead_pid,
+            start_time: dead_start,
+            epoch: 7,
+            timestamp_ns: 0,
+            reserved_slots: 2,
+        };
+        producer_a.region.store_head(3).expect("reserve head");
+        producer_a
+            .region
+            .write_writing_header(1, 1, 10, identity)
+            .expect("zombie slot 1");
+        producer_a
+            .region
+            .write_writing_header(2, 1, 10, identity)
+            .expect("zombie slot 2");
+        drop(producer_a);
+
+        assert_eq!(
+            consumer.recv_with_seq().expect("recv first").payload,
+            b"first"
+        );
+        // The gate hits the dead reservation at slot 1...
+        assert!(matches!(
+            consumer.recv(),
+            Err(DslineError::Channel(ChannelError::BufferEmpty))
+        ));
+        assert_eq!(consumer.reclaimed_slots(), 2, "both reserved slots freed");
+        assert_eq!(
+            consumer.region.load_tail().expect("tail"),
+            3,
+            "the tail CAS advanced past the reservation"
+        );
+
+        // A fresh producer continues the ring; the live message behind the
+        // dead reservation is delivered with the resynced sequence.
+        let mut producer_b =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("reopen");
+        // The dead reservation's sequence was abandoned with its slots.
+        assert_eq!(producer_b.next_sequence(), 0);
+        producer_b.send(b"second").expect("send");
+        assert_eq!(
+            consumer.recv_with_seq().expect("recv second").payload,
+            b"second"
+        );
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn mpsc_reclaim_refuses_an_extent_crossing_a_committed_slot() {
+        // Defensive stop: if the recorded extent covers a slot that is not
+        // the dead writer's (here: COMMITTED), the reclaim must abort with
+        // the cursors untouched.
+        let path = test_file_path("crash-mpsc-refuse");
+        let mut config = persistent_config(8, 64);
+        config.multi_producer = true;
+        let mut producer =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        let mut consumer =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config.clone()).expect("open");
+
+        let (dead_pid, dead_start) = spawn_dead_identity();
+        let identity = crate::WriterIdentity {
+            pid: dead_pid,
+            start_time: dead_start,
+            epoch: 7,
+            timestamp_ns: 0,
+            reserved_slots: 3,
+        };
+        producer.region.store_head(3).expect("reserve head");
+        producer
+            .region
+            .write_writing_header(0, 0, 10, identity)
+            .expect("zombie slot 0");
+        producer
+            .region
+            .write_writing_header(1, 0, 10, identity)
+            .expect("zombie slot 1");
+        // Slot 2 holds a COMMITTED frame inside the claimed extent — a
+        // state a truthful reservation can never produce.
+        let frame = encode_frame(FrameKind::Bytes, 5, 0, 0, 0, &[], b"x").expect("encode");
+        producer
+            .region
+            .write_committed(2, 5, &frame, None)
+            .expect("committed inside extent");
+        drop(producer);
+
+        assert!(matches!(
+            consumer.recv(),
+            Err(DslineError::Channel(ChannelError::BufferEmpty))
+        ));
+        assert_eq!(consumer.reclaimed_slots(), 0, "nothing reclaimed");
+        assert_eq!(consumer.region.load_tail().expect("tail"), 0);
+        assert_eq!(consumer.len(), 3);
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn reclaim_stale_reports_the_freed_slot_count() {
+        // The explicit cleanup entry point reclaims reachable leftovers and
+        // is a no-op on a healthy ring.
+        let path = test_file_path("crash-reclaim-stale");
+        let config = persistent_config(4, 64);
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        assert_eq!(ch.reclaim_stale().expect("healthy noop"), 0);
+        ch.send(b"one").expect("send");
+        let (dead_pid, dead_start) = spawn_dead_identity();
+        ch.debug_leave_zombie(1, dead_pid, dead_start, 1)
+            .expect("zombie");
+        assert_eq!(ch.reclaim_stale().expect("reclaim"), 1);
+        assert_eq!(ch.reclaim_stale().expect("idempotent"), 0);
+        assert_eq!(ch.reclaimed_slots(), 1);
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn region_format_word_is_verified_at_open() {
+        // A region written with a different layout version must be
+        // rejected, never misinterpreted.
+        let path = test_file_path("crash-format-version");
+        let config = persistent_config(4, 64);
+        let ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        drop(ch);
+        // Corrupt the format word through a second mapping: std::fs writes
+        // are not coherent with mapped views on Windows.
+        let region_slot = super::persistent_region_slot_size(&config).expect("region slot");
+        let total =
+            PersistentSlotRegion::<MmapSlotStorage>::total_len(config.capacity, region_slot)
+                .expect("total");
+        {
+            let storage =
+                <MmapSlotStorage as SlotRegionIo>::open(&path, config.capacity, region_slot, total)
+                    .expect("storage");
+            storage
+                .write_at(super::FORMAT_OFFSET, &9u32.to_le_bytes())
+                .expect("corrupt format");
+        }
+        assert!(matches!(
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config),
+            Err(DslineError::Channel(ChannelError::InvalidConfig(_)))
         ));
 
         fs::remove_file(path).expect("cleanup");
@@ -4015,8 +5020,13 @@ mod tests {
     #[cfg(windows)]
     fn section_storage_writes_reads_and_clears() {
         let path = test_file_path("section-basic");
-        let storage = <SectionShmSlotStorage as SlotRegionIo>::create(&path, 4, 127, 20 + 4 * 127)
-            .expect("storage");
+        let storage = <SectionShmSlotStorage as SlotRegionIo>::create(
+            &path,
+            4,
+            127,
+            REGION_HEADER_LEN + 4 * 127,
+        )
+        .expect("storage");
 
         storage.write_at(21, b"hello").expect("write");
         assert_eq!(storage.read_at(21, 5).expect("read"), b"hello");
@@ -4029,12 +5039,20 @@ mod tests {
     #[cfg(windows)]
     fn section_storage_create_or_open_reports_exactly_one_creator() {
         let path = test_file_path("section-created");
-        let (first, created1) =
-            <SectionShmSlotStorage as SlotRegionIo>::create_or_open(&path, 4, 127, 20 + 4 * 127)
-                .expect("create");
-        let (second, created2) =
-            <SectionShmSlotStorage as SlotRegionIo>::create_or_open(&path, 4, 127, 20 + 4 * 127)
-                .expect("open");
+        let (first, created1) = <SectionShmSlotStorage as SlotRegionIo>::create_or_open(
+            &path,
+            4,
+            127,
+            REGION_HEADER_LEN + 4 * 127,
+        )
+        .expect("create");
+        let (second, created2) = <SectionShmSlotStorage as SlotRegionIo>::create_or_open(
+            &path,
+            4,
+            127,
+            REGION_HEADER_LEN + 4 * 127,
+        )
+        .expect("open");
 
         assert!(created1, "the first caller creates the section");
         assert!(!created2, "the second caller opens the existing section");
@@ -4050,7 +5068,12 @@ mod tests {
     fn section_storage_open_without_create_fails() {
         let path = test_file_path("section-missing");
         assert!(matches!(
-            <SectionShmSlotStorage as SlotRegionIo>::open(&path, 4, 127, 20 + 4 * 127),
+            <SectionShmSlotStorage as SlotRegionIo>::open(
+                &path,
+                4,
+                127,
+                REGION_HEADER_LEN + 4 * 127
+            ),
             Err(DslineError::Channel(ChannelError::StorageIo(_)))
         ));
     }
@@ -4086,16 +5109,24 @@ mod tests {
         // channel-level open must poll for the REGION_MAGIC and fail
         // cleanly when it never appears (a creator that died mid-init).
         let path = test_file_path("section-no-magic");
-        let storage =
-            <SectionShmSlotStorage as SlotRegionIo>::create_or_open(&path, 4, 127, 20 + 4 * 127)
-                .expect("storage without init");
+        let storage = <SectionShmSlotStorage as SlotRegionIo>::create_or_open(
+            &path,
+            4,
+            127,
+            REGION_HEADER_LEN + 4 * 127,
+        )
+        .expect("storage without init");
         drop(storage);
 
         // Recreate the section, then open a channel over it without the
         // initialization pass: the magic stays zero and the open fails.
-        let (storage, _created) =
-            <SectionShmSlotStorage as SlotRegionIo>::create_or_open(&path, 4, 127, 20 + 4 * 127)
-                .expect("storage again");
+        let (storage, _created) = <SectionShmSlotStorage as SlotRegionIo>::create_or_open(
+            &path,
+            4,
+            127,
+            REGION_HEADER_LEN + 4 * 127,
+        )
+        .expect("storage again");
         let region =
             PersistentSlotRegion::<SectionShmSlotStorage>::from_storage(storage).expect("region");
         assert!(matches!(

@@ -1015,7 +1015,7 @@ dsline/
 - [ ] 变长消息。
 - [x] MPSC（`multi_producer=True`，CAS 预留协议；2026-09-06）。
 - [ ] 背压策略：BLOCK / RAISE / DROP_NEWEST / DROP_OLDEST。
-- [ ] crash recovery：PID + start_time + checksum。
+- [x] crash recovery：PID + start_time + checksum（写入者身份记录于 WRITING 槽头 + 平台存活探测回收；2026-09-06）。
 - [ ] buffer protocol 单次拷贝路径。
 - [ ] alloc/publish 仅在 safety gate 通过后公开。
 - [ ] Windows shared memory 技术 spike，不作为稳定承诺。

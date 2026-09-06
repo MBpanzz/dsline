@@ -11,6 +11,78 @@
 
 ---
 
+## Update — 2026-09-06: crash recovery via writer identity
+
+The channel layer gains the roadmap §6 crash recovery (§0.1.0 Channel
+checklist): a producer killed mid-send no longer permanently costs the ring
+its in-flight slots.
+
+- **Writer identity in every WRITING slot header** (slot header 13 → 48
+  bytes): `pid + start_time` (the roadmap's process identity), a per-handle
+  epoch, a unix-ns timestamp, the message's reserved slot count, and an
+  identity magic published last behind a release fence — a reader that
+  observes the magic never sees a torn identity (Z4.2). The region header
+  gains a format word (20 → 24 bytes, format = 2); older regions are
+  rejected at open instead of misread (delete stale region files when
+  upgrading).
+- **Liveness probe** (`crates/dsline-shm/src/process.rs`): Windows
+  `OpenProcess` + `GetProcessTimes` (creation FILETIME), Linux
+  `/proc/<pid>/stat` field 22 (parsed after the last `)` — `comm` may
+  contain spaces/parens), other platforms answer `Unknown`. A slot is
+  reclaimable only when the recorded identity classifies `Gone` (PID
+  missing, or PID alive with a different start time — PID reuse);
+  `Alive` and `Unknown` never reclaim, and headers without the identity
+  magic are never auto-reclaimed (the conservative roadmap default).
+- **Reclaim points.** SPSC: at open (scan) and at the recv gate (after the
+  COMMITTED grace poll expires) — beyond-cursor leftovers retire their
+  `recovery_bias` credit and the freed slot is reused by the recovered
+  producer; the cursors never move. MPSC: at the recv gate — the dead
+  reservation is cursor-counted (head is reserved before the write), so the
+  reclaim frees exactly the recorded extent (after verifying every crossed
+  slot is the dead writer's WRITING or FREE) and CAS-advances the shared
+  tail past it; the live message behind a dead producer becomes deliverable
+  instead of wedging the ring. `reclaim_stale()` is the explicit owner
+  cleanup; `stats()["reclaimed_slots"]` reports the total.
+- **Sequence resync.** A crash legitimately breaks sequence contiguity: the
+  handle that reclaimed (or opened with nothing readable) adopts the first
+  observed sequence on the next read, then enforces the strict chain again
+  (Z4.3).
+- **Latent bug fixed (orphan cursor regime).** A consumer that read a
+  COMMITTED slot whose head count was not yet published (producer mid-batch,
+  or crashed between slot commits and the head store) advanced tail past
+  head and the next refresh rejected the ring as inconsistent — reachable
+  deterministically in the crash scenario. `refresh_cursors` now recognizes
+  tail-ahead-by-up-to-capacity (orphan regime, depth from the bias);
+  consuming an orphan retires its bias credit instead of corrupting the
+  cursors (CP-SAT C10 reproduces the pre-fix inversion and proves the
+  regime rule covers every protocol-reachable state).
+- **Solver verification: 43 → 62 checks, all passing.** Z3: the reclaim
+  decision table is sound (Z4.1/1b/1c — only a provably dead identity is
+  reclaimed; identityless/torn headers never), the identity magic +
+  double-read never fabricate an identity (Z4.2), the resync adopts the
+  post-crash sequence exactly once (Z4.3), and the bias accounting stays
+  collision-free after reclaims (Z4.4). CP-SAT: a dead reservation wedges
+  the ring pre-fix and the reclaim restores progress post-fix (C8), a
+  reclaim never crosses a live message — reservation exclusivity (C9), the
+  orphan cursor regimes (C10). SCIP: the region-size formula with the
+  identity header (S7, cross-solver with CP-SAT) and the minimal tail
+  advance == recorded extent (S8). Replay R6 exercises open-time reclaim,
+  gate reclaim + resync, the live-writer default, and `reclaim_stale`
+  through the real implementation.
+- Tests: 9 new Rust unit tests in `dsline-shm` (59 → 68: dead/live/
+  identityless zombies at open, gate reclaim SPSC + MPSC extent, the
+  extent-crossing-COMMITTED refusal, `reclaim_stale`, format-word
+  rejection, process-identity probes) and 5 new Python test cases
+  (99 → 104: a spawned worker leaves a zombie and exits; the parent
+  verifies reclaim at open and at the gate across real named channels).
+
+Still not implemented: multi-consumer, `alloc/publish` zero-copy (safety
+gate pending), arena allocator, metrics/`BusTransport`, and owner-side
+cleanup of a panicked-but-alive writer's own in-flight slots (a panicked
+writer's leftovers are reclaimed only after the process exits, since the
+identity still probes alive).
+---
+
 ## Update — 2026-09-06: declarative Pipeline API and region-management CLI
 
 Two 0.1 工程 items land, both closing documented roadmap surfaces:

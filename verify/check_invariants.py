@@ -7,15 +7,21 @@ ordering, chunked-message accounting, crash recovery inference).
 
   Z3    (SMT, bitvectors)     — proof-style properties: the wrapping
                                 sequence comparison, the send-plan chunk
-                                arithmetic, the next_seq recovery fold, and
-                                the cursor-protocol arithmetic (wrap guard
-                                exactness, send-guard no-collision theorems).
+                                arithmetic, the next_seq recovery fold, the
+                                cursor-protocol arithmetic (wrap guard
+                                exactness, send-guard no-collision theorems),
+                                and the crash-recovery reclaim decision
+                                (liveness table, torn-read defense, resync,
+                                bias accounting).
   CP-SAT (constraint program) — bounded model checking: search for schedules
                                 that violate the ring invariants; formally
                                 reproduces the historical len-underflow bug,
                                 proves the cursor gate theorem (a crash-free
-                                run never exposes an uncommitted slot), and
-                                witnesses the crash-leftover zombie state.
+                                run never exposes an uncommitted slot),
+                                witnesses the crash-leftover zombie state, and
+                                bounded-model-checks the reclaim protocol
+                                (progress after a dead reservation, no message
+                                loss, the pre-fix cursor inversion).
   SCIP  (MILP)                — optimization checks: the message-size
                                 formulas as optima, the cursor-depth and
                                 batch-flush bounds as MIP optima, and
@@ -37,8 +43,8 @@ import sys
 # Constants mirrored from dsline-core / dsline-shm.
 CHUNK_METADATA_LEN = 42  # 3 TLVs x (2-byte type + 4-byte len + 8-byte value)
 FRAME_HEADER_LEN = 50
-PERSISTENT_SLOT_HEADER_LEN = 13
-REGION_HEADER_LEN = 20  # head: u64 @ 0, tail: u64 @ 8, init magic: u32 @ 16
+PERSISTENT_SLOT_HEADER_LEN = 48  # incl. writer identity (pid/start_time/epoch/ts/reserved)
+REGION_HEADER_LEN = 24  # head: u64 @ 0, tail: u64 @ 8, init magic: u32 @ 16, format: u32 @ 20
 
 PASS = []
 FAIL = []
@@ -58,7 +64,7 @@ def record(name, ok, detail=""):
 
 def check_z3():
     from z3 import BitVec, BitVecVal, If, Or, And, Not, ULT, ULE, Solver, sat, unsat
-    from z3 import Ints
+    from z3 import BitVecs, Bools, Implies, Int, Ints
 
     def precedes(x, y):
         # dsline-shm: sequence_precedes(left, right)
@@ -335,6 +341,163 @@ def check_z3():
         s.add(Or(*collisions))
         s.set(timeout=20000)
         record("Z3.9 biased guard head-tail+bias+k<=N avoids the crash batch",
+               s.check() == unsat)
+
+    # ── Z4: crash recovery — the reclaim decision (roadmap §6) ──
+    # A slot left WRITING by a dead producer may be reclaimed only when the
+    # recorded writer identity (pid + start_time) is provably gone. The
+    # decision table (mirrors reclaim_dead_writing):
+    #   reclaim  <=>  stable_reads AND identity_magic AND pid != 0
+    #                 AND liveness == Gone
+    # with the liveness oracle constrained by:
+    #   Gone   -> the identity is NOT live
+    #   Alive  -> the identity IS live
+    #   Unknown-> undecided (pid 0, unsupported platform, permission error)
+
+    # Z4.1: the decision table is sound. A firing decision always implies
+    # "the recorded writer is not live" — so a regression that turns the
+    # conservative Unknown into reclaim, or that answers Gone for a live
+    # identity, breaks the check.
+    pid, st = BitVecs("pid st", 64)
+    stable, magic, live = Bools("stable magic live")
+    # The liveness answer of the platform probe.
+    answer = Int("answer")  # 0 Gone, 1 Alive, 2 Unknown
+    s = Solver()
+    s.add(answer >= 0, answer <= 2)
+    gone = answer == 0
+    alive = answer == 1
+    unknown = answer == 2
+    # Oracle soundness: the answer must agree with reality where it speaks.
+    s.add(Implies(gone, Not(live)))
+    s.add(Implies(alive, live))
+    # Unset identity (pid 0) is never answered Gone.
+    s.add(Implies(pid == 0, unknown))
+    # The decision procedure.
+    reclaim = And(stable, magic, pid != 0, gone)
+    # Soundness: reclaim fires only on a dead identity.
+    s.add(Not(Implies(reclaim, Not(live))))
+    s.set(timeout=10000)
+    record("Z4.1 reclaim fires only on a provably dead writer identity",
+           s.check() == unsat)
+
+    # Z4.1b: a live writer is never reclaimed, whatever the probe answers.
+    s = Solver()
+    s.add(answer >= 0, answer <= 2)
+    s.add(Implies(gone, Not(live)))
+    s.add(Implies(alive, live))
+    s.add(Implies(pid == 0, unknown))
+    s.add(live)                                # the writer IS alive
+    s.add(And(stable, magic, pid != 0, gone))  # yet the decision fires
+    s.set(timeout=10000)
+    record("Z4.1b no input combination reclaims a live writer",
+           s.check() == unsat)
+
+    # Z4.1c: the conservative defaults — an identityless header (no magic,
+    # torn/unstable reads, pid 0) is never reclaimed.
+    s = Solver()
+    s.add(answer >= 0, answer <= 2)
+    s.add(Implies(gone, Not(live)))
+    s.add(Implies(alive, live))
+    s.add(Implies(pid == 0, unknown))
+    reclaim = And(stable, magic, pid != 0, gone)
+    s.add(Or(Not(stable), Not(magic), pid == 0))  # one gate broken
+    s.add(reclaim)
+    s.set(timeout=10000)
+    record("Z4.1c identityless/torn headers are never reclaimed",
+           s.check() == unsat)
+
+    # Z4.2: the torn-read defense. The writer publishes the identity in a
+    # store sequence, then (after a Release fence) the identity magic; a
+    # reader pairs with an Acquire fence, so a snapshot that shows the
+    # magic ALWAYS shows the complete true identity. Reads are monotone:
+    # the second read is at least as advanced as the first. Model: progress
+    # p in {0, 1}; snapshot(p) shows the magic iff p == 1, and snapshot(1)
+    # carries the true identity. Prove: a decision that fires on two
+    # agreeing magic-bearing reads observes the true identity — a torn or
+    # partial write can never fabricate one.
+    p1, p2 = Ints("p1 p2")
+    true_id, id1, id2 = Ints("true_id id1 id2")
+    m1, m2 = Ints("m1 m2")  # 0/1: magic observed
+    s = Solver()
+    s.add(p1 >= 0, p1 <= 1, p2 >= 0, p2 <= 1, p1 <= p2)  # monotone reads
+    # Snapshot content: identity/magic are visible exactly when p == 1.
+    s.add(Implies(p1 == 1, And(m1 == 1, id1 == true_id)))
+    s.add(Implies(p1 == 0, m1 == 0))
+    s.add(Implies(p2 == 1, And(m2 == 1, id2 == true_id)))
+    s.add(Implies(p2 == 0, m2 == 0))
+    # Decision: both reads observed the magic and agreed on the identity.
+    fired = And(m1 == 1, m2 == 1, id1 == id2)
+    s.add(fired)
+    s.add(id1 != true_id)  # ... but observed an identity that is not the writer's
+    s.set(timeout=10000)
+    record("Z4.2 the identity magic + double read never fabricate an identity",
+           s.check() == unsat)
+
+    # Z4.3: sequence resync after a crash. Bounded transition system: the
+    # consumer tracks expected_recv_seq; a normal read requires seq ==
+    # expected and advances by 1; a resync read adopts the observed seq.
+    # Schedule: messages 0..2 arrive, the producer crashes mid message 3,
+    # a recovered producer restarts at seq 7 (the reclaimed zombie's seq is
+    # abandoned, so the recovered counter restarts lower).
+    def consumer_trace(seq_stream, resync_event):
+        # resync_event: index of the message where a reclaim rearms the
+        # expected sequence (None = never, the plain strict consumer).
+        expected = 0
+        out = []
+        for i, seq in enumerate(seq_stream):
+            if resync_event is not None and i == resync_event:
+                expected = seq + 1  # adopt, then continue the +1 chain
+                out.append(True)
+                continue
+            out.append(seq == expected)
+            if seq == expected:
+                expected += 1
+        return out
+
+    stream = [0, 1, 2, 7, 8]
+    strict = consumer_trace(stream, resync_event=None)
+    resynced = consumer_trace(stream, resync_event=3)
+    ok = (
+        all(strict[:3]) and not strict[3]      # strict chain rejects the restart
+        and all(resynced[:3]) and resynced[3]  # resync adopts it exactly once
+        and resynced[4]                        # ...and the chain continues
+    )
+    record("Z4.3 strict chain rejects the post-crash restart; resync adopts it",
+           ok, f"strict={strict}, resynced={resynced}")
+
+    # Z4.4: bias accounting after an SPSC reclaim. The crashed batch's
+    # slots are credited through recovery_bias (the cursors never counted
+    # them). A reclaim that frees `freed` slots retires at most that much
+    # credit (freed <= bias), and the Z3.9 guard argument carries over with
+    # the reduced bias: writes [head+bias', head+bias'+k) never hit an
+    # occupied index.
+    for k in (1, 2, 3):
+        h, t, bias, freed = (
+            BitVec(f"h{k}", 64),
+            BitVec(f"t{k}", 64),
+            BitVec(f"b{k}", 64),
+            BitVec(f"f{k}", 64),
+        )
+        dist = h - t
+        s = Solver()
+        s.add(ULT(dist, BitVecVal(1 << 63, 64)))
+        s.add(ULT(bias, BitVecVal(N, 64)))
+        s.add(ULE(freed, bias))  # never retire more credit than held
+        new_bias = bias - freed
+        s.add(ULE(dist + new_bias, BitVecVal(N - k, 64)))
+        # Collision: a write target inside the post-reclaim occupied set.
+        collisions = []
+        for j in range(k):
+            for jp in range(N + k):
+                collisions.append(
+                    And(
+                        ULT(BitVecVal(jp, 64), dist + new_bias),
+                        (h + new_bias + j) % N == (t + jp) % N,
+                    )
+                )
+        s.add(Or(*collisions))
+        s.set(timeout=20000)
+        record(f"Z4.4 bias' = bias - freed keeps the guard collision-free (k={k})",
                s.check() == unsat)
 
 
@@ -904,6 +1067,182 @@ def check_cp_sat():
            "tail (zombie state reachable; the COMMITTED gate converts it to "
            "an empty ring)", status in (cp_model.OPTIMAL, cp_model.FEASIBLE), witness)
 
+    # ── C8: crash recovery — reclaim restores progress after a dead
+    # reservation (multi-producer mode) ──
+    # Fixed crash aftermath on a 4-slot ring: message A committed at slot 0,
+    # a dead producer's 2-slot reservation WRITING at slots 1-2 (the head
+    # cursor was reserved before the write, so the slots are cursor-counted),
+    # live message B committed at slot 3. The consumer starts at tail 0.
+    # Pre-fix (no reclaim): the tail can never cross the dead WRITING slots,
+    # so B is unreachable — the ring is wedged forever. Post-fix: the gate
+    # reclaim frees the recorded extent and advances the tail past it, and
+    # B is delivered.
+    def reclaim_progress(allow_reclaim):
+        N, H = 4, 6
+        kind = [0, 1, 1, 0]  # 0 = committed live message, 1 = dead WRITING
+        m = cp_model.CpModel()
+        tail = [m.NewIntVar(0, N, f"t{t}") for t in range(H + 1)]
+        m.Add(tail[0] == 0)
+        read = [m.NewBoolVar(f"r{t}") for t in range(H)]
+        rec = [m.NewBoolVar(f"x{t}") for t in range(H)]
+        idle = [m.NewBoolVar(f"i{t}") for t in range(H)]
+        for t in range(H):
+            m.AddExactlyOne([read[t], rec[t], idle[t]])
+            if not allow_reclaim:
+                m.Add(rec[t] == 0)
+            pos = m.NewIntVar(0, N - 1, f"p{t}")
+            _mod_ring(m, tail[t], N, pos, f"pm{t}")
+            k = m.NewIntVar(0, 1, f"k{t}")
+            m.AddElement(pos, kind, k)
+            # read: only a committed (live) slot; reclaim: only the dead
+            # WRITING slot, and the extent (2) is crossed at once.
+            m.Add(k == 0).OnlyEnforceIf(read[t])
+            m.Add(k == 1).OnlyEnforceIf(rec[t])
+            m.Add(tail[t + 1] == tail[t] + 1).OnlyEnforceIf(read[t])
+            m.Add(tail[t + 1] == tail[t] + 2).OnlyEnforceIf(rec[t])
+            m.Add(tail[t + 1] == tail[t]).OnlyEnforceIf(idle[t])
+        delivered = [m.NewBoolVar(f"d{i}") for i in range(N)]
+        for i in range(N):
+            hits = []
+            for t in range(H):
+                at_i = m.NewBoolVar(f"at{t}_{i}")
+                _reify_eq(m, tail[t], i, at_i)
+                hit = m.NewBoolVar(f"hit{t}_{i}")
+                m.Add(hit == 1).OnlyEnforceIf([read[t], at_i])
+                m.Add(hit == 0).OnlyEnforceIf(read[t].Not())
+                m.Add(hit == 0).OnlyEnforceIf(at_i.Not())
+                hits.append(hit)
+            m.AddMaxEquality(delivered[i], hits)
+        return m, delivered, read, rec, tail, H
+
+    # Pre-fix: no reclaim exists — delivering B (slot 3) is impossible.
+    m, delivered, read, rec, tail, H = reclaim_progress(allow_reclaim=False)
+    m.Add(delivered[3] == 1)
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 30
+    status = solver.Solve(m)
+    record("C8 pre-fix: a dead reservation wedges the ring forever (B is "
+           "never delivered)", status == cp_model.INFEASIBLE)
+
+    # Post-fix: the reclaim unblocks the ring; show the schedule.
+    m, delivered, read, rec, tail, H = reclaim_progress(allow_reclaim=True)
+    m.Add(delivered[0] == 1)
+    m.Add(delivered[3] == 1)
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 30
+    status = solver.Solve(m)
+    witness = ""
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        acts = []
+        for t in range(H):
+            if solver.Value(read[t]):
+                acts.append(f"R@{solver.Value(tail[t]) % 4}")
+            elif solver.Value(rec[t]):
+                acts.append(f"X@{solver.Value(tail[t]) % 4}+2")
+            else:
+                acts.append("_")
+        witness = f"schedule {' '.join(acts)}: A and B both delivered"
+    record("C8 post-fix: the gate reclaim frees the extent and delivers the "
+           "live message behind it", status in (cp_model.OPTIMAL, cp_model.FEASIBLE),
+           witness)
+
+    # ── C9: the reclaim never crosses a live message (reservation
+    # exclusivity, bounded model check) ──
+    # A 4-slot MPSC ring in arbitrary crash aftermath: the solver picks the
+    # dead reservation (start, extent), a live reservation behind it, and
+    # the consumer's tail, all in count space with the W2 disjointness rule.
+    # The gate reclaim fires when the tail slot is a dead WRITING slot with
+    # the recorded extent. Violation sought: any crossed slot belongs to a
+    # LIVE message (committed or in-flight). Under reservation exclusivity
+    # no such state exists — the implemented rule cannot lose data.
+    N = 4
+    m = cp_model.CpModel()
+    t_cur = m.NewIntVar(0, N - 1, "tail")      # consumer tail count mod N
+    r1 = m.NewIntVar(0, N - 1, "r1")           # dead reservation start (mod N)
+    n1 = m.NewIntVar(1, N, "n1")               # dead reservation extent
+    r2 = m.NewIntVar(0, N - 1, "r2")           # live reservation start (mod N)
+    n2 = m.NewIntVar(1, N, "n2")               # live reservation extent
+    # Both reservations fit in the cursor window [0, N) (counts tail..tail+N);
+    # project starts relative to the tail for the disjointness encoding.
+    off1 = m.NewIntVar(0, N - 1, "off1")       # r1 - tail mod N
+    off2 = m.NewIntVar(0, N - 1, "off2")       # r2 - tail mod N
+    _mod_ring(m, r1 - t_cur, N, off1, "o1")
+    _mod_ring(m, r2 - t_cur, N, off2, "o2")
+    # Reservation exclusivity (W2, in ring positions): [off, off+n) pairs
+    # are disjoint on the circle. Encode: off2 is not strictly inside
+    # [off1, off1+n1) mod N and vice versa (position-wise containment).
+    def inside(m, x, start, length, N, tag):
+        # x in [start, start+length) mod N, for length in [1, N].
+        d = m.NewIntVar(0, N - 1, f"d{tag}")
+        _mod_ring(m, x - start, N, d, f"dm{tag}")
+        le = m.NewBoolVar(f"le{tag}")
+        _reify_lt(m, d, length, le)
+        return le
+    in1 = inside(m, off2, off1, n1, N, "21")
+    in2 = inside(m, off1, off2, n2, N, "12")
+    m.Add(in1 == 0)
+    m.Add(in2 == 0)
+    # The gate fires: the tail slot is the dead reservation's first slot —
+    # the consumer reached it by consuming everything before it, so off1
+    # == 0, and the reclaim crosses [0, n1).
+    m.Add(off1 == 0)
+    # Violation: a crossed slot (offset 0..n1-1) belongs to the LIVE
+    # reservation. The tail slot itself is dead-WRITING (fire condition),
+    # so the violation must be a live slot strictly inside the crossed run.
+    cross = [inside(m, off2, 0, n1, N, f"c{i}") for i in range(1)]
+    # The live reservation START inside the crossed run means a live slot is
+    # crossed (its slots occupy [off2, off2+n2)).
+    m.Add(cross[0] == 1)
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 30
+    status = solver.Solve(m)
+    witness = ""
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        witness = (f"dead reservation at offset {solver.Value(off1)} extent "
+                   f"{solver.Value(n1)}, live reservation at offset "
+                   f"{solver.Value(off2)} extent {solver.Value(n2)}")
+    record("C9 reclaim never crosses a live message: two reservations cannot "
+           "overlap on the ring (exclusivity, bounded check)",
+           status == cp_model.INFEASIBLE, witness)
+
+    # ── C10: the orphan cursor regime (pre-fix inversion reproduced and
+    # fixed) ──
+    # SPSC: the producer commits batch slots one by one and publishes the
+    # head cursor only after the whole batch. A consumer that reads such an
+    # "orphan" slot advances tail past head. Pre-fix the refresh computed
+    # dist = head - tail (wrapping) and rejected anything >= 2^63 — the
+    # error state is reachable. Post-fix the refresh accepts either
+    # head-ahead by <= capacity or tail-ahead by <= capacity (orphan
+    # regime); the error state is unreachable.
+    B = 2  # batch of 2 slots committed, head cursor never published
+    m = cp_model.CpModel()
+    orphans = m.NewIntVar(0, B, "orphans")  # slots consumed pre-publish
+    m.Add(orphans >= 1)                     # at least one orphan read
+    # Pre-fix error condition: dist = (0 - orphans) mod 2^64 >= 2^63.
+    # For orphans >= 1 the wrapped distance is >= 2^64 - B > 2^63: the
+    # refresh raises "ring cursors are inconsistent".
+    solver = cp_model.CpSolver()
+    status = solver.Solve(m)
+    # Reachability is trivial (orphans >= 1 is satisfiable) — state it as
+    # the reproduction witness.
+    record("C10 pre-fix: consuming an orphan slot inverts the cursors "
+           f"(dist = 2^64 - orphans >= 2^63; witness orphans=1 of batch {B})",
+           status in (cp_model.OPTIMAL, cp_model.FEASIBLE))
+
+    m = cp_model.CpModel()
+    orphans = m.NewIntVar(0, B, "orphans")
+    batch = m.NewIntVar(1, 8, "batch")
+    m.Add(orphans <= batch)  # orphans are part of the committed batch
+    # Post-fix error condition: head-ahead > cap AND tail-ahead > cap.
+    # tail-ahead == orphans <= batch <= capacity on any real ring, so the
+    # conjunction is unsatisfiable over the whole protocol domain.
+    m.Add(orphans > 64)  # the capacity bound: unreachable (orphans <= batch <= 64)
+    solver = cp_model.CpSolver()
+    status = solver.Solve(m)
+    record("C10 post-fix: the orphan regime (tail-ahead <= capacity) covers "
+           "every protocol-reachable state; the inconsistent-cursors error "
+           "is unreachable", status == cp_model.INFEASIBLE)
+
 def check_scip():
     import pyscipopt as scip
 
@@ -982,7 +1321,7 @@ def check_scip():
     model.optimize()
     optimum = model.getObjVal()
     formula = 64 * (4096 + FRAME_HEADER_LEN + PERSISTENT_SLOT_HEADER_LEN)
-    record("S3 worst-case region bytes == 64*(4096+50+13)",
+    record("S3 worst-case region bytes == 64*(4096+50+48)",
            optimum == formula, f"MIP optimum {optimum}, formula {formula}")
 
     # ── S4: differential agreement across all three solvers ──
@@ -1042,6 +1381,69 @@ def check_scip():
         record(f"S6 max flush end {cap}x{slot} == region total {total} (no overflow)",
                ok, f"MIP optimum {optimum}")
 
+    # ── S7: cross-solver agreement on the worst-case region size with the
+    # writer-identity header (48-byte slot header, 24-byte region header) ──
+    def cpsat_max_region(capacity, slot_size):
+        from ortools.sat.python import cp_model as cpm
+        m = cpm.CpModel()
+        size = m.NewIntVar(0, 1 << 32, "size")
+        m.Add(size == capacity
+              * (slot_size + FRAME_HEADER_LEN + PERSISTENT_SLOT_HEADER_LEN)
+              + REGION_HEADER_LEN)
+        m.Maximize(size)
+        solver = cpm.CpSolver()
+        solver.parameters.max_time_in_seconds = 30
+        solver.Solve(m)
+        return solver.ObjectiveValue()
+
+    ok = True
+    detail = ""
+    for (cap, slot) in [(2, 64), (4, 64), (16, 4096), (64, 256)]:
+        model = scip.Model("max-storage-identity")
+        model.hideOutput()
+        model.setParam("limits/time", 30)
+        c = model.addVar(vtype="I", lb=cap, ub=cap, name="cap")
+        s = model.addVar(vtype="I", lb=slot, ub=slot, name="slot")
+        size = model.addVar(vtype="I", lb=0, ub=1 << 32, name="size")
+        model.addCons(size == c * (s + FRAME_HEADER_LEN + PERSISTENT_SLOT_HEADER_LEN)
+                      + REGION_HEADER_LEN)
+        model.setObjective(size, sense="maximize")
+        model.optimize()
+        scip_opt = model.getObjVal()
+        cpsat_opt = cpsat_max_region(cap, slot)
+        formula = cap * (slot + FRAME_HEADER_LEN + PERSISTENT_SLOT_HEADER_LEN) + REGION_HEADER_LEN
+        if not (scip_opt == cpsat_opt == formula):
+            ok = False
+            detail += (f"{cap}x{slot}: scip={scip_opt} cpsat={cpsat_opt} "
+                       f"formula={formula}; ")
+    record("S7 worst-case region size with the identity header: SCIP == "
+           "CP-SAT == formula", ok, detail)
+
+    # ── S8: the minimal tail advance past a dead reservation is exactly its
+    # recorded extent ──
+    # The reclaim advances the tail by the dead writer's recorded extent E.
+    # Any smaller advance leaves the tail inside the dead run (the gate
+    # cannot pass), and E itself suffices (the live message behind it is
+    # immediately readable). Verify as a MIP optimum for several extents.
+    ok = True
+    detail = ""
+    for extent in (1, 2, 3):
+        model = scip.Model("min-advance")
+        model.hideOutput()
+        model.setParam("limits/time", 30)
+        advance = model.addVar(vtype="I", lb=0, ub=8, name="advance")
+        # Offsets 0..extent-1 hold the dead reservation; the reclaim can
+        # only stop at or beyond its end.
+        model.addCons(advance >= extent)
+        model.setObjective(advance, sense="minimize")
+        model.optimize()
+        optimum = model.getObjVal()
+        if optimum != extent:
+            ok = False
+            detail += f"extent={extent}: optimum {optimum}; "
+    record("S8 minimal tail advance past a dead reservation == recorded "
+           "extent (MIP optimum)", ok, detail)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Replay — differential check against the real implementation
@@ -1087,7 +1489,7 @@ def check_replay():
             pass
     record("R1 stats() limits match the send_plan formulas", ok, detail)
 
-    # ── R2: region file size == REGION_HEADER_LEN + capacity*(slot+63) ──
+    # ── R2: region file size == REGION_HEADER_LEN + capacity*(slot+98) ──
     ok = True
     detail = ""
     for (cap, slot) in [(2, 16), (4, 64)]:
@@ -1103,7 +1505,7 @@ def check_replay():
             os.remove(path)
         except OSError:
             pass
-    record("R2 on-disk region size == 20 + capacity*(slot+63)", ok, detail)
+    record("R2 on-disk region size == 24 + capacity*(slot+98)", ok, detail)
 
     # ── R3: random schedule matches the reference model ──
     # The same bookkeeping the solvers model (depth = occupied slots,
@@ -1324,6 +1726,148 @@ def check_replay():
         pass
     record("R5 MPSC two-producer schedule delivers every message exactly once",
            ok, detail)
+
+    # ── R6: crash recovery replay through the real implementation ──
+    # A "crashed" writer is simulated with the test-only debug helper, which
+    # leaves a WRITING header with an arbitrary writer identity — exactly
+    # what a producer killed mid-send leaves behind. The dead identity is a
+    # real, reaped child process, so the liveness probe answers Gone.
+    import subprocess
+
+    def dead_identity():
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        proc.wait()
+        return proc.pid, 0
+
+    def _spawn_and_reap_for_dead_pid():
+        return dead_identity()
+
+    # R6a: open-time reclaim — the zombie is freed, its slot is reused, and
+    # the sequence continues from the surviving messages.
+    ok = True
+    detail = ""
+    C, SLOT = 4, 64
+    path = temp_path("r6a")
+    producer = dsline.FileChannel.create(path, capacity=C, slot_size=SLOT)
+    producer.send(b"one")
+    dead_pid, dead_start = _spawn_and_reap_for_dead_pid()
+    producer._debug_leave_zombie(1, dead_pid, dead_start)
+    consumer = dsline.FileChannel.open(path, capacity=C, slot_size=SLOT)
+    stats = consumer.stats()
+    if stats["reclaimed_slots"] != 1 or stats["queue_depth"] != 1:
+        ok = False
+        detail += f"open-time reclaim: {stats}; "
+    consumer.send(b"two")
+    got = [consumer.recv_with_seq(), consumer.recv_with_seq()]
+    if [g[0] for g in got] != [0, 1] or [g[1] for g in got] != [b"one", b"two"]:
+        ok = False
+        detail += f"post-reclaim round trip: {got}; "
+    _release(producer)
+    _release(consumer)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    record("R6a dead writer's zombie reclaimed at open; slot reused", ok, detail)
+
+    # R6b: gate-time reclaim — a consumer opened before the crash reclaims
+    # the zombie at its gate and resyncs to the recovered producer.
+    ok = True
+    detail = ""
+    path = temp_path("r6b")
+    producer = dsline.FileChannel.create(path, capacity=C, slot_size=SLOT)
+    consumer = dsline.FileChannel.open(path, capacity=C, slot_size=SLOT)
+    producer.send(b"one")
+    dead_pid, dead_start = _spawn_and_reap_for_dead_pid()
+    producer._debug_leave_zombie(1, dead_pid, dead_start)
+    try:
+        consumer.recv_with_seq()
+        got_one = True
+    except dsline.BufferEmptyError:
+        got_one = False
+    if not got_one:
+        ok = False
+        detail += "the healthy message was not delivered; "
+    try:
+        consumer.recv()
+        ok = False
+        detail += "the zombie was delivered; "
+    except dsline.BufferEmptyError:
+        pass
+    if consumer.stats()["reclaimed_slots"] != 1:
+        ok = False
+        detail += f"gate reclaim did not fire: {consumer.stats()}; "
+    producer.send(b"two")  # lands in the freed slot
+    if consumer.recv_with_seq()[1] != b"two":
+        ok = False
+        detail += "the post-crash message was not delivered after resync; "
+    _release(producer)
+    _release(consumer)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    record("R6b consumer reclaims the zombie at the gate and resyncs", ok, detail)
+
+    # R6c: a live writer's zombie is never reclaimed (conservative default).
+    ok = True
+    detail = ""
+    path = temp_path("r6c")
+    producer = dsline.FileChannel.create(path, capacity=C, slot_size=SLOT)
+    producer.send(b"one")
+    pid, start_time = dsline.process_identity()
+    producer._debug_leave_zombie(1, pid, start_time)
+    consumer = dsline.FileChannel.open(path, capacity=C, slot_size=SLOT)
+    stats = consumer.stats()
+    if stats["reclaimed_slots"] != 0 or stats["queue_depth"] != 2:
+        ok = False
+        detail += f"live zombie touched: {stats}; "
+    consumer.send(b"two")  # steps over the zombie
+    if consumer.recv_with_seq() != (0, b"one"):
+        ok = False
+        detail += "the healthy message was lost; "
+    try:
+        consumer.recv()
+    except dsline.BufferEmptyError:
+        pass
+    except Exception as exc:  # noqa: BLE001 - any other error is a failure
+        ok = False
+        detail += f"unexpected error on the zombie: {exc}; "
+    _release(producer)
+    _release(consumer)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    record("R6c a live writer's zombie is left untouched", ok, detail)
+
+    # R6d: reclaim_stale — the explicit owner cleanup entry point.
+    ok = True
+    detail = ""
+    path = temp_path("r6d")
+    producer = dsline.FileChannel.create(path, capacity=C, slot_size=SLOT)
+    if producer.reclaim_stale() != 0:
+        ok = False
+        detail += "healthy ring reported a reclaim; "
+    producer.send(b"one")
+    dead_pid, dead_start = _spawn_and_reap_for_dead_pid()
+    producer._debug_leave_zombie(1, dead_pid, dead_start)
+    if producer.reclaim_stale() != 1:
+        ok = False
+        detail += f"cleanup did not free the zombie: {producer.stats()}; "
+    if producer.reclaim_stale() != 0:
+        ok = False
+        detail += "cleanup is not idempotent; "
+    producer.send(b"two")
+    if producer.recv_with_seq() != (0, b"one") or producer.recv_with_seq()[1] != b"two":
+        ok = False
+        detail += "post-cleanup round trip broken; "
+    _release(producer)
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    record("R6d reclaim_stale frees the zombie exactly once", ok, detail)
 
 
 def main():

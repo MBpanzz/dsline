@@ -182,9 +182,37 @@ impl ShmChannel {
         stats.set_item("next_sequence", channel.next_sequence())?;
         stats.set_item("expected_recv_sequence", channel.expected_recv_sequence())?;
         stats.set_item("last_received_sequence", channel.last_received_sequence())?;
+        stats.set_item("reclaimed_slots", channel.reclaimed_slots())?;
         stats.set_item("closed", channel.is_closed())?;
         stats.set_item("empty", channel.is_empty())?;
         Ok(stats)
+    }
+
+    /// Explicitly reclaim crashed writers' leftovers whose identity is
+    /// provably dead (roadmap §6 "owner executes cleanup"). Returns the
+    /// number of slots freed. Leftovers deeper in the ring are reclaimed
+    /// automatically when the consumer's tail reaches them.
+    fn reclaim_stale(&self) -> PyResult<u64> {
+        let mut channel = self.lock_channel()?;
+        channel.reclaim_stale().map_err(to_py_err)
+    }
+
+    /// Test/diagnostics aid: leave a WRITING header with an arbitrary
+    /// writer identity at the producer's next slot, exactly as a writer
+    /// killed mid-send would leave the region. Not part of the production
+    /// protocol.
+    #[pyo3(signature = (seq, pid, start_time, reserved_slots=1))]
+    fn _debug_leave_zombie(
+        &self,
+        seq: u64,
+        pid: u32,
+        start_time: u64,
+        reserved_slots: u32,
+    ) -> PyResult<()> {
+        let mut channel = self.lock_channel()?;
+        channel
+            .debug_leave_zombie(seq, pid, start_time, reserved_slots)
+            .map_err(to_py_err)
     }
 
     fn __len__(&self) -> PyResult<usize> {
@@ -378,9 +406,41 @@ impl FileChannel {
         stats.set_item("next_sequence", channel.next_sequence())?;
         stats.set_item("expected_recv_sequence", channel.expected_recv_sequence())?;
         stats.set_item("last_received_sequence", channel.last_received_sequence())?;
+        stats.set_item("reclaimed_slots", channel.reclaimed_slots())?;
+        stats.set_item("reclaimed_slots", channel.reclaimed_slots())?;
         stats.set_item("closed", channel.is_closed())?;
         stats.set_item("empty", channel.is_empty())?;
         Ok(stats)
+    }
+
+    /// Explicitly reclaim crashed writers' leftovers whose identity is
+    /// provably dead. Returns the number of slots freed.
+    fn reclaim_stale(&self) -> PyResult<u64> {
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+        channel.reclaim_stale().map_err(to_py_err)
+    }
+
+    /// Test/diagnostics aid: leave a WRITING header with an arbitrary
+    /// writer identity at the producer's next slot. Not part of the
+    /// production protocol.
+    #[pyo3(signature = (seq, pid, start_time, reserved_slots=1))]
+    fn _debug_leave_zombie(
+        &self,
+        seq: u64,
+        pid: u32,
+        start_time: u64,
+        reserved_slots: u32,
+    ) -> PyResult<()> {
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+        channel
+            .debug_leave_zombie(seq, pid, start_time, reserved_slots)
+            .map_err(to_py_err)
     }
 
     fn __len__(&self) -> PyResult<usize> {
@@ -964,12 +1024,19 @@ fn push_parsed_item(data: &[u8], items: &mut Vec<PyObject>, py: Python<'_>) {
     }
 }
 
+#[pyfunction]
+fn process_identity() -> (u32, u64) {
+    let identity = dsline_shm::current_process_identity();
+    (identity.pid, identity.start_time)
+}
+
 #[pymodule]
 fn _dsline(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Backpressure>()?;
     module.add_class::<ShmChannel>()?;
     module.add_class::<FileChannel>()?;
     module.add_class::<PyPipeline>()?;
+    module.add_function(wrap_pyfunction!(process_identity, module)?)?;
     module.add("DslineError", _py.get_type_bound::<DslineErrorPy>())?;
     module.add("ChannelError", _py.get_type_bound::<ChannelErrorPy>())?;
     module.add(

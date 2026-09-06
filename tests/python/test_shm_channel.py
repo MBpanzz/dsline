@@ -1,6 +1,7 @@
 import gc
 import multiprocessing as mp
 import os
+import subprocess
 import time
 import unittest
 import uuid
@@ -357,6 +358,114 @@ class CrossProcessShmChannelTests(unittest.TestCase):
 
         self.assertEqual(process.exitcode, 0)
         self.assertEqual(received, list(enumerate(payloads)))
+
+
+# ── crash recovery (writer identity, roadmap §6) ──
+
+
+def _dead_process_identity():
+    """Spawn a child that exits immediately and return its (pid, 0)."""
+    proc = subprocess.Popen(["cmd", "/c", "exit"] if os.name == "nt" else ["true"])
+    proc.wait()
+    return proc.pid, 0
+
+
+def _crashed_writer_worker(name, capacity, slot_size, result_queue):
+    """Child process worker: mimic a producer killed mid-send.
+
+    Opens the named channel, leaves a WRITING header with a provably dead
+    writer identity at its recovered write position, and exits.
+    """
+    with dsline.ShmChannel(name, capacity=capacity, slot_size=slot_size) as ch:
+        dead_pid, dead_start = _dead_process_identity()
+        ch._debug_leave_zombie(1, dead_pid, dead_start)
+    result_queue.put("left-zombie")
+
+
+class CrashRecoveryShmChannelTests(unittest.TestCase):
+    def make_channel(self, label, **kwargs):
+        ch = dsline.ShmChannel(unique_name(label), **kwargs)
+        self.addCleanup(remove_region, ch)
+        return ch
+
+    def _spawn_crashed_writer(self, name, capacity, slot_size):
+        ctx = mp.get_context("spawn")
+        result_queue = ctx.Queue()
+        process = ctx.Process(
+            target=_crashed_writer_worker,
+            args=(name, capacity, slot_size, result_queue),
+        )
+        process.start()
+        result_queue.get(timeout=30)
+        process.join(timeout=30)
+        self.assertEqual(process.exitcode, 0)
+
+    def test_dead_writer_zombie_is_reclaimed_at_open(self) -> None:
+        ch = self.make_channel("crash-open", capacity=4, slot_size=64)
+        ch.send(b"one")
+        self._spawn_crashed_writer(ch.name, 4, 64)
+
+        recovered = dsline.ShmChannel(ch.name, capacity=4, slot_size=64)
+        self.addCleanup(remove_region, recovered)
+        stats = recovered.stats()
+        self.assertEqual(stats["reclaimed_slots"], 1)
+        self.assertEqual(stats["queue_depth"], 1)
+        # The recovered producer reuses the freed slot.
+        recovered.send(b"two")
+        self.assertEqual(recovered.recv_with_seq(), (0, b"one"))
+        self.assertEqual(recovered.recv_with_seq()[1], b"two")
+
+    def test_consumer_reclaims_dead_writer_at_the_gate(self) -> None:
+        ch = self.make_channel("crash-gate", capacity=4, slot_size=64)
+        consumer = dsline.ShmChannel(ch.name, capacity=4, slot_size=64)
+        self.addCleanup(remove_region, consumer)
+        ch.send(b"one")
+        self._spawn_crashed_writer(ch.name, 4, 64)
+
+        self.assertEqual(consumer.recv(), b"one")
+        # The gate grace poll expires, the dead writer's slot is reclaimed,
+        # and the leftover is reported as an empty ring.
+        with self.assertRaises(dsline.BufferEmptyError):
+            consumer.recv()
+        self.assertEqual(consumer.stats()["reclaimed_slots"], 1)
+
+        # A recovered producer reuses the freed slot; the consumer adopts
+        # the new sequence through the resync rule.
+        ch.send(b"two")
+        self.assertEqual(consumer.recv(), b"two")
+
+    def test_live_writer_zombie_is_not_reclaimed(self) -> None:
+        ch = self.make_channel("crash-live", capacity=4, slot_size=64)
+        ch.send(b"one")
+        pid, start_time = dsline.process_identity()
+        ch._debug_leave_zombie(1, pid, start_time)
+
+        recovered = dsline.ShmChannel(ch.name, capacity=4, slot_size=64)
+        self.addCleanup(remove_region, recovered)
+        self.assertEqual(recovered.stats()["reclaimed_slots"], 0)
+        # The zombie still counts in the depth; the write steps over it.
+        self.assertEqual(recovered.stats()["queue_depth"], 2)
+        recovered.send(b"two")
+        self.assertEqual(recovered.recv_with_seq(), (0, b"one"))
+        with self.assertRaises(dsline.BufferEmptyError):
+            recovered.recv()
+
+    def test_reclaim_stale_is_explicit_cleanup(self) -> None:
+        ch = self.make_channel("crash-stale", capacity=4, slot_size=64)
+        self.assertEqual(ch.reclaim_stale(), 0)
+        ch.send(b"one")
+        dead_pid, dead_start = _dead_process_identity()
+        ch._debug_leave_zombie(1, dead_pid, dead_start)
+        self.assertEqual(ch.reclaim_stale(), 1)
+        self.assertEqual(ch.reclaim_stale(), 0, "idempotent after cleanup")
+        self.assertEqual(ch.stats()["reclaimed_slots"], 1)
+        ch.send(b"two")
+        self.assertEqual(ch.recv_with_seq(), (0, b"one"))
+        self.assertEqual(ch.recv_with_seq()[1], b"two")
+
+    def test_stats_report_reclaimed_slots(self) -> None:
+        ch = self.make_channel("crash-stats", capacity=4, slot_size=64)
+        self.assertEqual(ch.stats()["reclaimed_slots"], 0)
 
 
 if __name__ == "__main__":
