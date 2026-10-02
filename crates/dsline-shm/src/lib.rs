@@ -4,10 +4,10 @@
 //! API is intentionally conservative until ADR-001 is accepted.
 
 use dsline_core::{
-    checksum::checksum32, decode_frame, encode_frame, Backpressure, ChannelError, DslineError,
-    Frame, FrameKind, Metadata, Result, SpscConfig, CHUNK_METADATA_LEN, FRAME_FLAG_CHUNKED,
-    FRAME_FLAG_CHUNK_END, FRAME_FLAG_CHUNK_START, FRAME_HEADER_LEN, TLV_CHUNK_INDEX,
-    TLV_CHUNK_MESSAGE_LEN, TLV_CHUNK_TOTAL,
+    checksum::checksum32, decode_frame, decode_frame_header, encode_frame, encode_frame_header,
+    Backpressure, ChannelError, DslineError, Frame, FrameKind, Metadata, Result, SpscConfig,
+    CHUNK_METADATA_LEN, FRAME_FLAG_CHUNKED, FRAME_FLAG_CHUNK_END, FRAME_FLAG_CHUNK_START,
+    FRAME_HEADER_LEN, TLV_CHUNK_INDEX, TLV_CHUNK_MESSAGE_LEN, TLV_CHUNK_TOTAL,
 };
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -497,6 +497,23 @@ pub trait SlotRegionIo: std::fmt::Debug + Sized {
             Ok((current, false))
         }
     }
+
+    /// Run `f` over `len` bytes of the backing store starting at `offset`,
+    /// without copying them out first where the backend allows it.
+    ///
+    /// This is the zero-copy read window: `publish` computes the payload
+    /// checksum through it, so a published buffer's bytes are read for
+    /// verification in place instead of being duplicated into a temporary.
+    /// The borrow lives only for the call — backends that must lock their
+    /// mapping hold the lock for exactly the duration of `f`.
+    ///
+    /// Default: copies through `read_at` (file backends, where the "mapping"
+    /// is a syscall read anyway). The mmap and section backends override
+    /// this with a true in-place slice.
+    fn with_slice<R>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        let data = self.read_at(offset, len)?;
+        Ok(f(&data))
+    }
 }
 
 #[derive(Debug)]
@@ -893,6 +910,15 @@ impl SlotRegionIo for MmapSlotStorage {
         Ok(map[offset..offset + len].to_vec())
     }
 
+    fn with_slice<R>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        self.validate_range(offset, len)?;
+        let map = self
+            .map
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("mmap storage lock poisoned"))?;
+        Ok(f(&map[offset..offset + len]))
+    }
+
     fn write_at(&self, offset: usize, bytes: &[u8]) -> Result<()> {
         self.validate_range(offset, bytes.len())?;
         let mut map = self
@@ -1277,6 +1303,18 @@ impl SlotRegionIo for SectionShmSlotStorage {
         Ok(src.to_vec())
     }
 
+    fn with_slice<R>(&self, offset: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> Result<R> {
+        self.validate_range(offset, len)?;
+        let view = self
+            .view
+            .lock()
+            .map_err(|_| ChannelError::StorageIo("section storage lock poisoned"))?;
+        // SAFETY: as in `read_at`; the slice borrow ends before the guard
+        // is released, so no reference outlives the mapping view.
+        let src = unsafe { std::slice::from_raw_parts((view.base + offset) as *const u8, len) };
+        Ok(f(src))
+    }
+
     fn write_at(&self, offset: usize, bytes: &[u8]) -> Result<()> {
         self.validate_range(offset, bytes.len())?;
         let view = self
@@ -1574,10 +1612,12 @@ const ID_RESERVED_SLOTS_OFFSET: usize = 37;
 const ID_MAGIC_OFFSET: usize = 41;
 
 /// Size of the region header at the start of the backing store, holding the
-/// SPSC cursors, the initialization magic, and the region format version:
+/// SPSC cursors, the zero-copy pin floor, the initialization magic, and the
+/// region format version:
 ///
 /// ```text
 /// [head: u64 @ 0] [tail: u64 @ 8] [magic: u32 @ 16] [format: u32 @ 20]
+/// [pin_floor: u64 @ 24]
 /// ```
 ///
 /// `head` is producer-owned (monotonic slot count), `tail` is consumer-owned.
@@ -1586,13 +1626,17 @@ const ID_MAGIC_OFFSET: usize = 41;
 /// half-initialized region: the caller that creates the store first fills
 /// every slot header and only then publishes the magic; everyone else waits
 /// for it before recovering the ring. The format word distinguishes the
-/// current on-region layout (48-byte slot headers with writer identity) from
-/// the previous 13-byte one; a region written by an older build is rejected
-/// at open instead of being misinterpreted.
-pub const REGION_HEADER_LEN: usize = 24;
+/// current on-region layout (48-byte slot headers with writer identity, the
+/// zero-copy pin floor) from older ones; a region written by an older build
+/// is rejected at open instead of being misinterpreted.
+pub const REGION_HEADER_LEN: usize = 32;
 
 /// On-region layout version (`REGION_FORMAT` word).
-pub const REGION_FORMAT: u32 = 2;
+///
+/// 3 = 48-byte slot headers with writer identity + the `pin_floor` word
+/// (zero-copy views, roadmap §4.2). Version 2 regions (no pin floor) are
+/// rejected at open.
+pub const REGION_FORMAT: u32 = 3;
 
 /// Magic value published once initialization completes
 /// (bytes `DSL1` little-endian) — single-producer (SPSC) mode.
@@ -1618,6 +1662,24 @@ const CURSOR_HEAD_OFFSET: usize = 0;
 const CURSOR_TAIL_OFFSET: usize = 8;
 const MAGIC_OFFSET: usize = 16;
 const FORMAT_OFFSET: usize = 20;
+
+/// Region-header offset of the zero-copy **pin floor** (roadmap §4.2/§4.4).
+///
+/// The floor is the smallest cursor value whose physical slot is still
+/// pinned by a live zero-copy view (`recv_view`). Slots with a cursor value
+/// in `[pin_floor, tail)` are logically consumed but physically reserved:
+/// a producer's send guard must never let the ring wrap onto them, or a
+/// live view's bytes would be overwritten mid-read. The sentinel
+/// [`PIN_FLOOR_NONE`] means "no views are pinned". The floor is
+/// consumer-owned (only the consumer pins and releases views) and only
+/// read by producers; every writer goes through a CAS loop
+/// (`floor_toward`), so an opener's recovery recompute can never clobber a
+/// concurrent pin.
+pub const PIN_FLOOR_OFFSET: usize = 24;
+
+/// `pin_floor` sentinel: no zero-copy views are pinned, so the guard's
+/// effective floor is the tail cursor itself.
+pub const PIN_FLOOR_NONE: u64 = u64::MAX;
 
 /// Resolve a channel name to a stable region file path in the runtime
 /// directory. The same name always maps to the same path, in every process,
@@ -1652,16 +1714,18 @@ fn shm_runtime_base() -> Result<PathBuf> {
 }
 
 /// A slot header snapshot including the writer identity fields. The
-/// identity is meaningful only when `state` is `Writing` and
-/// `identity_magic == SLOT_IDENTITY_MAGIC`; every other state (or a header
-/// written by a build without identity support) reports `identity: None`.
+/// identity is meaningful only when `state` is `Writing` or `Pinned` and
+/// `identity_magic == SLOT_IDENTITY_MAGIC` (writers stamp WRITING headers
+/// for crash recovery, consumers stamp PINNED headers when handing out a
+/// zero-copy view); every other state (or a header written by a build
+/// without identity support) reports `identity: None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotHeaderFull {
     pub state: SlotState,
     pub seq: u64,
     pub payload_len: usize,
-    /// Writer identity and reservation extent (WRITING slots with a
-    /// published identity only).
+    /// Writer/consumer identity and reservation extent (`Writing`/`Pinned`
+    /// slots with a published identity only).
     pub identity: Option<WriterIdentity>,
 }
 
@@ -1992,6 +2056,85 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
         self.storage.fetch_max_u64(CURSOR_TAIL_OFFSET, tail)
     }
 
+    /// Load the zero-copy pin floor (acquire).
+    pub fn load_floor(&self) -> Result<u64> {
+        self.storage.load_u64(PIN_FLOOR_OFFSET)
+    }
+
+    /// Store the zero-copy pin floor (release). Initialization and recovery
+    /// only; runtime updates go through `floor_toward`'s CAS loop.
+    pub fn store_floor(&self, floor: u64) -> Result<()> {
+        self.storage.store_u64(PIN_FLOOR_OFFSET, floor)
+    }
+
+    /// Lower the pin floor to `target` (the pin path): min semantics, so a
+    /// concurrent writer's lower floor is never raised. Retry loop on lost
+    /// CAS races.
+    pub fn floor_min(&self, target: u64) -> Result<u64> {
+        for _ in 0..32 {
+            let current = self.load_floor()?;
+            if current != PIN_FLOOR_NONE && current <= target {
+                // Already at least as low as the new pin: the min wins.
+                return Ok(current);
+            }
+            let (_, ok) = self
+                .storage
+                .compare_exchange_u64(PIN_FLOOR_OFFSET, current, target)?;
+            if ok {
+                return Ok(target);
+            }
+            // Another writer moved the floor meanwhile; re-evaluate.
+        }
+        // Surrender conservatively: report whatever is there now.
+        self.load_floor()
+    }
+
+    /// Raise the pin floor to `target` **only if nobody touched it since**
+    /// `expected` was observed — the release/recovery path, where a scan of
+    /// the ring established that no live pin sits below `target` as of that
+    /// scan. A concurrent pinner that lowered the floor during the scan
+    /// makes the CAS fail and keeps its (better-informed, lower) value; a
+    /// phantom floor (no pinned header behind it) is raised away, which is
+    /// exactly the self-heal this exists for.
+    pub fn floor_cas(&self, expected: u64, target: u64) -> Result<bool> {
+        let (_, ok) = self
+            .storage
+            .compare_exchange_u64(PIN_FLOOR_OFFSET, expected, target)?;
+        Ok(ok)
+    }
+
+    /// Raw compare-exchange over any 8-byte region word (tests, recovery).
+    pub fn compare_exchange_word(
+        &self,
+        offset: usize,
+        expected: u64,
+        new: u64,
+    ) -> Result<(u64, bool)> {
+        self.storage.compare_exchange_u64(offset, expected, new)
+    }
+
+    /// Write a PINNED header with the consumer's identity, following the
+    /// same publication protocol as `write_writing_header`: the identity
+    /// fields and a Release fence land first, the identity magic last, so
+    /// a reclaimer that observes the magic never sees a torn identity.
+    /// The identity makes a crashed consumer's leftover pins reclaimable
+    /// (roadmap §6 symmetric to dead writers).
+    pub fn write_pinned_header(
+        &self,
+        index: usize,
+        seq: u64,
+        payload_len: usize,
+        identity: WriterIdentity,
+    ) -> Result<()> {
+        let fields =
+            Self::encode_header(SlotState::Pinned, seq, payload_len, Some(identity), false);
+        self.storage.write_at(self.slot_offset(index), &fields)?;
+        fence(Ordering::Release);
+        let magic = SLOT_IDENTITY_MAGIC.to_le_bytes();
+        self.storage
+            .write_at(self.slot_offset(index) + ID_MAGIC_OFFSET, &magic)
+    }
+
     /// MPSC reservation: CAS the head cursor from `expected` to `new`.
     /// Returns `(actual, true)` on success. The linearization point of the
     /// reservation protocol — exactly one producer's CAS wins per value, so
@@ -2295,6 +2438,48 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
         Ok(true)
     }
 
+    /// Reclaim a PINNED slot left behind by a provably dead consumer.
+    ///
+    /// Zero-copy views pin their slot (`recv_view`) until released; a
+    /// consumer that dies while holding views leaves PINNED slots behind
+    /// the tail cursor. The pin floor then blocks the send guard from
+    /// ever wrapping onto them — the ring would drain to zero capacity.
+    /// This is the mirror of `reclaim_dead_writing` for the consumer side
+    /// (roadmap §6): the same decision table applies, with the same
+    /// conservative default:
+    ///
+    /// 1. the slot must read PINNED in two consecutive full-header reads;
+    /// 2. the identity magic must be published (`write_pinned_header`);
+    /// 3. the identity must classify as [`ProcessLiveness::Gone`] — a live
+    ///    or unknown consumer's pin is never touched.
+    ///
+    /// The caller (open recovery, `reclaim_stale`) recomputes the pin
+    /// floor afterwards; this primitive only frees the one verified slot.
+    pub fn reclaim_dead_pinned(&self, index: usize) -> Result<bool> {
+        let first = self.read_header_full(index)?;
+        if first.state != SlotState::Pinned {
+            return Ok(false);
+        }
+        let Some(identity) = first.identity else {
+            return Ok(false); // no published identity: never auto-reclaim
+        };
+        let second = self.read_header_full(index)?;
+        if second != first {
+            return Ok(false);
+        }
+        if process_liveness(ProcessIdentity {
+            pid: identity.pid,
+            start_time: identity.start_time,
+        }) != ProcessLiveness::Gone
+        {
+            return Ok(false);
+        }
+        self.force_release_no_flush(index)?;
+        self.storage
+            .flush_range(self.slot_offset(index), PERSISTENT_SLOT_HEADER_LEN)?;
+        Ok(true)
+    }
+
     /// Publish the cursor words and one slot to other processes' mappings.
     ///
     /// Uses a single flush over `[0, end]` while the range stays small, and
@@ -2380,6 +2565,292 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
     }
 }
 
+// ── Zero-copy alloc/publish (roadmap §4.2) ──
+
+/// Byte offset of the message payload inside a single-slot zero-copy frame:
+/// slot header, then frame header (single-slot frames carry no TLV
+/// metadata, so the offset is a region-layout constant).
+pub const ZERO_COPY_PAYLOAD_OFFSET: usize = PERSISTENT_SLOT_HEADER_LEN + FRAME_HEADER_LEN;
+
+/// Absolute byte offset of a slot's start (region header + `index` slots).
+/// Used by the view/lease objects, which see the region through the
+/// object-safe [`RegionAccess`] facade below and recompute the offset from
+/// `RegionAccess::slot_size`.
+fn region_slot_offset(index: usize, slot_size: usize) -> usize {
+    REGION_HEADER_LEN + index * slot_size
+}
+
+/// Object-safe facade over a persistent slot region for the zero-copy
+/// lease/view objects.
+///
+/// The Python bindings' view and buffer objects must survive across calls
+/// while the channel object itself stays free, and must be non-generic
+/// (PyO3 pyclasses cannot take type parameters). They therefore hold an
+/// `Arc<dyn RegionAccess>` — a shared handle onto the same mapping the
+/// channel uses — plus their slot's byte offsets, and drive the slot state
+/// machine through this trait. Every method is `&self`: the region's
+/// primitives are interior-mutable through the storage backends.
+pub trait RegionAccess: std::fmt::Debug + Send + Sync {
+    fn capacity(&self) -> usize;
+    fn slot_size(&self) -> usize;
+    /// Usable frame area of one slot (slot size minus the slot header).
+    fn frame_capacity(&self) -> usize;
+    fn read_at(&self, offset: usize, len: usize) -> Result<Vec<u8>>;
+    fn write_at(&self, offset: usize, bytes: &[u8]) -> Result<()>;
+    fn flush_range(&self, offset: usize, len: usize) -> Result<()>;
+    fn load_u64(&self, offset: usize) -> Result<u64>;
+    fn compare_exchange_u64(&self, offset: usize, expected: u64, new: u64) -> Result<(u64, bool)>;
+    fn read_header_full(&self, index: usize) -> Result<SlotHeaderFull>;
+    /// PINNED → FREE: clear the payload, release-fence, write the FREE
+    /// header, flush the slot. Errors unless the slot is PINNED.
+    fn release_pinned(&self, index: usize) -> Result<()>;
+    /// Force any state to FREE with a payload clear (reclaim path).
+    fn force_release(&self, index: usize) -> Result<()>;
+}
+
+impl<S: SlotRegionIo + Send + Sync> RegionAccess for PersistentSlotRegion<S> {
+    fn capacity(&self) -> usize {
+        PersistentSlotRegion::capacity(self)
+    }
+    fn slot_size(&self) -> usize {
+        PersistentSlotRegion::slot_size(self)
+    }
+    fn frame_capacity(&self) -> usize {
+        PersistentSlotRegion::frame_capacity(self)
+    }
+    fn read_at(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.storage.read_at(offset, len)
+    }
+    fn write_at(&self, offset: usize, bytes: &[u8]) -> Result<()> {
+        self.storage.write_at(offset, bytes)
+    }
+    fn flush_range(&self, offset: usize, len: usize) -> Result<()> {
+        self.storage.flush_range(offset, len)
+    }
+    fn load_u64(&self, offset: usize) -> Result<u64> {
+        self.storage.load_u64(offset)
+    }
+    fn compare_exchange_u64(&self, offset: usize, expected: u64, new: u64) -> Result<(u64, bool)> {
+        self.storage.compare_exchange_u64(offset, expected, new)
+    }
+    fn read_header_full(&self, index: usize) -> Result<SlotHeaderFull> {
+        PersistentSlotRegion::read_header_full(self, index)
+    }
+    fn release_pinned(&self, index: usize) -> Result<()> {
+        PersistentSlotRegion::release_pinned(self, index)
+    }
+    fn force_release(&self, index: usize) -> Result<()> {
+        self.force_release_no_flush(index)?;
+        self.storage
+            .flush_range(self.slot_offset(index), PERSISTENT_SLOT_HEADER_LEN)
+    }
+    // (slot_offset is the region's own; the view helpers recompute theirs
+    // from `region_slot_offset(index, slot_size)`.)
+}
+
+/// Producer-side lease from [`PersistentShmChannel::alloc`]: the reserved
+/// slot's payload area, writable in place until [`sealed`](Self::is_sealed).
+///
+/// The bytes written here land directly in the shared region — there is no
+/// intermediate frame buffer and no transport copy. [`publish`]
+/// (PersistentShmChannel::publish) seals the lease: the frame header
+/// (checksum included) is written over the payload, the slot transitions to
+/// COMMITTED, and further writes are rejected. A lease that is dropped
+/// without publishing leaves its slot WRITING — recoverable like any
+/// crashed writer once this process exits; `abort` frees it immediately.
+///
+/// [`publish`]: PersistentShmChannel::publish
+#[derive(Debug)]
+pub struct ShmWriteLease {
+    access: std::sync::Arc<dyn RegionAccess>,
+    index: usize,
+    seq: u64,
+    /// Absolute offset of the payload area inside the region.
+    payload_offset: usize,
+    payload_len: usize,
+    sealed: bool,
+}
+
+impl ShmWriteLease {
+    /// Message sequence assigned at `alloc` time.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Writable payload size in bytes.
+    pub fn size(&self) -> usize {
+        self.payload_len
+    }
+
+    /// Ring slot this lease reserved (diagnostics).
+    pub fn slot_index(&self) -> usize {
+        self.index
+    }
+
+    /// Whether `publish` has sealed this lease.
+    pub fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
+    /// Write `bytes` into the payload area at `offset`, directly into the
+    /// shared region. Errors once the lease is sealed.
+    pub fn write(&self, offset: usize, bytes: &[u8]) -> Result<()> {
+        if self.sealed {
+            return Err(ChannelError::InvalidConfig(
+                "buffer is sealed: publish() already committed it",
+            )
+            .into());
+        }
+        if offset > self.payload_len || bytes.len() > self.payload_len - offset {
+            return Err(ChannelError::InvalidConfig("write out of buffer bounds").into());
+        }
+        self.access.write_at(self.payload_offset + offset, bytes)
+    }
+}
+
+/// Consumer-side zero-copy view from [`PersistentShmChannel::recv_view`].
+///
+/// The view pins its slot: the message is logically consumed (the tail
+/// cursor advanced) but the slot is only recycled once the view is
+/// released, so the payload bytes stay valid for as long as the view is
+/// alive. Reads go straight to the shared region — `read` copies exactly
+/// the requested byte range, nothing more; a consumer that inspects a few
+/// header bytes of a large payload never pulls the whole message.
+///
+/// Releasing is mandatory for ring progress: while any view is pinned, the
+/// send guard refuses to wrap the ring onto its slot (`pin_floor`). Drop
+/// releases best-effort; `release()` surfaces storage errors and makes the
+/// release idempotence explicit.
+#[derive(Debug)]
+pub struct ShmRecvView {
+    access: std::sync::Arc<dyn RegionAccess>,
+    index: usize,
+    seq: u64,
+    /// Absolute offset of the payload area inside the region.
+    payload_offset: usize,
+    payload_len: usize,
+    /// The cursor value this slot had when it was consumed — the pin
+    /// floor's unit of accounting.
+    cursor_value: u64,
+    released: bool,
+}
+
+impl ShmRecvView {
+    /// Message sequence of the viewed slot.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// Payload size in bytes.
+    pub fn size(&self) -> usize {
+        self.payload_len
+    }
+
+    /// Ring slot backing this view (diagnostics).
+    pub fn slot_index(&self) -> usize {
+        self.index
+    }
+
+    /// Whether the view has been released.
+    pub fn is_released(&self) -> bool {
+        self.released
+    }
+
+    /// Copy `len` bytes of the payload starting at `offset` out of the
+    /// shared region. The copy is the caller's explicit choice; the
+    /// transport itself never moves these bytes.
+    pub fn read(&self, offset: usize, len: usize) -> Result<Vec<u8>> {
+        self.check_usable()?;
+        if offset > self.payload_len || len > self.payload_len - offset {
+            return Err(ChannelError::InvalidConfig("read out of view bounds").into());
+        }
+        self.access.read_at(self.payload_offset + offset, len)
+    }
+
+    /// Copy the whole payload out of the shared region.
+    pub fn read_all(&self) -> Result<Vec<u8>> {
+        self.check_usable()?;
+        self.access.read_at(self.payload_offset, self.payload_len)
+    }
+
+    /// Release the view: PINNED → FREE, then recompute the pin floor.
+    /// Idempotence is rejected explicitly — a double release is a caller
+    /// bug (the slot may already be reused by then).
+    pub fn release(&mut self) -> Result<()> {
+        self.check_usable()?;
+        self.access.release_pinned(self.index)?;
+        self.released = true;
+        unpin_floor(&*self.access, self.cursor_value)?;
+        Ok(())
+    }
+
+    fn check_usable(&self) -> Result<()> {
+        if self.released {
+            return Err(ChannelError::InvalidConfig("view is already released").into());
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ShmRecvView {
+    fn drop(&mut self) {
+        if !self.released {
+            // Best-effort: a dropped view must not pin its slot forever.
+            // Storage errors are swallowed (nothing can observe them here);
+            // a failed physical release self-heals through the open-time
+            // dead-pin reclaim (the identity records this process as the
+            // pinner, and the process is going away or the storage is
+            // failing anyway).
+            let _ = self.access.release_pinned(self.index);
+            let _ = unpin_floor(&*self.access, self.cursor_value);
+            self.released = true;
+        }
+    }
+}
+
+/// Recompute the pin floor after the view owning `released_cursor` was
+/// released. Fast path: only the floor's owner triggers a rescan (pins are
+/// consumed in FIFO order, so a later view's release cannot expose a lower
+/// pin); the scan walks forward from the released cursor to the tail
+/// looking for the next still-pinned slot, bounded by the capacity.
+fn unpin_floor(access: &dyn RegionAccess, released_cursor: u64) -> Result<()> {
+    let entry_floor = access.load_u64(PIN_FLOOR_OFFSET)?;
+    let owns_floor = entry_floor == released_cursor;
+    if !owns_floor && entry_floor != PIN_FLOOR_NONE {
+        // A lower pin still owns the floor: releasing this view cannot
+        // raise it, so the accounting stays exact without a scan.
+        return Ok(());
+    }
+    let tail = access.load_u64(CURSOR_TAIL_OFFSET)?;
+    let cap = access.capacity() as u64;
+    let lo = if owns_floor {
+        released_cursor + 1
+    } else {
+        // Floor says "no pins" while a pinned view was just released — an
+        // opener raised it over a live pin (the conservative CAS race).
+        // Rescan the whole window.
+        tail.saturating_sub(cap)
+    };
+    let start = lo.max(tail.saturating_sub(cap));
+    let mut next = PIN_FLOOR_NONE;
+    // Cursor values in [start, tail) map to physical slots (c % capacity);
+    // the first PINNED slot in ascending cursor order is the new floor.
+    for cursor in start..tail {
+        let index = (cursor % cap) as usize;
+        if access.read_header_full(index)?.state == SlotState::Pinned {
+            next = cursor;
+            break;
+        }
+    }
+    // Single-shot raise from the entry snapshot: if a concurrent pinner
+    // lowered the floor while this scan ran, the CAS fails and its lower
+    // (better-informed) value stands. See `floor_cas`.
+    if entry_floor != next {
+        access.compare_exchange_u64(PIN_FLOOR_OFFSET, entry_floor, next)?;
+    }
+    Ok(())
+}
+
 /// A channel backed by a persistent slot region.
 ///
 /// This channel can be opened by multiple processes that share the same
@@ -2406,7 +2877,9 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
 /// rather than a hang.
 #[derive(Debug)]
 pub struct PersistentShmChannel<S: SlotRegionIo = MmapSlotStorage> {
-    region: PersistentSlotRegion<S>,
+    /// Shared with the zero-copy lease/view objects (they must outlive
+    /// individual method calls on the channel), hence the `Arc`.
+    region: std::sync::Arc<PersistentSlotRegion<S>>,
     config: SpscConfig,
     /// Producer-owned next write index, recovered at open and advanced
     /// locally. Never overwritten by a refresh: only the producer moves it.
@@ -2420,6 +2893,11 @@ pub struct PersistentShmChannel<S: SlotRegionIo = MmapSlotStorage> {
     /// Monotonic slot counts mirrored from the shared region header.
     head_cursor: u64,
     tail_cursor: u64,
+    /// Zero-copy pin floor mirrored from the shared region header
+    /// ([`PIN_FLOOR_NONE`] when no views are pinned). Reloaded on every
+    /// refresh; the send guard derives its occupancy from it (see
+    /// [`Self::guard_len`]).
+    floor_cursor: u64,
     /// Crash-leftover occupancy: slots occupied at open that the shared
     /// cursors do not count (a producer that died mid-write left WRITING
     /// slots, and the shared head never advanced past them). Kept in the
@@ -2482,7 +2960,11 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     pub fn create(path: impl AsRef<Path>, config: SpscConfig) -> Result<Self> {
         config.validate()?;
         let region_slot_size = persistent_region_slot_size(&config)?;
-        let region = PersistentSlotRegion::<S>::create(path, config.capacity, region_slot_size)?;
+        let region = std::sync::Arc::new(PersistentSlotRegion::<S>::create(
+            path,
+            config.capacity,
+            region_slot_size,
+        )?);
         Self::new_initialized(region, config)
     }
 
@@ -2498,13 +2980,17 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     pub fn open(path: impl AsRef<Path>, config: SpscConfig) -> Result<Self> {
         config.validate()?;
         let region_slot_size = persistent_region_slot_size(&config)?;
-        let region = PersistentSlotRegion::<S>::open(path, config.capacity, region_slot_size)?;
+        let region = std::sync::Arc::new(PersistentSlotRegion::<S>::open(
+            path,
+            config.capacity,
+            region_slot_size,
+        )?);
         region.wait_initialized(region_magic(config.multi_producer))?;
         Self::opened(region, config)
     }
 
     /// Build the channel state for an existing, initialized region.
-    fn opened(region: PersistentSlotRegion<S>, config: SpscConfig) -> Result<Self> {
+    fn opened(region: std::sync::Arc<PersistentSlotRegion<S>>, config: SpscConfig) -> Result<Self> {
         let mut channel = Self {
             region,
             config,
@@ -2513,6 +2999,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             len: 0,
             head_cursor: 0,
             tail_cursor: 0,
+            floor_cursor: PIN_FLOOR_NONE,
             recovery_bias: 0,
             writer: process::current_process_identity(),
             writer_epoch: next_writer_epoch(),
@@ -2527,7 +3014,10 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         Ok(channel)
     }
 
-    fn new_initialized(region: PersistentSlotRegion<S>, config: SpscConfig) -> Result<Self> {
+    fn new_initialized(
+        region: std::sync::Arc<PersistentSlotRegion<S>>,
+        config: SpscConfig,
+    ) -> Result<Self> {
         let channel = Self {
             region,
             config,
@@ -2536,6 +3026,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             len: 0,
             head_cursor: 0,
             tail_cursor: 0,
+            floor_cursor: PIN_FLOOR_NONE,
             recovery_bias: 0,
             writer: process::current_process_identity(),
             writer_epoch: next_writer_epoch(),
@@ -2559,6 +3050,11 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         for i in 0..self.config.capacity {
             self.region.write_header(i, SlotState::Free, 0, 0)?;
         }
+        // No zero-copy views are pinned on a fresh region. The floor word
+        // must be the sentinel, not the zero-filled default: cursor 0 is a
+        // legal pin value, and a zero floor would permanently shrink the
+        // ring once the cursors pass it.
+        self.region.store_floor(PIN_FLOOR_NONE)?;
         self.region
             .publish_magic(region_magic(self.config.multi_producer))
     }
@@ -2682,7 +3178,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         }
         loop {
             self.refresh_cursors()?;
-            if self.config.capacity - self.len >= needed_slots {
+            if self.config.capacity - self.guard_len() >= needed_slots {
                 let head_c = self.head_cursor;
                 let (actual, ok) = self
                     .region
@@ -2702,7 +3198,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
                 }
                 Backpressure::DropNewest => return Ok(None),
                 Backpressure::DropOldest => {
-                    while self.config.capacity - self.len < needed_slots {
+                    while self.config.capacity - self.guard_len() < needed_slots {
                         self.drop_oldest_message()?;
                     }
                 }
@@ -2714,15 +3210,20 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         Ok(self.recv_with_seq()?.payload)
     }
 
-    pub fn recv_with_seq(&mut self) -> Result<ReceivedMessage> {
+    /// Shared prologue of the receive paths (`recv_with_seq`, `recv_view`):
+    /// refresh, the closed/empty decision, and the COMMITTED gate with its
+    /// crash-leftover reclaim.
+    ///
+    /// Returns whether a sequence resync is pending (a reclaim or an open
+    /// with nothing readable legitimately broke the +1 chain; the caller
+    /// adopts the observed sequence instead of enforcing it). On success the
+    /// tail slot is COMMITTED and `self.tail` is its ring index.
+    fn ensure_tail_readable(&mut self) -> Result<bool> {
         self.refresh_cursors()?;
         if self.closed && self.len == 0 {
             return Err(ChannelError::Closed.into());
         }
 
-        // A reclaim (or an open with nothing readable) breaks sequence
-        // contiguity legitimately: the next read adopts whatever sequence
-        // it actually observes instead of enforcing the +1 chain.
         let resync = std::mem::take(&mut self.resync_expected);
 
         // Gate: only a fully COMMITTED slot is readable. The producer
@@ -2746,6 +3247,11 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
                 return Err(ChannelError::BufferEmpty.into());
             }
         }
+        Ok(resync)
+    }
+
+    pub fn recv_with_seq(&mut self) -> Result<ReceivedMessage> {
+        let resync = self.ensure_tail_readable()?;
 
         let snapshot = self.region.read_committed(self.tail)?;
 
@@ -2803,6 +3309,283 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
         self.last_received_seq = Some(seq);
         Ok(ReceivedMessage { seq, payload })
+    }
+
+    // ── Zero-copy alloc/publish (roadmap §4.2) ──
+    //
+    // The safety-gate conditions (roadmap §4.3) this milestone satisfies:
+    // the payload is born in the shared region (`alloc` reserves the slot
+    // and the lease writes into it directly), `publish` seals the buffer
+    // and commits it, and the consumer's view pins the slot until released
+    // (`pin_floor` keeps the send guard from wrapping onto it, with the
+    // lease/seal/pin state machine covered by unit tests and the
+    // solver-based invariant checks in `verify/check_invariants.py`).
+
+    /// Reserve one slot for a zero-copy message and return a writable
+    /// lease into the shared region.
+    ///
+    /// Single-producer mode only (an MPSC reservation is cursor-counted at
+    /// claim time, so an unpublished reservation would head-of-line block
+    /// the whole ring for as long as the buffer is held): `multi_producer`
+    /// channels reject `alloc` with `InvalidConfig`. `DropOldest` is
+    /// rejected too — its force-release may free a slot a live view is
+    /// pinned on; `DropNewest` has nothing to discard and behaves like
+    /// `Raise` here. `Block` waits for space as usual.
+    ///
+    /// The message must fit one slot (`size <= payload_slot_size`): larger
+    /// payloads chunk across slots whose bytes are not contiguous in the
+    /// region, which a single view cannot express — use `send` for them.
+    pub fn alloc(&mut self, size: usize) -> Result<ShmWriteLease>
+    where
+        S: Send + Sync + 'static,
+    {
+        if self.closed {
+            return Err(ChannelError::Closed.into());
+        }
+        if self.config.multi_producer {
+            return Err(ChannelError::InvalidConfig(
+                "zero-copy alloc requires single-producer mode",
+            )
+            .into());
+        }
+        if self.config.backpressure == Backpressure::DropOldest {
+            return Err(ChannelError::InvalidConfig(
+                "zero-copy is incompatible with DropOldest: the drop may free a pinned slot",
+            )
+            .into());
+        }
+        if size > self.config.slot_size {
+            return Err(ChannelError::MessageTooLarge {
+                len: size,
+                slot_size: self.config.slot_size,
+            }
+            .into());
+        }
+        let frame_len = FRAME_HEADER_LEN
+            .checked_add(size)
+            .ok_or(ChannelError::InvalidConfig("size overflow"))?;
+        self.refresh_cursors()?;
+        // DropNewest cannot discard a half-created message, so it degrades
+        // to Raise on the alloc path (an error, nothing queued).
+        if !self.prepare_send_slots(1)? {
+            return Err(ChannelError::BufferFull.into());
+        }
+        let index = self.head;
+        let (state, _, _) = self.region.read_header(index)?;
+        if state != SlotState::Free {
+            // The guard counts slots from the cursors; the physical slot
+            // must agree (a pinned slot with a stale floor, for instance).
+            return Err(ChannelError::BufferFull.into());
+        }
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let stamp = self.writer.stamp(self.writer_epoch, 1);
+        self.region
+            .write_writing_header(index, seq, frame_len, stamp)?;
+        self.head = (self.head + 1) % self.config.capacity;
+        self.len += 1;
+        let access: std::sync::Arc<dyn RegionAccess> = self.region.clone();
+        Ok(ShmWriteLease {
+            access,
+            index,
+            seq,
+            payload_offset: region_slot_offset(index, self.region.slot_size())
+                + ZERO_COPY_PAYLOAD_OFFSET,
+            payload_len: size,
+            sealed: false,
+        })
+    }
+
+    /// Seal and commit a zero-copy buffer: checksum the payload where it
+    /// lies (no copy out of the region), write the frame header, flip the
+    /// slot to COMMITTED, and publish the head cursor. Returns the message
+    /// sequence. The lease stays usable for nothing but `seq`/`size`
+    /// queries — further writes are rejected (the roadmap's seal rule).
+    pub fn publish(&mut self, lease: &mut ShmWriteLease) -> Result<u64> {
+        if self.closed {
+            return Err(ChannelError::Closed.into());
+        }
+        if lease.sealed {
+            return Err(ChannelError::InvalidConfig("buffer is already published").into());
+        }
+        let (state, _, _) = self.region.read_header(lease.index)?;
+        if state != SlotState::Writing {
+            return Err(ChannelError::InvalidConfig("buffer slot is not reserved").into());
+        }
+        // Checksum in place through the backend's zero-copy read window.
+        let checksum =
+            self.region
+                .storage
+                .with_slice(lease.payload_offset, lease.payload_len, checksum32)?;
+        let header = encode_frame_header(
+            FrameKind::Bytes,
+            0,
+            lease.seq,
+            0,
+            0,
+            checksum,
+            lease.payload_len,
+            &[],
+        )?;
+        let frame_offset = lease.payload_offset - FRAME_HEADER_LEN;
+        let frame_len = FRAME_HEADER_LEN + lease.payload_len;
+        self.region.storage.write_at(frame_offset, &header)?;
+        // Release-fence the frame header, then commit the slot: a reader
+        // that observes COMMITTED never sees a stale checksum or header.
+        fence(Ordering::Release);
+        self.region
+            .write_header(lease.index, SlotState::Committed, lease.seq, frame_len)?;
+        lease.sealed = true;
+        // Publish the batch exactly like `send`: the head cursor store
+        // (release) plus one flush over the slot and the cursor.
+        self.head_cursor = self.head_cursor.wrapping_add(1);
+        self.region.store_head(self.head_cursor)?;
+        self.region.storage.flush_range(
+            region_slot_offset(lease.index, self.region.slot_size()),
+            PERSISTENT_SLOT_HEADER_LEN + FRAME_HEADER_LEN + lease.payload_len,
+        )?;
+        Ok(lease.seq)
+    }
+
+    /// Free an unpublished `alloc` reservation: clear the payload, flip the
+    /// slot back to FREE, and rewind the producer's local position. Only
+    /// the newest reservation can be unwound — the SPSC head cursor was
+    /// never published, so the slot is invisible to consumers.
+    pub fn abort(&mut self, lease: ShmWriteLease) -> Result<()> {
+        if lease.sealed {
+            return Err(ChannelError::InvalidConfig("cannot abort a published buffer").into());
+        }
+        let last_reserved = (self.head + self.config.capacity - 1) % self.config.capacity;
+        if lease.index != last_reserved {
+            return Err(ChannelError::InvalidConfig(
+                "only the newest unpublished buffer can be aborted",
+            )
+            .into());
+        }
+        self.region.force_release_no_flush(lease.index)?;
+        self.region.storage.flush_range(
+            region_slot_offset(lease.index, self.region.slot_size()),
+            PERSISTENT_SLOT_HEADER_LEN,
+        )?;
+        self.head = lease.index;
+        self.len = self.len.saturating_sub(1);
+        self.next_seq = lease.seq;
+        Ok(())
+    }
+
+    /// Receive the next message as a zero-copy view over the shared
+    /// region: the slot is pinned (COMMITTED → PINNED with this handle's
+    /// consumer identity), the tail cursor advances (logical consume), and
+    /// the returned view reads — or partially reads — the payload in place
+    /// until released.
+    ///
+    /// The pin floor records the oldest pinned cursor value, and every
+    /// producer's send guard refuses to wrap the ring onto a pinned slot;
+    /// release views promptly or the ring fills to a standstill. Rejected
+    /// on `DropOldest` channels (a forced drop may free a pinned slot) and
+    /// for chunked multi-slot messages (their bytes are not contiguous —
+    /// use `recv`).
+    pub fn recv_view(&mut self) -> Result<ShmRecvView>
+    where
+        S: Send + Sync + 'static,
+    {
+        if self.config.backpressure == Backpressure::DropOldest {
+            return Err(ChannelError::InvalidConfig(
+                "zero-copy views are incompatible with DropOldest: the drop may free a pinned slot",
+            )
+            .into());
+        }
+        let resync = self.ensure_tail_readable()?;
+        let index = self.tail;
+        let (state, slot_seq, frame_len) = self.region.read_header(index)?;
+        debug_assert_eq!(state, SlotState::Committed);
+        if frame_len < FRAME_HEADER_LEN {
+            return Err(ChannelError::CorruptedMessage.into());
+        }
+        let frame_offset =
+            region_slot_offset(index, self.region.slot_size()) + PERSISTENT_SLOT_HEADER_LEN;
+        let header_bytes = self
+            .region
+            .storage
+            .read_at(frame_offset, FRAME_HEADER_LEN)?;
+        let (header, _total_len) = decode_frame_header(&header_bytes)?;
+        // Zero-copy eligibility: a single-slot, unchunked bytes frame. A
+        // larger header means TLV metadata (chunking), which lives in
+        // non-contiguous slots.
+        if header.header_len as usize != FRAME_HEADER_LEN
+            || header.flags != 0
+            || header.kind != FrameKind::Bytes
+        {
+            return Err(ChannelError::InvalidConfig(
+                "zero-copy views require single-slot unchunked messages; use recv()",
+            )
+            .into());
+        }
+        if header.seq != slot_seq {
+            return Err(ChannelError::SequenceMismatch {
+                expected: slot_seq,
+                actual: header.seq,
+            }
+            .into());
+        }
+        if resync {
+            self.expected_recv_seq = slot_seq;
+        } else if !self.config.multi_producer && slot_seq != self.expected_recv_seq {
+            return Err(ChannelError::SequenceMismatch {
+                expected: self.expected_recv_seq,
+                actual: slot_seq,
+            }
+            .into());
+        }
+        let payload_len = header.payload_len as usize;
+        if payload_len != frame_len - FRAME_HEADER_LEN {
+            return Err(ChannelError::CorruptedMessage.into());
+        }
+        // Verify the checksum over the payload in place (no copy).
+        let checksum = self.region.storage.with_slice(
+            frame_offset + FRAME_HEADER_LEN,
+            payload_len,
+            checksum32,
+        )?;
+        if checksum != header.checksum {
+            return Err(ChannelError::CorruptedMessage.into());
+        }
+        // Pin: the PINNED header (with this handle's consumer identity,
+        // so a crashed consumer's pins are reclaimable) lands first; the
+        // pin floor follows. A producer that reads a stale-high floor in
+        // between at worst over-commits into a write error — never into a
+        // silent overwrite, because the Free-state check backs every
+        // physical write.
+        let cursor_value = self.tail_cursor;
+        let stamp = self.writer.stamp(self.writer_epoch, 1);
+        self.region
+            .write_pinned_header(index, slot_seq, frame_len, stamp)?;
+        self.region.floor_min(cursor_value)?;
+        self.advance_tail_keep_pinned()?;
+        self.expected_recv_seq = self.expected_recv_seq.wrapping_add(1);
+        self.last_received_seq = Some(slot_seq);
+        let access: std::sync::Arc<dyn RegionAccess> = self.region.clone();
+        Ok(ShmRecvView {
+            access,
+            index,
+            seq: slot_seq,
+            payload_offset: frame_offset + FRAME_HEADER_LEN,
+            payload_len,
+            cursor_value,
+            released: false,
+        })
+    }
+
+    /// Count currently pinned slots (bounded scan; diagnostics for
+    /// `stats()["pinned_slots"]`).
+    pub fn pinned_slots(&self) -> Result<usize> {
+        let mut pinned = 0;
+        for index in 0..self.config.capacity {
+            if self.region.read_header(index)?.0 == SlotState::Pinned {
+                pinned += 1;
+            }
+        }
+        Ok(pinned)
     }
 
     pub fn close(&mut self) {
@@ -2887,7 +3670,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             }
             .into());
         }
-        if self.config.capacity - self.len >= needed_slots {
+        if self.config.capacity - self.guard_len() >= needed_slots {
             return Ok(true);
         }
 
@@ -2899,7 +3682,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             }
             Backpressure::DropNewest => Ok(false),
             Backpressure::DropOldest => {
-                while self.config.capacity - self.len < needed_slots {
+                while self.config.capacity - self.guard_len() < needed_slots {
                     self.drop_oldest_message()?;
                 }
                 Ok(true)
@@ -2908,7 +3691,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     }
 
     fn wait_for_space(&mut self, needed_slots: usize) -> Result<()> {
-        if self.config.capacity - self.len >= needed_slots {
+        if self.config.capacity - self.guard_len() >= needed_slots {
             return Ok(());
         }
         let Some(timeout) = self.config.timeout else {
@@ -2917,7 +3700,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
             self.refresh_cursors()?;
-            if self.config.capacity - self.len >= needed_slots {
+            if self.config.capacity - self.guard_len() >= needed_slots {
                 return Ok(());
             }
             thread::yield_now();
@@ -2948,11 +3731,13 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     fn refresh_cursors(&mut self) -> Result<()> {
         let head_c = self.region.load_head()?;
         let tail_c = self.region.load_tail()?;
+        let floor_c = self.region.load_floor()?;
         let cap = self.config.capacity as u64;
         let fwd = head_c.wrapping_sub(tail_c);
         let back = tail_c.wrapping_sub(head_c);
         self.head_cursor = head_c;
         self.tail_cursor = tail_c;
+        self.floor_cursor = floor_c;
         self.tail = (tail_c % cap) as usize;
         if fwd <= cap {
             self.len = ((fwd as usize) + self.recovery_bias).min(self.config.capacity);
@@ -2962,6 +3747,50 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             return Err(ChannelError::InvalidConfig("ring cursors are inconsistent").into());
         }
         Ok(())
+    }
+
+    /// Occupied-slot count the **send guard** must respect: the cursor depth
+    /// plus every zero-copy view pin between the pin floor and the head.
+    ///
+    /// Pinned slots are logically consumed (behind the tail cursor), so the
+    /// plain depth does not see them — but their physical slots are still
+    /// reserved for live views, and a claim that wrapped the ring onto one
+    /// would overwrite bytes a consumer is still reading. With
+    /// `floor_cursor` ranging over `[tail - capacity, tail]` (or the
+    /// "no pins" sentinel, which maps to the tail), the span
+    /// `head - floor` counts exactly the slots between the floor and the
+    /// head: every pinned slot, plus every released-but-behind-a-pin slot
+    /// that is unusable anyway because claims are contiguous from `head`.
+    /// Without pins this reduces bit-for-bit to the plain cursor depth.
+    ///
+    /// Guard theorem (verify Z6): a reservation of `needed` slots claiming
+    /// cursors `[head, head + needed)` touches a pinned physical slot iff
+    /// `head + needed > floor + capacity` — this count is that condition.
+    fn guard_len(&self) -> usize {
+        let floor_eff = if self.floor_cursor == PIN_FLOOR_NONE {
+            self.tail_cursor
+        } else {
+            self.floor_cursor.min(self.tail_cursor)
+        };
+        let pinned_span = self.head_cursor.saturating_sub(floor_eff);
+        (pinned_span as usize + self.recovery_bias).min(self.config.capacity)
+    }
+
+    /// Rebuild the pin floor from the ring during open recovery: the oldest
+    /// still-pinned slot inside the window of consumable cursor values
+    /// `[tail - capacity, tail)`, or [`PIN_FLOOR_NONE`] when nothing is
+    /// pinned. Ascending cursor order maps one-to-one onto ring positions,
+    /// so the first PINNED header encountered is the smallest pinned cursor.
+    fn scan_pin_floor(&self, _head_c: u64, tail_c: u64) -> Result<u64> {
+        let cap = self.config.capacity as u64;
+        let lo = tail_c.saturating_sub(cap);
+        for cursor in lo..tail_c {
+            let index = (cursor % cap) as usize;
+            if self.region.read_header(index)?.0 == SlotState::Pinned {
+                return Ok(cursor);
+            }
+        }
+        Ok(PIN_FLOOR_NONE)
     }
 
     /// One-time recovery scan at open. The shared cursors carry the ring
@@ -2988,9 +3817,28 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
                 }
             }
         }
+        // Dead consumers' zero-copy pins are reclaimable in both modes (the
+        // pin is behind the tail cursor, so no cursor changes): a consumer
+        // that died holding views would otherwise pin-hole the ring — the
+        // floor would block every wrap onto its slots forever.
+        for index in 0..self.config.capacity {
+            if self.region.reclaim_dead_pinned(index)? {
+                self.reclaimed_slots += 1;
+            }
+        }
         let occupied = self.occupied_slot_headers()?;
         let head_c = self.region.load_head()?;
         let tail_c = self.region.load_tail()?;
+        // Rebuild the pin floor from the ring: the oldest still-pinned slot
+        // inside the consumable window is the floor; with none, the "no
+        // pins" sentinel. The raise is a single CAS from the pre-scan
+        // snapshot, so a concurrent pinner's lower floor is never clobbered.
+        let floor_before = self.region.load_floor()?;
+        let floor = self.scan_pin_floor(head_c, tail_c)?;
+        if floor_before != floor {
+            self.region.floor_cas(floor_before, floor)?;
+        }
+        self.floor_cursor = self.region.load_floor()?;
         let cap = self.config.capacity as u64;
         let fwd = head_c.wrapping_sub(tail_c);
         let back = tail_c.wrapping_sub(head_c);
@@ -3008,8 +3856,24 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         self.tail = tail_index;
         self.head = self.infer_head_from_tail(tail_index)?;
         // The scan sees every occupied slot; the cursors only see fully
-        // committed batches. The difference is crash leftovers.
-        self.recovery_bias = occupied.len().saturating_sub(cursor_len);
+        // committed batches. The difference is crash leftovers — with one
+        // exception: zero-copy pins live behind the tail cursor and are
+        // accounted through the pin floor instead (`guard_len`'s pinned
+        // span counts `[floor, head)`); biasing them here as well would
+        // double-book them and over-shrink the ring. The orphan regime
+        // (tail ahead of head) keeps pins in the bias, because their
+        // cursors sit beyond the published head where the span cannot
+        // reach — over-counting there is merely conservative.
+        let pinned_count = occupied
+            .iter()
+            .filter(|slot| slot.state == SlotState::Pinned)
+            .count();
+        let bias_pool = if fwd <= cap {
+            occupied.len().saturating_sub(pinned_count)
+        } else {
+            occupied.len()
+        };
+        self.recovery_bias = bias_pool.saturating_sub(cursor_len);
         self.len = (cursor_len + self.recovery_bias).min(self.config.capacity);
 
         // Producer sequence: continue after the newest occupied slot.
@@ -3241,6 +4105,23 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
                 total += freed;
                 self.refresh_cursors()?;
             }
+            // Dead consumers' pins sit behind the tail and are freed by
+            // identity, like everywhere else; the floor follows.
+            for index in 0..self.config.capacity {
+                if self.region.reclaim_dead_pinned(index)? {
+                    total += 1;
+                }
+            }
+            if total > 0 {
+                self.reclaimed_slots += total;
+                let tail_c = self.region.load_tail()?;
+                let floor_before = self.region.load_floor()?;
+                let floor = self.scan_pin_floor(0, tail_c)?;
+                if floor_before != floor {
+                    self.region.floor_cas(floor_before, floor)?;
+                }
+                self.floor_cursor = self.region.load_floor()?;
+            }
             return Ok(total);
         }
         // SPSC: free every dead writer's WRITING slot outside the cursor
@@ -3261,12 +4142,25 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             if self.region.reclaim_dead_writing(index)? {
                 total += 1;
             }
+            if self.region.reclaim_dead_pinned(index)? {
+                total += 1;
+            }
         }
         if total > 0 {
             self.reclaimed_slots += total;
             self.resync_expected = true;
             self.recovery_bias = self.recompute_spsc_bias()?;
             self.refresh_cursors()?;
+            // Pins freed above raise the floor (fewer reservations); move
+            // the shared word accordingly so the guard un-shrinks too.
+            let head_c = self.region.load_head()?;
+            let tail_c = self.region.load_tail()?;
+            let floor_before = self.region.load_floor()?;
+            let floor = self.scan_pin_floor(head_c, tail_c)?;
+            if floor_before != floor {
+                self.region.floor_cas(floor_before, floor)?;
+            }
+            self.floor_cursor = self.region.load_floor()?;
         }
         Ok(total)
     }
@@ -3296,6 +4190,18 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     }
 
     fn advance_tail_after_read(&mut self) -> Result<()> {
+        self.advance_tail_impl(true)
+    }
+
+    /// Zero-copy consume: advance the tail cursor but keep the slot PINNED.
+    /// The view returned to the caller owns the physical release; until
+    /// then the send guard keeps the ring from wrapping onto the slot via
+    /// the pin floor.
+    fn advance_tail_keep_pinned(&mut self) -> Result<()> {
+        self.advance_tail_impl(false)
+    }
+
+    fn advance_tail_impl(&mut self, release_slot: bool) -> Result<()> {
         // Was the slot just consumed counted by the cursors? head strictly
         // ahead means yes; head == tail (or already tail-ahead) means the
         // slot was an orphan — occupied beyond the published head, credited
@@ -3304,13 +4210,15 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         let fwd = self.head_cursor.wrapping_sub(self.tail_cursor);
         let orphan = fwd == 0 || fwd > cap;
         let index = self.tail;
-        self.region.release_pinned_no_flush(index)?;
+        if release_slot {
+            self.region.release_pinned_no_flush(index)?;
+        }
         self.tail = (self.tail + 1) % self.config.capacity;
-        // Publish the FREE header and the advanced tail cursor (two
+        // Publish the FREE/PINNED header and the advanced tail cursor (two
         // page-local flushes; the cursor lives in the first page).
         self.tail_cursor = self.tail_cursor.wrapping_add(1);
         self.region.fetch_max_tail(self.tail_cursor)?;
-        // Publish the FREE header and the advanced tail cursor.
+        // Publish the header and the advanced tail cursor.
         self.region.flush_release(index)?;
         // `len` is re-derived from the cursors at the start of every
         // operation, so it can undercount while a producer is mid-write;
@@ -3516,7 +4424,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         let total_len = PersistentSlotRegion::<S>::total_len(config.capacity, region_slot_size)?;
         let (storage, created) =
             S::create_or_open(&path, config.capacity, region_slot_size, total_len)?;
-        let region = PersistentSlotRegion::<S>::from_storage(storage)?;
+        let region = std::sync::Arc::new(PersistentSlotRegion::<S>::from_storage(storage)?);
         if created {
             // Freshly created: initialise all slots as FREE and publish the
             // region magic last.
@@ -3867,9 +4775,10 @@ impl<S: FixedSlotStorage> ShmSpscChannel<S> {
 #[cfg(test)]
 mod tests {
     use super::{
-        process, region_magic, shm_region_path, FileSlotStorage, FixedSlotRegion, FixedSlotStorage,
-        MemorySlotStorage, MmapSlotStorage, PersistentShmChannel, PersistentSlotRegion,
-        ShmSpscChannel, SlotRegionIo, SlotState, REGION_HEADER_LEN,
+        process, region_magic, region_slot_offset, shm_region_path, FileSlotStorage,
+        FixedSlotRegion, FixedSlotStorage, MemorySlotStorage, MmapSlotStorage,
+        PersistentShmChannel, PersistentSlotRegion, ShmSpscChannel, SlotRegionIo, SlotState,
+        WriterIdentity, PIN_FLOOR_NONE, REGION_HEADER_LEN, ZERO_COPY_PAYLOAD_OFFSET,
     };
     use dsline_core::error::{ChannelError, DslineError};
     use dsline_core::{
@@ -5377,5 +6286,342 @@ mod tests {
         assert_eq!(consumer.recv_with_seq().expect("chunked").payload, chunked);
         assert_eq!(consumer.recv_with_seq().expect("gamma").payload, b"gamma");
         assert!(consumer.is_empty());
+    }
+
+    // ── Zero-copy alloc/publish (roadmap §4.2) ──
+
+    fn zero_copy_config(capacity: usize, slot_size: usize) -> SpscConfig {
+        persistent_config(capacity, slot_size)
+    }
+
+    #[test]
+    fn zero_copy_alloc_publish_recv_view_roundtrip() {
+        let path = test_file_path("zero-copy-roundtrip");
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, zero_copy_config(4, 64))
+                .expect("create");
+
+        let payload: Vec<u8> = (0..32u8).collect();
+        let mut lease = ch.alloc(payload.len()).expect("alloc");
+        assert_eq!(lease.seq(), 0);
+        assert_eq!(lease.size(), 32);
+        lease.write(0, &payload).expect("write payload");
+        let seq = ch.publish(&mut lease).expect("publish");
+        assert_eq!(seq, 0);
+        assert!(lease.is_sealed());
+
+        let mut view = ch.recv_view().expect("recv_view");
+        assert_eq!(view.seq(), 0);
+        assert_eq!(view.size(), 32);
+        assert_eq!(view.read_all().expect("read_all"), payload);
+        // Partial reads see the same bytes without pulling the rest.
+        assert_eq!(view.read(0, 4).expect("partial"), &payload[..4]);
+        assert_eq!(view.read(28, 4).expect("partial tail"), &payload[28..]);
+
+        view.release().expect("release");
+        assert!(view.is_released());
+        assert_eq!(ch.pinned_slots().expect("pinned"), 0);
+        assert_eq!(ch.len(), 0);
+    }
+
+    #[test]
+    fn zero_copy_seal_rejects_writes_and_double_publish() {
+        let path = test_file_path("zero-copy-seal");
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, zero_copy_config(2, 64))
+                .expect("create");
+
+        let mut lease = ch.alloc(8).expect("alloc");
+        lease.write(0, b"abcdefgh").expect("write");
+
+        ch.publish(&mut lease).expect("publish");
+        assert_eq!(
+            lease.write(0, b"X").expect_err("write after publish"),
+            DslineError::Channel(ChannelError::InvalidConfig(
+                "buffer is sealed: publish() already committed it"
+            ))
+        );
+        assert_eq!(
+            ch.publish(&mut lease).expect_err("double publish"),
+            DslineError::Channel(ChannelError::InvalidConfig("buffer is already published"))
+        );
+
+        // Bounds are enforced before publish too.
+        let lease2 = ch.alloc(4).expect("alloc 2");
+        assert!(lease2.write(3, b"ab").is_err());
+        assert!(lease2.write(0, b"abcde").is_err());
+        ch.abort(lease2).expect("abort scratch");
+    }
+
+    #[test]
+    fn zero_copy_abort_unwinds_and_reuses_the_slot() {
+        let path = test_file_path("zero-copy-abort");
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, zero_copy_config(2, 64))
+                .expect("create");
+
+        let lease = ch.alloc(8).expect("alloc");
+        let aborted_seq = lease.seq();
+        ch.abort(lease).expect("abort");
+
+        // The slot is reusable and the sequence rewound: the next send
+        // reuses both.
+        ch.send(b"hello").expect("send after abort");
+        let message = ch.recv_with_seq().expect("recv");
+        assert_eq!(message.seq, aborted_seq);
+        assert_eq!(message.payload, b"hello");
+
+        // Only the newest reservation can be unwound.
+        let first = ch.alloc(4).expect("alloc first");
+        let _second = ch.alloc(4).expect("alloc second");
+        assert_eq!(
+            ch.abort(first).expect_err("abort non-newest"),
+            DslineError::Channel(ChannelError::InvalidConfig(
+                "only the newest unpublished buffer can be aborted"
+            ))
+        );
+    }
+
+    #[test]
+    fn zero_copy_view_pins_the_ring_until_release() {
+        let path = test_file_path("zero-copy-pin-guard");
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, zero_copy_config(4, 64))
+                .expect("create");
+
+        ch.send(b"m0").expect("send 0");
+        ch.send(b"m1").expect("send 1");
+        ch.send(b"m2").expect("send 2");
+        let mut lease = ch.alloc(2).expect("alloc");
+        lease.write(0, b"m3").expect("write");
+        ch.publish(&mut lease).expect("publish");
+
+        // Pin slot 0 (cursor 0); cursors 1..3 are consumed normally.
+        let mut view = ch.recv_view().expect("recv_view");
+        assert_eq!(view.read_all().expect("read"), b"m0");
+        assert_eq!(ch.pinned_slots().expect("pinned"), 1);
+        ch.recv().expect("consume m1");
+        ch.recv().expect("consume m2");
+
+        // The ring is logically empty but the pin floor holds cursor 0:
+        // a send would claim cursor 4 = the same physical slot 0.
+        assert_eq!(
+            ch.send(b"m4").expect_err("send blocked by pin"),
+            DslineError::Channel(ChannelError::BufferFull)
+        );
+        // The pinned bytes are untouched by the failed attempts.
+        assert_eq!(view.read_all().expect("read still"), b"m0");
+
+        // Releasing raises the floor back to "none" and un-shrinks the
+        // guard; the ring wraps onto the released slot.
+        view.release().expect("release");
+        ch.send(b"m4").expect("send after release");
+        assert_eq!(ch.recv().expect("recv m3"), b"m3");
+        assert_eq!(ch.recv().expect("recv m4"), b"m4");
+    }
+
+    #[test]
+    fn zero_copy_two_views_out_of_order_release_keeps_floor() {
+        let path = test_file_path("zero-copy-two-views");
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, zero_copy_config(4, 64))
+                .expect("create");
+
+        for i in 0..3 {
+            ch.send(format!("m{i}").as_bytes()).expect("send");
+        }
+        let mut older = ch.recv_view().expect("view older");
+        let mut newer = ch.recv_view().expect("view newer");
+
+        // Releasing the newer view must not unblock the ring: the older
+        // pin still owns the floor.
+        newer.release().expect("release newer");
+        for i in 3..4 {
+            ch.send(format!("m{i}").as_bytes()).expect("fill");
+        }
+        assert_eq!(
+            ch.send(b"m4").expect_err("still pinned"),
+            DslineError::Channel(ChannelError::BufferFull)
+        );
+
+        older.release().expect("release older");
+        ch.send(b"m4").expect("send after both released");
+    }
+
+    #[test]
+    fn zero_copy_recv_view_rejects_chunked_and_drop_oldest() {
+        let path = test_file_path("zero-copy-chunked");
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, zero_copy_config(8, 64))
+                .expect("create");
+        // 100 payload bytes at 34 payload bytes per chunk slot = a
+        // 3-slot chunked message.
+        ch.send(&[7u8; 100]).expect("send chunked");
+        assert!(matches!(
+            ch.recv_view(),
+            Err(DslineError::Channel(ChannelError::InvalidConfig(_)))
+        ));
+        // The chunked message is untouched: the copy path still gets it.
+        assert_eq!(ch.recv().expect("copy path"), vec![7u8; 100]);
+    }
+
+    #[test]
+    fn zero_copy_alloc_rejected_on_mpsc_and_drop_oldest() {
+        let path = test_file_path("zero-copy-rejects");
+        let mut mpsc_config = zero_copy_config(4, 64);
+        mpsc_config.multi_producer = true;
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, mpsc_config).expect("create");
+        assert!(matches!(
+            ch.alloc(8),
+            Err(DslineError::Channel(ChannelError::InvalidConfig(_)))
+        ));
+
+        let path2 = test_file_path("zero-copy-drop-oldest");
+        let mut drop_config = zero_copy_config(4, 64);
+        drop_config.backpressure = Backpressure::DropOldest;
+        let mut ch2 =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path2, drop_config).expect("create");
+        assert!(matches!(
+            ch2.alloc(8),
+            Err(DslineError::Channel(ChannelError::InvalidConfig(_)))
+        ));
+        ch2.send(b"m").expect("send");
+        assert!(matches!(
+            ch2.recv_view(),
+            Err(DslineError::Channel(ChannelError::InvalidConfig(_)))
+        ));
+    }
+
+    #[test]
+    fn zero_copy_recv_view_detects_corrupted_payload() {
+        let path = test_file_path("zero-copy-corrupt");
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, zero_copy_config(2, 64))
+                .expect("create");
+
+        let mut lease = ch.alloc(8).expect("alloc");
+        lease.write(0, b"payload!").expect("write");
+        ch.publish(&mut lease).expect("publish");
+
+        // Corrupt the payload in place (simulating bit rot between publish
+        // and receive): the view's in-place checksum verify must catch it.
+        let corrupt_at = region_slot_offset(0, ch.region.slot_size()) + ZERO_COPY_PAYLOAD_OFFSET;
+        ch.region
+            .storage
+            .write_at(corrupt_at, b"X")
+            .expect("corrupt");
+        assert!(matches!(
+            ch.recv_view(),
+            Err(DslineError::Channel(ChannelError::CorruptedMessage))
+        ));
+    }
+
+    #[test]
+    fn zero_copy_open_reclaims_dead_consumer_pins() {
+        let path = test_file_path("zero-copy-dead-pins");
+        let (dead_pid, dead_start) = spawn_dead_identity();
+
+        // Simulate a consumer that pinned a view and died: a PINNED header
+        // with its (dead) identity, and the floor pointing at it.
+        {
+            let mut ch =
+                PersistentShmChannel::<MmapSlotStorage>::create(&path, zero_copy_config(4, 64))
+                    .expect("create");
+            ch.send(b"m0").expect("send");
+            let stamp = WriterIdentity {
+                pid: dead_pid,
+                start_time: dead_start,
+                epoch: 7,
+                timestamp_ns: 0,
+                reserved_slots: 1,
+            };
+            // frame_len = FRAME_HEADER_LEN + 2 payload bytes.
+            ch.region
+                .write_pinned_header(0, 0, FRAME_HEADER_LEN + 2, stamp)
+                .expect("write pinned header");
+            ch.region.store_floor(0).expect("store floor");
+            // A real pin is consumed: the tail cursor advanced past it.
+            ch.region.fetch_max_tail(1).expect("advance tail");
+        }
+
+        // Reopening rebuilds the state: the dead pin is reclaimed (the
+        // message was lost with its consumer), the floor returns to the
+        // "no pins" sentinel, and the ring is fully writable again.
+        let mut ch = PersistentShmChannel::<MmapSlotStorage>::open(&path, zero_copy_config(4, 64))
+            .expect("reopen");
+        assert_eq!(ch.reclaimed_slots, 1);
+        assert_eq!(ch.region.load_floor().expect("floor"), PIN_FLOOR_NONE);
+        assert!(ch.recv().is_err(), "pinned message died with its consumer");
+        for i in 0..4 {
+            ch.send(format!("n{i}").as_bytes())
+                .expect("ring un-shrunk after reclaim");
+        }
+    }
+
+    #[test]
+    fn zero_copy_second_handle_rebuilds_floor_for_live_pins() {
+        let path = test_file_path("zero-copy-live-pins");
+        let mut owner =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, zero_copy_config(4, 64))
+                .expect("create");
+        owner.send(b"m0").expect("send");
+        let mut view = owner.recv_view().expect("pin cursor 0");
+
+        // A second handle opens while the pin is live: the identity
+        // classifies as Alive, so the pin survives and the floor rebuilds
+        // to its cursor — the opener's send guard respects the pin.
+        let mut other =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, zero_copy_config(4, 64))
+                .expect("open second handle");
+        assert_eq!(other.reclaimed_slots, 0);
+        other.send(b"m1").expect("send 1");
+        other.send(b"m2").expect("send 2");
+        other.send(b"m3").expect("send 3");
+        assert_eq!(
+            other.send(b"m4").expect_err("pin blocks the other handle"),
+            DslineError::Channel(ChannelError::BufferFull)
+        );
+
+        view.release().expect("release");
+        other.send(b"m4").expect("send after release");
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn zero_copy_roundtrip_section_backend() {
+        let path = test_file_path("zero-copy-section");
+        let mut ch =
+            PersistentShmChannel::<SectionShmSlotStorage>::create(&path, zero_copy_config(4, 64))
+                .expect("create");
+
+        let payload: Vec<u8> = (b'a'..b'z').collect();
+        let mut lease = ch.alloc(payload.len()).expect("alloc");
+        lease.write(0, &payload).expect("write");
+        ch.publish(&mut lease).expect("publish");
+
+        let mut view = ch.recv_view().expect("recv_view");
+        assert_eq!(view.read_all().expect("read"), payload);
+        view.release().expect("release");
+        assert_eq!(ch.pinned_slots().expect("pinned"), 0);
+    }
+
+    #[test]
+    fn zero_copy_floor_sentinel_tracks_no_pins() {
+        // With zero-copy never used, the floor stays at the sentinel and
+        // the guard reduces to the plain cursor depth (regression guard
+        // for the PIN_FLOOR_NONE initialization).
+        let path = test_file_path("zero-copy-sentinel");
+        let mut ch =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, zero_copy_config(8, 64))
+                .expect("create");
+        assert_eq!(ch.region.load_floor().expect("floor"), PIN_FLOOR_NONE);
+        ch.send(b"a").expect("send a");
+        ch.recv().expect("recv a");
+        ch.send(b"b").expect("send b");
+        ch.send(b"c").expect("send c");
+        ch.send(b"d").expect("send d");
+        ch.send(b"e").expect("send e");
+        ch.send(b"f").expect("send f");
     }
 }

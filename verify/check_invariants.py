@@ -53,7 +53,7 @@ except ImportError:  # the replay section reports the skip itself
 CHUNK_METADATA_LEN = 42  # 3 TLVs x (2-byte type + 4-byte len + 8-byte value)
 FRAME_HEADER_LEN = 50
 PERSISTENT_SLOT_HEADER_LEN = 48  # incl. writer identity (pid/start_time/epoch/ts/reserved)
-REGION_HEADER_LEN = 24  # head: u64 @ 0, tail: u64 @ 8, init magic: u32 @ 16, format: u32 @ 20
+REGION_HEADER_LEN = 32  # head: u64 @ 0, tail: u64 @ 8, magic: u32 @ 16, format: u32 @ 20, pin_floor: u64 @ 24
 
 PASS = []
 FAIL = []
@@ -588,6 +588,81 @@ def check_z3():
         s.set(timeout=30000)
         record(f"Z5.3 hash shard for N={N} always lies in [0, N)",
                s.check() == unsat)
+
+    # ── Z6: the zero-copy pin-floor guard (roadmap §4.2/§4.4) ──
+    #
+    # A producer claiming cursors [head, head+needed) writes the physical
+    # slots of those cursors; the slot for cursor c is physically the slot
+    # of cursor c-capacity. A zero-copy view pins its slot's cursor value;
+    # pinned cursors form a set whose minimum is the pin floor, and every
+    # pinned cursor lies in [floor, tail) (pins are consumed cursors, and
+    # the floor is the smallest). The guard permits a claim only when
+    # head+needed <= floor+capacity. Z6.1 proves that condition sound: the
+    # claim range then never intersects the pinned window under the
+    # capacity shift. Z6.2 proves it tight: one slot over the guard can
+    # collide. Z6.3 proves the "no pins" sentinel degenerates to the
+    # classic SPSC guard (floor := tail).
+    CAP = 8
+
+    def pin_guard_premises(head, tail, floor, needed):
+        # Window discipline for a healthy ring: floor <= tail (pins are
+        # consumed), the floor sits within one ring window of the tail,
+        # the tail cannot lap the head by more than the capacity, and a
+        # claim is 1..CAP slots. The cursors themselves are monotonic u64
+        # counts that never wrap (the code's 2^63 window discipline), so
+        # the 16-bit model keeps them below 2^14 — the guard and collision
+        # comparisons must not wrap.
+        return And(
+            ULE(floor, tail),
+            ULE(tail - floor, BitVecVal(CAP, 16)),
+            ULE(tail - head, BitVecVal(CAP, 16)),
+            ULE(head, tail),  # normal regime: the head is not behind
+            ULE(BitVecVal(1, 16), needed),
+            ULE(needed, BitVecVal(CAP, 16)),
+            ULE(head, BitVecVal(1 << 14, 16)),
+        )
+
+    def collision(head, needed, floor, tail):
+        # Some CLAIMED cursor d in [head, head+needed) has its physical
+        # predecessor (d-CAP) inside the pinned window [floor, tail):
+        # within one ring window each residue appears exactly once, so the
+        # congruent pinned cursor is exactly d-CAP.
+        return Or(*[
+            And(ULT(BitVecVal(d, 16), needed),
+                ULE(floor, head + BitVecVal(d, 16) - BitVecVal(CAP, 16)),
+                ULT(head + BitVecVal(d, 16) - BitVecVal(CAP, 16), tail))
+            for d in range(CAP)
+        ])
+
+    # Z6.1: the guard is sound — no guarded claim touches a pinned slot.
+    head, tail, floor, needed = BitVecs("head tail floor needed", 16)
+    s = Solver()
+    s.set(timeout=20000)
+    s.add(pin_guard_premises(head, tail, floor, needed))
+    s.add(ULE(head + needed, floor + BitVecVal(CAP, 16)))  # the guard
+    s.add(collision(head, needed, floor, tail))
+    record("Z6.1 the pin-floor guard is sound: head+needed <= floor+cap "
+           "never touches a pinned slot", s.check() == unsat)
+
+    # Z6.2: the guard is tight — one slot over admits a collision.
+    s = Solver()
+    s.set(timeout=20000)
+    s.add(pin_guard_premises(head, tail, floor, needed))
+    s.add(head + needed == floor + BitVecVal(CAP + 1, 16))
+    s.add(collision(head, needed, floor, tail))
+    record("Z6.2 the guard is tight: one slot over the bound collides "
+           "(witness exists)", s.check() == sat)
+
+    # Z6.3: with no pins (the sentinel regime, floor := tail) the guard
+    # reduces to the classic SPSC bound and no collision is possible.
+    s = Solver()
+    s.set(timeout=20000)
+    s.add(pin_guard_premises(head, tail, floor, needed))
+    s.add(floor == tail)  # sentinel: no pins
+    s.add(ULE(head + needed, tail + BitVecVal(CAP, 16)))
+    s.add(collision(head, needed, floor, tail))
+    record("Z6.3 the sentinel degenerates to the classic SPSC guard "
+           "(no collision without pins)", s.check() == unsat)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1409,6 +1484,114 @@ def check_cp_sat():
     record("C12 broadcast delivers the whole stream to every shard "
            "(amplification N x B, no shard missed)", status == cp_model.INFEASIBLE)
 
+    # ── C13: the pin-floor guard prevents wrap onto a pinned slot ──
+    # Bounded schedule at the wrap boundary of a 4-slot ring. Setup: the
+    # head has filled cursors 0..3 (all consumed, tail = 4), so the next
+    # claim of n slots covers cursors 4..4+n-1 — the physical slots of
+    # cursors 0..n-1. Steps: pins (mark a cursor as held by a live
+    # zero-copy view) and releases (clear one, recompute the floor to the
+    # true minimum over the surviving pins — the same recompute
+    # `unpin_floor`'s scan performs; floor == CAP is the "no pins"
+    # sentinel). Violation sought: a guarded claim whose covered cursors'
+    # physical predecessors include a pinned cursor. Guarded: infeasible;
+    # unguarded: a violating schedule exists (the check bites).
+    CAP, H = 4, 5
+
+    def c13_model(enforce_guard):
+        m = cp_model.CpModel()
+        pin = [[m.NewBoolVar(f"p{k}_{c}") for c in range(CAP)] for k in range(H + 1)]
+        # floor == CAP is the sentinel: above every cursor, i.e. no pins.
+        floor = [m.NewIntVar(0, CAP, f"f{k}") for k in range(H + 1)]
+        m.Add(floor[0] == CAP)
+        for c in range(CAP):
+            m.Add(pin[0][c] == 0)
+
+        for k in range(H):
+            is_pin = m.NewBoolVar(f"pn{k}")
+            is_rel = m.NewBoolVar(f"rl{k}")
+            m.AddExactlyOne([is_pin, is_rel])
+            chosen = [m.NewBoolVar(f"ch{k}_{c}") for c in range(CAP)]
+            m.AddExactlyOne(chosen)
+            for c in range(CAP):
+                # Pin marks an unpinned cursor; release clears a pinned one.
+                m.Add(pin[k + 1][c] == 1).OnlyEnforceIf([is_pin, chosen[c]])
+                m.Add(pin[k + 1][c] == pin[k][c]).OnlyEnforceIf(
+                    [is_pin, chosen[c].Not()])
+                m.Add(pin[k + 1][c] == 0).OnlyEnforceIf([is_rel, chosen[c]])
+                m.Add(pin[k + 1][c] == pin[k][c]).OnlyEnforceIf(
+                    [is_rel, chosen[c].Not()])
+                m.AddImplication(chosen[c], pin[k][c].Not()).OnlyEnforceIf(is_pin)
+                m.AddImplication(chosen[c], pin[k][c]).OnlyEnforceIf(is_rel)
+            # Floor recompute: min over the surviving pins, else the
+            # sentinel — exactly `unpin_floor`'s ascending scan.
+            cands = []
+            for c in range(CAP):
+                cand = m.NewIntVar(0, CAP, f"cand{k}_{c}")
+                m.Add(cand == c).OnlyEnforceIf(pin[k + 1][c])
+                m.Add(cand == CAP).OnlyEnforceIf(pin[k + 1][c].Not())
+                cands.append(cand)
+            m.AddMinEquality(floor[k + 1], cands)
+
+        # The claim: n in {1, 2} at head = CAP (the wrap boundary). Guard:
+        # CAP + n <= floor_eff + CAP where floor_eff is the floor when pins
+        # exist and the tail (== CAP, the sentinel regime) otherwise.
+        is_n1 = m.NewBoolVar("n1")
+        is_n2 = m.NewBoolVar("n2")
+        m.AddExactlyOne([is_n1, is_n2])
+        has_pins = m.NewBoolVar("hp")
+        m.Add(floor[H] < CAP).OnlyEnforceIf(has_pins)
+        m.Add(floor[H] == CAP).OnlyEnforceIf(has_pins.Not())
+        if enforce_guard:
+            g1 = m.NewBoolVar("g1")
+            g2 = m.NewBoolVar("g2")
+            m.Add(1 <= floor[H]).OnlyEnforceIf([g1, has_pins])
+            m.Add(1 <= CAP).OnlyEnforceIf([g1, has_pins.Not()])
+            m.Add(2 <= floor[H]).OnlyEnforceIf([g2, has_pins])
+            m.Add(2 <= CAP).OnlyEnforceIf([g2, has_pins.Not()])
+            # The guard is what rules the violation out: a guarded claim
+            # may only fire when the floor leaves room for it. (No hardcoded
+            # claim/hit implication — the solver must derive safety from
+            # the floor arithmetic, which is exactly what we are checking.)
+            m.AddImplication(is_n1, g1)
+            m.AddImplication(is_n2, g2)
+
+        # Violation: the claim of size n covers cursor CAP+d (d < n), whose
+        # physical predecessor is cursor d — pinned means an overwritten
+        # view's bytes.
+        hit1 = m.NewBoolVar("hit1")
+        m.Add(hit1 == pin[H][0])
+        hit2 = m.NewBoolVar("hit2")
+        m.AddBoolOr([pin[H][0], pin[H][1]]).OnlyEnforceIf(hit2)
+        m.AddBoolAnd([pin[H][0].Not(), pin[H][1].Not()]).OnlyEnforceIf(hit2.Not())
+        return m, is_n1, hit1, is_n2, hit2
+
+    def c13_probe(enforce_guard, force_n2):
+        m, is_n1, hit1, is_n2, hit2 = c13_model(enforce_guard)
+        if force_n2:
+            m.Add(is_n2 == 1)
+            m.Add(hit2 == 1)
+        else:
+            m.Add(is_n1 == 1)
+            m.Add(hit1 == 1)
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = 30
+        return solver.Solve(m)
+
+    # Guarded: neither claim size can reach a violation.
+    guarded_clean = c13_probe(True, False) == cp_model.INFEASIBLE
+    guarded_clean = guarded_clean and c13_probe(True, True) == cp_model.INFEASIBLE
+    record("C13 guarded claims at the wrap boundary never touch a pinned "
+           "slot (n=1 and n=2 both infeasible)", guarded_clean)
+
+    # Unguarded: the same probe must find a violating schedule.
+    status = c13_probe(False, True)
+    witness = ""
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        witness = "violating schedule found with the guard disabled"
+    record("C13b without the guard the violation is reachable (check bites)",
+           status in (cp_model.OPTIMAL, cp_model.FEASIBLE), witness)
+
+
 def check_scip():
     import pyscipopt as scip
 
@@ -1652,6 +1835,37 @@ def check_scip():
     record("S9 round-robin balance is optimal: min-max load == ceil(P/N), "
            "max-min load == floor(P/N) (MIP optima)", ok, detail)
 
+    # ── S10: the zero-copy single-slot payload bound ──
+    # A zero-copy message must fit one slot: the frame (payload +
+    # FRAME_HEADER_LEN) must fit the region slot (slot_size +
+    # FRAME_HEADER_LEN of frame area after the 48-byte persistent header),
+    # and the channel's own payload capacity is slot_size. Both bounds
+    # coincide at payload == slot_size, so the MIP optimum over the two
+    # constraints is exactly the slot payload capacity — the same bound the
+    # Rust `alloc` enforces. Cross-checked here as an optimum (the MILP
+    # role: message-size formulas as optima).
+    ok = True
+    detail = ""
+    for slot in (16, 64, 4096):
+        model = scip.Model("zero-copy-bound")
+        model.hideOutput()
+        model.setParam("limits/time", 30)
+        payload = model.addVar(vtype="I", lb=0, ub=slot, name="payload")
+        region_slot = slot + FRAME_HEADER_LEN + PERSISTENT_SLOT_HEADER_LEN
+        # Region fit: frame <= region slot frame area.
+        model.addCons(payload + FRAME_HEADER_LEN
+                      <= region_slot - PERSISTENT_SLOT_HEADER_LEN)
+        # Channel capacity: payload <= slot_size (the alloc bound).
+        model.addCons(payload <= slot)
+        model.setObjective(payload, "maximize")
+        model.optimize()
+        optimum = int(model.getObjVal())
+        if optimum != slot:
+            ok = False
+            detail += f"slot {slot}: optimum {optimum} != {slot}; "
+    record("S10 max single-slot zero-copy payload == slot_size "
+           "(MIP optimum over the region-fit and capacity bounds)", ok, detail)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Replay — differential check against the real implementation
@@ -1746,7 +1960,7 @@ def check_replay():
             os.remove(path)
         except OSError:
             pass
-    record("R2 on-disk region size == 24 + capacity*(slot+98)", ok, detail)
+    record("R2 on-disk region size == 32 + capacity*(slot+98)", ok, detail)
 
     # ── R3: random schedule matches the reference model ──
     # The same bookkeeping the solvers model (depth = occupied slots,
@@ -2221,6 +2435,89 @@ def check_replay():
         fan2.close()
         record("R7c hash routing: the same key from two handles lands on "
                "the same shard (FNV-1a % shards)", ok, detail)
+
+    # ── R8: zero-copy alloc/publish/recv_view through the real channel ──
+    # The lease/seal/pin protocol end-to-end: publish seals the buffer,
+    # the view pins its slot (the send guard blocks the wrap), a second
+    # handle rebuilds the floor for the live pin, and the release
+    # un-shrinks the ring without the pinned bytes ever changing.
+    ok = True
+    detail = ""
+    name = f"verify-r8-{random.randrange(1 << 30):08x}"
+    ch = dsline.ShmChannel(
+        name, capacity=4, slot_size=64, backpressure=dsline.Backpressure.Raise
+    )
+    try:
+        buf = ch.alloc(9)
+        buf.write(b"ZEROCOPY!")
+        seq = ch.publish(buf)
+        if seq != 0:
+            ok = False
+            detail += f"publish seq {seq} != 0; "
+        try:
+            buf.write(b"x")
+            ok = False
+            detail += "write after publish did not raise; "
+        except ValueError:
+            pass
+        view = ch.recv_view()
+        if view.read_all() != b"ZEROCOPY!" or view.seq != 0:
+            ok = False
+            detail += f"view {view.read_all()!r} seq {view.seq}; "
+        if ch.stats()["pinned_slots"] != 1:
+            ok = False
+            detail += f"pinned {ch.stats()['pinned_slots']} != 1; "
+        # Fill the rest of the ring, then the pin must block the wrap.
+        ch.send(b"one")
+        ch.send(b"two")
+        ch.send(b"three")
+        try:
+            ch.send(b"four")
+            ok = False
+            detail += "send past the pin did not raise; "
+        except dsline.BufferFullError:
+            pass
+        # A second handle rebuilds the floor for the live pin: its send is
+        # blocked too (the next claimable cursor IS the pinned slot).
+        ch2 = dsline.ShmChannel(
+            name, capacity=4, slot_size=64, backpressure=dsline.Backpressure.Raise
+        )
+        try:
+            ch2.send(b"four")
+            ok = False
+            detail += "second handle send past the pin did not raise; "
+        except dsline.BufferFullError:
+            pass
+        # The pinned bytes are untouched by all the failed attempts.
+        if view.read_all() != b"ZEROCOPY!":
+            ok = False
+            detail += "pinned bytes changed; "
+        view.release()
+        try:
+            view.read_all()
+            ok = False
+            detail += "read after release did not raise; "
+        except ValueError:
+            pass
+        # The release un-shrinks the ring; the wrap reuses the freed slot.
+        ch.send(b"four")
+        drained = []
+        while len(drained) < 4:
+            try:
+                drained.append(ch.recv())
+            except dsline.BufferEmptyError:
+                break
+        if drained != [b"one", b"two", b"three", b"four"]:
+            ok = False
+            detail += f"drain {drained!r}; "
+        if ch.stats()["pinned_slots"] != 0:
+            ok = False
+            detail += f"pinned after release {ch.stats()['pinned_slots']}; "
+        ch2.close()
+    finally:
+        _release(ch)
+    record("R8 zero-copy lease/seal/pin floor through the real channel",
+           ok, detail)
 
 
 def main():

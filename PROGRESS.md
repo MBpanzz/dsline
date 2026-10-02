@@ -11,6 +11,43 @@
 
 ---
 
+## Update — 2026-10-02: zero-copy alloc/publish (roadmap §4.2/§4.3/§4.4)
+
+The last open 0.1.0 feature lands: the zero-copy path with the lease/seal/pin
+safety model (ADR-005).
+
+- **alloc/publish** (single-producer, single-slot): `alloc(size)` reserves a
+  slot and returns a writable lease into the shared region — the payload is
+  born in shared memory. `publish` verifies the checksum **in place**
+  (new `SlotRegionIo::with_slice` lock-window read, no copy-out), writes the
+  frame header over the payload, seals the lease, and commits. Python:
+  `ShmWriteBuffer` with `write()`/slice assignment, `ShmReadView` with
+  partial `read()`/`read_all()` — the transport never moves the bytes;
+  Python-side reads are explicit copies of the requested range until the
+  pyo3 0.23 buffer-protocol migration.
+- **Pin floor**: a `pin_floor` word in the region header (now 32 bytes,
+  format 3) records the smallest pinned cursor; every producer's send guard
+  derives occupancy from it, so the ring cannot wrap onto a slot a live
+  view reads. Guard theorem proven by Z3 (Z6.1 sound / Z6.2 tight / Z6.3
+  sentinel degeneration), bounded-model-checked by CP-SAT at the wrap
+  boundary with and without the guard (C13/C13b). CAS-structured updates:
+  a lost race at worst costs a spurious `BufferFull`, never a silent
+  overwrite.
+- **Crash recovery, consumer side**: dead consumers' pins are reclaimed by
+  identity (same decision table as dead writers) at open and in
+  `reclaim_stale()`; the open path rebuilds the floor from the ring; the
+  recovery bias no longer double-books pins in the normal cursor regime.
+- **Boundaries**: `alloc` is SPSC-only (MPSC reservation would head-of-line
+  block), zero-copy ops reject `DropOldest`, chunked messages stay on the
+  copy path, and Python reads copy the requested range (buffer-protocol
+  views are future work with pyo3 0.23).
+- **Tests**: 12 new Rust unit tests (68 → 80), 18 new Python tests
+  (114 → 132, including a cross-process test where a spinning producer must
+  not overwrite the pinned message), 7 new solver checks (77 → 84: Z6.1–3,
+  C13/C13b, S10, R8).
+
+---
+
 ## Update — 2026-09-06: sharded multi-consumer channel (分片 MPMC)
 
 The channel layer gains the roadmap §5.5 multi-consumer design — not a
@@ -530,14 +567,21 @@ These numbers are expected for the 0.0.1 in-process prototype and are published 
 
 ## Next Milestone: 0.1.0
 
-Priority order:
+Done since this list was written: MPSC (CAS reservation), Windows
+paging-file sections, sharded MPMC, crash recovery, zero-copy alloc/publish.
 
-1. **OS shared memory backend** (Linux POSIX shm) — unblocks real multi-process performance testing
-2. **Arena-backed variable-length allocator** — current support uses multi-slot chunking
-3. **MPSC** — multi-producer CAS on head
-4. **Pipeline runtime** — tokio background thread, run/start/stop
-5. **Benchmark: dsline vs mp.Queue in multi-process** — the defining performance test
-6. **PyPI release** — `pip install dsline`
+Remaining for 0.1.0:
+
+1. **Benchmark: dsline vs mp.Queue in multi-process** — the defining performance test
+2. **PyPI release** — `pip install dsline`
+
+Then (0.2.0+):
+
+- **Linux POSIX shm backend** — unblocks real multi-process performance testing there
+- **MPSC zero-copy alloc** — needs the Cancelled slot state so the gate can skip unwound reservations
+- **Buffer-protocol views / numpy interop** — pyo3 0.23 `__getbuffer__` migration
+- **Arena-backed variable-length allocator** — current support uses multi-slot chunking
+- **Pipeline runtime** — tokio background thread, run/start/stop
 
 ---
 

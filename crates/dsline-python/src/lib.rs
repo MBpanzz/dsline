@@ -6,7 +6,7 @@ use dsline_shm::{shm_region_path, MmapSlotStorage, PersistentShmChannel};
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PyType};
+use pyo3::types::{PyBytes, PyDict, PyList, PyModule, PySlice, PyType};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -183,6 +183,7 @@ impl ShmChannel {
         stats.set_item("expected_recv_sequence", channel.expected_recv_sequence())?;
         stats.set_item("last_received_sequence", channel.last_received_sequence())?;
         stats.set_item("reclaimed_slots", channel.reclaimed_slots())?;
+        stats.set_item("pinned_slots", channel.pinned_slots().map_err(to_py_err)?)?;
         stats.set_item("closed", channel.is_closed())?;
         stats.set_item("empty", channel.is_empty())?;
         Ok(stats)
@@ -213,6 +214,65 @@ impl ShmChannel {
         channel
             .debug_leave_zombie(seq, pid, start_time, reserved_slots)
             .map_err(to_py_err)
+    }
+
+    // ── Zero-copy alloc/publish (roadmap §4.2) ──
+
+    /// Reserve a slot for a zero-copy message and return a writable buffer
+    /// whose writes land directly in the shared region. Publish it with
+    /// `publish()` (or free it with `abort()`); the buffer seals on
+    /// publish and rejects further writes.
+    fn alloc(&self, size: usize) -> PyResult<ShmWriteBuffer> {
+        let mut channel = self.lock_channel()?;
+        let lease = channel.alloc(size).map_err(to_py_err)?;
+        Ok(ShmWriteBuffer {
+            inner: Mutex::new(Some(lease)),
+        })
+    }
+
+    /// Seal and commit a zero-copy buffer allocated by `alloc`: checksum
+    /// the payload in place, write the frame header, flip the slot to
+    /// COMMITTED, publish the head cursor. The buffer seals — further
+    /// writes raise `ValueError`.
+    fn publish(&self, buffer: &Bound<'_, ShmWriteBuffer>) -> PyResult<u64> {
+        let mut channel = self.lock_channel()?;
+        let buf_ref = buffer.borrow();
+        let mut slot = buf_ref
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("buffer lock is poisoned"))?;
+        let lease = slot
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("buffer was already aborted"))?;
+        channel.publish(lease).map_err(to_py_err)
+    }
+
+    /// Free an unpublished `alloc` reservation. Only the newest
+    /// unpublished buffer of the handle can be unwound.
+    fn abort(&self, buffer: &Bound<'_, ShmWriteBuffer>) -> PyResult<()> {
+        let mut channel = self.lock_channel()?;
+        let buf_ref = buffer.borrow();
+        let mut slot = buf_ref
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("buffer lock is poisoned"))?;
+        let lease = slot
+            .take()
+            .ok_or_else(|| PyValueError::new_err("buffer was already aborted"))?;
+        channel.abort(lease).map_err(to_py_err)
+    }
+
+    /// Receive the next message as a zero-copy view over the shared
+    /// region. The view pins its slot until released (`release()`, the
+    /// `with` block, or dropping the object): while pinned, producers
+    /// cannot wrap the ring onto it. Partial reads (`view.read(off, n)`)
+    /// copy only the requested bytes.
+    fn recv_view(&self) -> PyResult<ShmReadView> {
+        let mut channel = self.lock_channel()?;
+        let view = channel.recv_view().map_err(to_py_err)?;
+        Ok(ShmReadView {
+            inner: Mutex::new(Some(view)),
+        })
     }
 
     fn __len__(&self) -> PyResult<usize> {
@@ -407,7 +467,7 @@ impl FileChannel {
         stats.set_item("expected_recv_sequence", channel.expected_recv_sequence())?;
         stats.set_item("last_received_sequence", channel.last_received_sequence())?;
         stats.set_item("reclaimed_slots", channel.reclaimed_slots())?;
-        stats.set_item("reclaimed_slots", channel.reclaimed_slots())?;
+        stats.set_item("pinned_slots", channel.pinned_slots().map_err(to_py_err)?)?;
         stats.set_item("closed", channel.is_closed())?;
         stats.set_item("empty", channel.is_empty())?;
         Ok(stats)
@@ -443,12 +503,342 @@ impl FileChannel {
             .map_err(to_py_err)
     }
 
+    // ── Zero-copy alloc/publish (roadmap §4.2) ──
+    //
+    // Same protocol as ShmChannel; on FileChannel the "shared region" is
+    // the mapped file (a deleted-while-mapped caveat applies on Windows —
+    // a live view keeps the mapping, and therefore the file, alive).
+
+    /// Reserve a slot for a zero-copy message and return a writable buffer
+    /// whose writes land directly in the mapped file.
+    fn alloc(&self, size: usize) -> PyResult<ShmWriteBuffer> {
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+        let lease = channel.alloc(size).map_err(to_py_err)?;
+        Ok(ShmWriteBuffer {
+            inner: Mutex::new(Some(lease)),
+        })
+    }
+
+    /// Seal and commit a zero-copy buffer allocated by `alloc`.
+    fn publish(&self, buffer: &Bound<'_, ShmWriteBuffer>) -> PyResult<u64> {
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+        let buf_ref = buffer.borrow();
+        let mut slot = buf_ref
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("buffer lock is poisoned"))?;
+        let lease = slot
+            .as_mut()
+            .ok_or_else(|| PyValueError::new_err("buffer was already aborted"))?;
+        channel.publish(lease).map_err(to_py_err)
+    }
+
+    /// Free an unpublished `alloc` reservation.
+    fn abort(&self, buffer: &Bound<'_, ShmWriteBuffer>) -> PyResult<()> {
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+        let buf_ref = buffer.borrow();
+        let mut slot = buf_ref
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("buffer lock is poisoned"))?;
+        let lease = slot
+            .take()
+            .ok_or_else(|| PyValueError::new_err("buffer was already aborted"))?;
+        channel.abort(lease).map_err(to_py_err)
+    }
+
+    /// Receive the next message as a zero-copy view over the mapped file.
+    fn recv_view(&self) -> PyResult<ShmReadView> {
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+        let view = channel.recv_view().map_err(to_py_err)?;
+        Ok(ShmReadView {
+            inner: Mutex::new(Some(view)),
+        })
+    }
+
     fn __len__(&self) -> PyResult<usize> {
         Ok(self
             .channel
             .lock()
             .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?
             .len())
+    }
+}
+
+// ── Zero-copy buffer/view objects (shared by both channel types) ──
+
+/// A writable handle into the shared region returned by
+/// `ShmChannel.alloc()` / `FileChannel.alloc()`.
+///
+/// Write the payload with `write()` (or slice assignment
+/// ``buf[0:4] = b"...."``), then hand it to the channel's ``publish()``.
+/// Publishing seals the buffer: further writes raise `ValueError`, and the
+/// message becomes visible to consumers. Dropping the buffer without
+/// publishing leaves the slot WRITING — freed when this process exits
+/// (crash recovery), or immediately via `channel.abort(buf)`.
+#[pyclass]
+struct ShmWriteBuffer {
+    inner: Mutex<Option<dsline_shm::ShmWriteLease>>,
+}
+
+#[pymethods]
+impl ShmWriteBuffer {
+    /// Write `data` (a bytes-like object) into the payload at `offset`,
+    /// directly into the shared region.
+    #[pyo3(signature = (data, offset=0))]
+    fn write(&self, py: Python<'_>, data: &Bound<'_, PyAny>, offset: usize) -> PyResult<()> {
+        let bytes_type = PyModule::import_bound(py, "builtins")?.getattr("bytes")?;
+        let bytes_obj = bytes_type.call1((data,))?;
+        let bytes = bytes_obj.downcast::<PyBytes>()?.as_bytes();
+        let slot = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("buffer lock is poisoned"))?;
+        let lease = slot
+            .as_ref()
+            .ok_or_else(|| PyValueError::new_err("buffer was already aborted"))?;
+        lease.write(offset, bytes).map_err(to_py_err)
+    }
+
+    /// Slice assignment: ``buf[start:stop] = data`` writes into the
+    /// region in place (step must be 1). Int keys are not supported — use
+    /// ``write()`` with an offset instead.
+    fn __setitem__(
+        &self,
+        py: Python<'_>,
+        key: &Bound<'_, PyAny>,
+        value: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let slice = key
+            .downcast::<PySlice>()
+            .map_err(|_| PyValueError::new_err("buffer indices must be slices"))?;
+        let size = self.size()?;
+        let indices = slice.indices(size as i32)?;
+        if indices.step != 1 {
+            return Err(PyValueError::new_err("slice step must be 1"));
+        }
+        let start = indices.start as usize;
+        let length = indices.slicelength as usize;
+        let bytes_type = PyModule::import_bound(py, "builtins")?.getattr("bytes")?;
+        let bytes_obj = bytes_type.call1((value,))?;
+        let bytes = bytes_obj.downcast::<PyBytes>()?.as_bytes();
+        if bytes.len() != length {
+            return Err(PyValueError::new_err(format!(
+                "slice length {} does not match data length {}",
+                length,
+                bytes.len()
+            )));
+        }
+        self.write(py, value, start as usize)
+    }
+
+    fn __len__(&self) -> PyResult<usize> {
+        self.size()
+    }
+
+    #[getter]
+    fn size(&self) -> PyResult<usize> {
+        self.with_lease(|lease| Ok(lease.size()))
+    }
+
+    #[getter]
+    fn seq(&self) -> PyResult<u64> {
+        self.with_lease(|lease| Ok(lease.seq()))
+    }
+
+    #[getter]
+    fn slot_index(&self) -> PyResult<usize> {
+        self.with_lease(|lease| Ok(lease.slot_index()))
+    }
+
+    #[getter]
+    fn sealed(&self) -> PyResult<bool> {
+        self.with_lease(|lease| Ok(lease.is_sealed()))
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.with_lease(|lease| {
+            Ok(format!(
+                "<ShmWriteBuffer seq={} size={} sealed={}>",
+                lease.seq(),
+                lease.size(),
+                lease.is_sealed()
+            ))
+        })
+    }
+}
+
+impl ShmWriteBuffer {
+    /// Run `f` with the lease, under the buffer lock. Aborted buffers
+    /// (lease already taken by `abort`) raise `ValueError`.
+    fn with_lease<R>(
+        &self,
+        f: impl FnOnce(&dsline_shm::ShmWriteLease) -> PyResult<R>,
+    ) -> PyResult<R> {
+        let slot = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("buffer lock is poisoned"))?;
+        match slot.as_ref() {
+            Some(lease) => f(lease),
+            None => Err(PyValueError::new_err("buffer was already aborted")),
+        }
+    }
+}
+
+/// A read-only zero-copy view returned by `ShmChannel.recv_view()` /
+/// `FileChannel.recv_view()`.
+///
+/// The view pins its slot: the message is consumed, but the payload bytes
+/// stay valid in the shared region until the view is released
+/// (`release()`, leaving the `with` block, or dropping the object).
+/// While any view is pinned, producers cannot wrap the ring onto its slot
+/// — release views promptly or the ring fills to a standstill. Reads copy
+/// exactly the requested bytes out of the region; the transport itself
+/// never moves them.
+#[pyclass]
+struct ShmReadView {
+    inner: Mutex<Option<dsline_shm::ShmRecvView>>,
+}
+
+#[pymethods]
+impl ShmReadView {
+    /// Copy `size` bytes (default: to the end) of the payload starting at
+    /// `offset` out of the shared region.
+    #[pyo3(signature = (offset=0, size=None))]
+    fn read<'py>(
+        &self,
+        py: Python<'py>,
+        offset: usize,
+        size: Option<usize>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        self.with_view(|view| {
+            let len = view.size();
+            let end = size.unwrap_or(len.saturating_sub(offset));
+            let data = view.read(offset, end).map_err(to_py_err)?;
+            Ok(PyBytes::new_bound(py, &data))
+        })
+    }
+
+    /// Copy the whole payload out of the shared region.
+    fn read_all<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        self.with_view(|view| {
+            let data = view.read_all().map_err(to_py_err)?;
+            Ok(PyBytes::new_bound(py, &data))
+        })
+    }
+
+    /// ``view[i]`` → one payload byte as int; ``view[a:b]`` → bytes.
+    fn __getitem__<'py>(&self, py: Python<'py>, key: &Bound<'_, PyAny>) -> PyResult<PyObject> {
+        if let Ok(index) = key.extract::<usize>() {
+            return self.with_view(|view| {
+                let byte = view.read(index, 1).map_err(to_py_err)?;
+                Ok((byte[0] as i32).to_object(py))
+            });
+        }
+        if let Ok(slice) = key.downcast::<PySlice>() {
+            let size = self.with_view(|view| Ok(view.size()))?;
+            let indices = slice.indices(size as i32)?;
+            if indices.step != 1 {
+                return Err(PyValueError::new_err("slice step must be 1"));
+            }
+            let start = indices.start as usize;
+            let length = indices.slicelength as usize;
+            return self.with_view(|view| {
+                let data = view.read(start as usize, length).map_err(to_py_err)?;
+                Ok(PyBytes::new_bound(py, &data).to_object(py))
+            });
+        }
+        Err(PyValueError::new_err(
+            "view indices must be integers or slices",
+        ))
+    }
+
+    fn __len__(&self) -> PyResult<usize> {
+        self.with_view(|view| Ok(view.size()))
+    }
+
+    /// Release the view: its slot returns to FREE and the pin floor
+    /// advances. Idempotence is rejected — a double release is a bug.
+    fn release(&self) -> PyResult<()> {
+        let mut slot = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("view lock is poisoned"))?;
+        match slot.as_mut() {
+            Some(view) => view.release().map_err(to_py_err),
+            None => Err(PyValueError::new_err("view is already released")),
+        }
+    }
+
+    #[getter]
+    fn released(&self) -> PyResult<bool> {
+        let slot = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("view lock is poisoned"))?;
+        Ok(slot.as_ref().map(|view| view.is_released()).unwrap_or(true))
+    }
+
+    #[getter]
+    fn seq(&self) -> PyResult<u64> {
+        self.with_view(|view| Ok(view.seq()))
+    }
+
+    #[getter]
+    fn size(&self) -> PyResult<usize> {
+        self.with_view(|view| Ok(view.size()))
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &self,
+        _exc_type: Option<&Bound<'_, PyType>>,
+        _exc: Option<&Bound<'_, PyAny>>,
+        _tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        self.release()?;
+        Ok(false)
+    }
+
+    fn __repr__(&self) -> PyResult<String> {
+        self.with_view(|view| {
+            Ok(format!(
+                "<ShmReadView seq={} size={}>",
+                view.seq(),
+                view.size()
+            ))
+        })
+    }
+}
+
+impl ShmReadView {
+    /// Run `f` with the view, under the view lock. Released views raise
+    /// `ValueError` (an access-after-release is a bug, not an empty read).
+    fn with_view<R>(&self, f: impl FnOnce(&dsline_shm::ShmRecvView) -> PyResult<R>) -> PyResult<R> {
+        let slot = self
+            .inner
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("view lock is poisoned"))?;
+        match slot.as_ref() {
+            Some(view) => f(view),
+            None => Err(PyValueError::new_err("view is already released")),
+        }
     }
 }
 
@@ -1035,6 +1425,8 @@ fn _dsline(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Backpressure>()?;
     module.add_class::<ShmChannel>()?;
     module.add_class::<FileChannel>()?;
+    module.add_class::<ShmWriteBuffer>()?;
+    module.add_class::<ShmReadView>()?;
     module.add_class::<PyPipeline>()?;
     module.add_function(wrap_pyfunction!(process_identity, module)?)?;
     module.add("DslineError", _py.get_type_bound::<DslineErrorPy>())?;

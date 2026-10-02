@@ -13,9 +13,10 @@ Current boundaries:
 - `ShmChannel` is a named shared-memory channel: every process that uses the same `name` (and the same capacity and slot_size) connects to the same memory-mapped region. On Windows the region lives in a named paging-file section (no backing file, destroyed when the last handle closes); elsewhere region files live in the platform runtime directory (e.g. `%LOCALAPPDATA%\dsline\shm\` on Windows, `$XDG_RUNTIME_DIR`/`$TMPDIR` on Unix, used only when falling back to the file backend). `FileChannel` memory-maps an explicit file path the same way.
 - `send/recv` for existing bytes uses a copy path.
 - Messages larger than one slot are supported through multi-slot chunking; each chunk still uses fixed-slot storage.
-- `alloc/publish` zero-copy APIs are not exposed.
-- Multi-consumer delivery is available through the sharded fan-out (`ShardedChannel`); a lock-free multi-consumer ring and anonymous OS shared memory (no backing file) are still future work on Unix. (`multi_producer=True` gives multi-producer / single-consumer.) Crash recovery is implemented: writers record `pid + start_time` in every WRITING slot header, and a leftover slot is reclaimed — at open or at the receive gate — once a platform probe proves the writer identity is gone (`GetProcessTimes` on Windows, `/proc` on Linux; unknown platforms default to no auto-reclaim, and a live writer's slots are never touched). In multi-producer mode the reclaim frees the dead reservation's recorded extent and advances the tail past it, so a live message behind a dead producer is delivered instead of wedging the ring. `reclaim_stale()` exposes the explicit owner cleanup, and `stats()["reclaimed_slots"]` reports what a handle has reclaimed.
-- On Windows a `FileChannel` region file cannot be deleted while a channel still holds its mapping (standard memory-mapped file behavior); drop the channel first.
+- Zero-copy `alloc/publish` (roadmap §4.2) is exposed for single-slot messages: `alloc(size)` returns a writable lease into the shared region, `publish(buf)` seals it (further writes raise) and commits the slot, and `recv_view()` returns a view whose reads go straight to the region — the transport never moves the bytes. While a view is alive its slot is pinned: a shared pin-floor word feeds every producer's send guard, so the ring cannot wrap onto a slot a consumer is still reading; views are released explicitly, by drop, or by the open-time reclaim when their consumer died. Boundaries: `alloc` is single-producer only, both reject `DropOldest` channels, chunked messages stay on the copy path, and Python reads are explicit copies of the requested range (buffer-protocol views need pyo3 0.23 and are future work). See ADR-005 and `docs/README.md` for the safety model.
+- Multi-consumer delivery is available through the sharded fan-out (`ShardedChannel`); a lock-free multi-consumer ring and anonymous OS shared memory (no backing file) are still future work on Unix. (`multi_producer=True` gives multi-producer / single-consumer.) Crash recovery is implemented: writers record `pid + start_time` in every WRITING slot header, and a leftover slot is reclaimed — at open or at the receive gate — once a platform probe proves the writer identity is gone (`GetProcessTimes` on Windows, `/proc` on Linux; unknown platforms default to no auto-reclaim, and a live writer's slots are never touched). In multi-producer mode the reclaim frees the dead reservation's recorded extent and advances the tail past it, so a live message behind a dead producer is delivered instead of wedging the ring. The same identity protocol covers zero-copy pins (a consumer that died holding views). `reclaim_stale()` exposes the explicit owner cleanup, and `stats()["reclaimed_slots"]` / `stats()["pinned_slots"]` report what a handle has reclaimed and how many slots are currently pinned.
+- On Windows a `FileChannel` region file cannot be deleted while a channel (or a live zero-copy view) still holds its mapping (standard memory-mapped file behavior); drop the channel first.
+- The on-region layout version is now 3 (region header grew to 32 bytes for the pin floor). Regions written by older builds are rejected at open — delete stale region files when upgrading.
 
 ## Install for development
 
@@ -33,6 +34,22 @@ with dsline.ShmChannel("demo", capacity=4, slot_size=64) as ch:
     assert ch.stats()["queue_depth"] == 2
     assert ch.recv_with_seq() == (0, b"hello")
     assert ch.recv() == b"view"
+```
+
+Zero-copy path for single-slot messages (roadmap §4.2):
+
+```python
+import dsline
+
+with dsline.ShmChannel("demo", capacity=8, slot_size=4096) as ch:
+    buf = ch.alloc(1024)          # writable lease into the shared region
+    buf.write(b"...", offset=0)   # data is born in shared memory
+    seq = ch.publish(buf)         # seals the buffer, commits the slot
+
+    view = ch.recv_view()         # read-only view over the same bytes
+    assert view.seq == seq
+    data = view.read(0, 16)       # copy only what you need
+    view.release()                # un-pin the slot (or `del` / with-block)
 ```
 
 Cross-process usage: two processes that open the same name see the same region.
@@ -82,7 +99,7 @@ Zero-copy wording follows the project rule:
 Implemented prototype pieces:
 
 - `dsline-core`: fixed-slot SPSC bytes ring, checksum, Frame header, chunk flags, and metadata TLV encode/decode.
-- `dsline-shm`: slot-region byte-range storage trait with file and memory-mapped (OS shared memory) backends, region state model, cross-process SPSC bytes channel over `FREE`, `WRITING`, `COMMITTED`, `PINNED`, and `CORRUPTED` with shared head/tail cursor words in the region header (O(1) per-operation refresh; the slot-header scan runs once at open for sequence recovery and crashed-writer cleanup), multi-slot chunked messages, an opt-in multi-producer (MPSC) mode that reserves head with a hardware CAS, crash recovery via writer identity (`pid + start_time` probed through platform APIs before reclaim), and name→region resolution for named channels.
+- `dsline-shm`: slot-region byte-range storage trait with file and memory-mapped (OS shared memory) backends, region state model, cross-process SPSC bytes channel over `FREE`, `WRITING`, `COMMITTED`, `PINNED`, and `CORRUPTED` with shared head/tail cursor words in the region header (O(1) per-operation refresh; the slot-header scan runs once at open for sequence recovery and crashed-writer cleanup), multi-slot chunked messages, an opt-in multi-producer (MPSC) mode that reserves head with a hardware CAS, crash recovery via writer identity (`pid + start_time` probed through platform APIs before reclaim), name→region resolution for named channels, and the zero-copy lease/view layer (roadmap §4.2): `alloc` reserves a slot and writes into the region directly, `publish` seals the lease and commits it, `recv_view` pins the slot behind a shared pin-floor word that feeds every producer's send guard, and dead consumers' pins are reclaimed by identity at open.
 - `dsline-python`: PyO3 `ShmChannel` (named, cross-process shared memory) and `FileChannel` (mmap-backed file) bindings over the `dsline-shm` core, Python exception exports, `send()` support for bytes-like inputs (`bytes`, `bytearray`, `memoryview`, and compatible buffer objects), `recv_with_seq()`, `Block`/`Raise`/`DropNewest`/`DropOldest` backpressure, and `stats()` with queue, sequence, and message-size limits.
 - Multi-consumer delivery is provided by the sharded fan-out (roadmap §5.5): `dsline.ShardedChannel(name, shards=N, strategy="round_robin"|"hash"|"broadcast")` composes N named channels and routes each message to one shard (per-producer round-robin, or stateless FNV-1a hash of a routing key so per-key ordering survives) or to all of them (broadcast). Consumers bind one shard via `fan.shard(i)` — the roadmap's "N 个 channel + 路由层" MPMC, no lock-free multi-consumer ring involved.
 - The Python `Pipeline` supports the declarative roadmap API: `from_transport("shm://...").pipe(ops.filter_expr(...), ops.map_expr(...), ops.batch(...)).sink("shm://...")` with `dsline.ops` deferred operators, plus `run()` that drains the source, applies the operators, and sends each result into the sink channel as bytes.

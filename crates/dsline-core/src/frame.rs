@@ -79,6 +79,36 @@ pub fn encode_frame(
     metadata: &[Metadata],
     payload: &[u8],
 ) -> Result<Vec<u8>> {
+    let header = encode_frame_header(
+        kind,
+        flags,
+        seq,
+        timestamp_ns,
+        schema_hash,
+        checksum32(payload),
+        payload.len(),
+        metadata,
+    )?;
+    let mut out = Vec::with_capacity(header.len() + payload.len());
+    out.extend_from_slice(&header);
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+/// Build only the frame header (fixed 50-byte part plus the metadata TLVs)
+/// for a payload that is written separately — the zero-copy alloc/publish
+/// path, where the checksum must be computed over payload bytes that never
+/// leave shared memory.
+pub fn encode_frame_header(
+    kind: FrameKind,
+    flags: u16,
+    seq: u64,
+    timestamp_ns: u64,
+    schema_hash: u64,
+    checksum: u32,
+    payload_len: usize,
+    metadata: &[Metadata],
+) -> Result<Vec<u8>> {
     let metadata_len = metadata.iter().try_fold(0usize, |total, item| {
         total
             .checked_add(TLV_HEADER_LEN)
@@ -91,28 +121,35 @@ pub fn encode_frame(
     let header_len_u32 =
         u32::try_from(header_len).map_err(|_| ProtocolError::HeaderLengthOverflow)?;
 
-    let mut out = Vec::with_capacity(header_len + payload.len());
+    let payload_len_u64 =
+        u64::try_from(payload_len).map_err(|_| ProtocolError::HeaderLengthOverflow)?;
+
+    let mut out = Vec::with_capacity(header_len);
     push_u32(&mut out, FRAME_MAGIC);
     push_u16(&mut out, FRAME_VERSION);
     push_u16(&mut out, flags);
     push_u16(&mut out, kind as u16);
     push_u32(&mut out, header_len_u32);
-    push_u64(&mut out, payload.len() as u64);
+    push_u64(&mut out, payload_len_u64);
     push_u64(&mut out, seq);
     push_u64(&mut out, timestamp_ns);
     push_u64(&mut out, schema_hash);
-    push_u32(&mut out, checksum32(payload));
+    push_u32(&mut out, checksum);
 
     for item in metadata {
         push_u16(&mut out, item.ty);
         push_u32(&mut out, item.value.len() as u32);
         out.extend_from_slice(&item.value);
     }
-    out.extend_from_slice(payload);
     Ok(out)
 }
 
-pub fn decode_frame(bytes: &[u8]) -> Result<Frame> {
+/// Parse only the frame header from the first bytes of a frame, without
+/// requiring the payload to follow in the same buffer. Returns the header
+/// and the total frame length (`header_len + payload_len`), so a caller
+/// reading straight from shared memory can validate the layout before
+/// handing out a view over the payload bytes.
+pub fn decode_frame_header(bytes: &[u8]) -> Result<(FrameHeader, usize)> {
     if bytes.len() < FRAME_HEADER_LEN {
         return Err(ProtocolError::FrameTooShort {
             len: bytes.len(),
@@ -141,35 +178,19 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame> {
         }
         .into());
     }
-    if bytes.len() < header_len {
-        return Err(ProtocolError::FrameTooShort {
-            len: bytes.len(),
-            minimum: header_len,
-        }
-        .into());
-    }
 
     let payload_len = read_u64(bytes, 14);
-    let available_payload = bytes.len() - header_len;
-    if payload_len > available_payload as u64 {
-        return Err(ProtocolError::InvalidPayloadLength {
-            declared: payload_len,
-            available: available_payload,
-        }
-        .into());
-    }
-
     let seq = read_u64(bytes, 22);
     let timestamp_ns = read_u64(bytes, 30);
     let schema_hash = read_u64(bytes, 38);
     let checksum = read_u32(bytes, 46);
 
-    let metadata = decode_metadata(bytes, header_len)?;
-    let payload_end = header_len + payload_len as usize;
-    let payload = bytes[header_len..payload_end].to_vec();
+    let total_len = header_len
+        .checked_add(payload_len as usize)
+        .ok_or(ProtocolError::HeaderLengthOverflow)?;
 
-    Ok(Frame {
-        header: FrameHeader {
+    Ok((
+        FrameHeader {
             flags,
             kind,
             header_len: header_len as u32,
@@ -179,6 +200,36 @@ pub fn decode_frame(bytes: &[u8]) -> Result<Frame> {
             schema_hash,
             checksum,
         },
+        total_len,
+    ))
+}
+
+pub fn decode_frame(bytes: &[u8]) -> Result<Frame> {
+    let (header, _total_len) = decode_frame_header(bytes)?;
+    let header_len = header.header_len as usize;
+    let payload_len = header.payload_len as usize;
+    if bytes.len() < header_len {
+        return Err(ProtocolError::FrameTooShort {
+            len: bytes.len(),
+            minimum: header_len,
+        }
+        .into());
+    }
+    let available_payload = bytes.len() - header_len;
+    if payload_len > available_payload {
+        return Err(ProtocolError::InvalidPayloadLength {
+            declared: header.payload_len,
+            available: available_payload,
+        }
+        .into());
+    }
+
+    let metadata = decode_metadata(bytes, header_len)?;
+    let payload_end = header_len + payload_len;
+    let payload = bytes[header_len..payload_end].to_vec();
+
+    Ok(Frame {
+        header,
         metadata,
         payload,
     })
