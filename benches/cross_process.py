@@ -18,7 +18,8 @@ queue.Queue, ZeroMQ inproc, pynng inproc.
 Notes on fairness:
   - every backend transfers raw byte payloads of the same sizes;
   - mp.Queue additionally pays pickle serialization (documented);
-  - dsline/shm_stdlib consumers spin on an empty ring; mp/zmq consumers block;
+  - dsline consumers poll with `try_recv()` (no exception, no grace poll) and
+    the shm_stdlib consumer spins on a raw buffer; mp/zmq consumers block;
   - warmup messages precede the timed region in every backend.
 
 Usage:
@@ -145,18 +146,14 @@ def dsline_consumer(params, n_warm, n, msg_size, control, results, start):
         start.wait(60)
         got = 0
         while got < n_warm:
-            try:
-                ch.recv()
-            except dsline.BufferEmptyError:
+            if ch.try_recv() is None:
                 _spin_wait()
                 continue
             got += 1
         t0 = now()
         got = 0
         while got < n:
-            try:
-                ch.recv()
-            except dsline.BufferEmptyError:
+            if ch.try_recv() is None:
                 _spin_wait()
                 continue
             got += 1
@@ -191,12 +188,8 @@ def dsline_latency_producer(params, n, msg_size, control, results, start):
         for _ in range(n):
             t0 = now()
             ping.send(payload)
-            while True:
-                try:
-                    pong.recv()
-                    break
-                except dsline.BufferEmptyError:
-                    continue
+            while pong.try_recv() is None:
+                pass
             rtts.append(now() - t0)
         results.put(("lat", rtts))
         ping.close()
@@ -222,11 +215,9 @@ def dsline_latency_consumer(params, n, msg_size, control, results, start):
         start.wait(60)
         for _ in range(n):
             while True:
-                try:
-                    data = ping.recv()
+                data = ping.try_recv()
+                if data is not None:
                     break
-                except dsline.BufferEmptyError:
-                    continue
             while True:
                 try:
                     pong.send(data)
@@ -339,12 +330,15 @@ class ShmRing:
         if create:
             self.shm = shared_memory.SharedMemory(name=name, create=True, size=total)
         else:
-            # The producer may not have created the block yet — retry.
+            # The producer may not have created the block yet — retry. The
+            # block is also briefly visible at zero length while the creator
+            # is sizing it (the same window dsline's file backends wait out),
+            # which surfaces as "cannot mmap an empty file".
             while True:
                 try:
                     self.shm = shared_memory.SharedMemory(name=name, create=False)
                     break
-                except FileNotFoundError:
+                except (FileNotFoundError, ValueError):
                     _spin_wait()
         self.buf = self.shm.buf
         self.head = 0
@@ -404,6 +398,10 @@ def shm_stdlib_producer(params, n_warm, n, msg_size, control, results, start):
     t1 = now()
     results.put(("time", t1 - t0))
     ring.close()
+    # The creator unlinks: `close()` alone leaves the /dev/shm block behind
+    # for the resource tracker to complain about (and to accumulate across
+    # runs), since this ring is not a dsline region.
+    ring.unlink()
 
 
 def shm_stdlib_consumer(params, n_warm, n, msg_size, control, results, start):
@@ -435,6 +433,8 @@ def shm_stdlib_latency_producer(params, n, msg_size, control, results, start):
     results.put(("lat", rtts))
     ping.close()
     pong.close()
+    ping.unlink()
+    pong.unlink()
 
 
 def shm_stdlib_latency_consumer(params, n, msg_size, control, results, start):
@@ -593,21 +593,33 @@ def pynng_latency_consumer(params, n, msg_size, control, results, start):
 # in-process (threads)
 # ═══════════════════════════════════════════════════════════════════════
 
+def _inproc_wall(results, timeout=600):
+    """Both threads must report a time; a missing one is a harness bug.
+
+    Without the timeout a thread that died (or a channel that starved it)
+    would block the whole benchmark forever instead of failing loudly.
+    """
+    return max(results.get(timeout=timeout)[1], results.get(timeout=timeout)[1])
+
+
 def inproc_dsline(params, n_warm, n, msg_size):
     import dsline
-    # Default capacity 1024: every send/recv re-derives the ring depth by
-    # scanning all slot headers, so the in-process number is dominated by the
-    # O(capacity) refresh (honest out-of-the-box measurement). The producer
-    # must use Block with a timeout: the default (Block, no timeout) raises
-    # BufferFullError immediately when the ring is full, which would kill the
-    # producer thread and leave the consumer spinning forever.
-    ch = dsline.ShmChannel(
-        params["name"],
+    # Default capacity 1024, out-of-the-box configuration, one handle per
+    # thread (a handle is serialized by an internal lock, so a shared handle
+    # would starve the consumer). The producer must use Block with a timeout:
+    # the default (Block, no timeout) raises BufferFullError immediately when
+    # the ring is full, which would kill the producer thread and leave the
+    # consumer spinning forever.
+    name = params["name"]
+    slot_size = max(4096, msg_size + 64)
+    producer_ch = dsline.ShmChannel(
+        name,
         capacity=1024,
-        slot_size=max(4096, msg_size + 64),
+        slot_size=slot_size,
         backpressure=dsline.Backpressure.Block,
         timeout=120.0,
     )
+    consumer_ch = dsline.ShmChannel(name, capacity=1024, slot_size=slot_size)
     payload = make_payload(msg_size)
     barrier = threading.Barrier(3)
     errors = []
@@ -616,10 +628,10 @@ def inproc_dsline(params, n_warm, n, msg_size):
         try:
             barrier.wait()
             for _ in range(n_warm):
-                ch.send(payload)
+                producer_ch.send(payload)
             t0 = now()
             for _ in range(n):
-                ch.send(payload)
+                producer_ch.send(payload)
             results.put(("time", now() - t0))
         except BaseException as e:  # noqa: BLE001
             errors.append(e)
@@ -629,18 +641,14 @@ def inproc_dsline(params, n_warm, n, msg_size):
             barrier.wait()
             got = 0
             while got < n_warm:
-                try:
-                    ch.recv()
-                except dsline.BufferEmptyError:
+                if consumer_ch.try_recv() is None:
                     _spin_wait()
                     continue
                 got += 1
             t0 = now()
             got = 0
             while got < n:
-                try:
-                    ch.recv()
-                except dsline.BufferEmptyError:
+                if consumer_ch.try_recv() is None:
                     _spin_wait()
                     continue
                 got += 1
@@ -660,8 +668,9 @@ def inproc_dsline(params, n_warm, n, msg_size):
         t.join()
     if errors:
         raise RuntimeError(errors[0])
-    ch.close()
-    return max(results.get()[1], results.get()[1])
+    producer_ch.close()
+    consumer_ch.close()
+    return _inproc_wall(results)
 
 
 def inproc_deque(params, n_warm, n, msg_size):
@@ -712,7 +721,7 @@ def inproc_deque(params, n_warm, n, msg_size):
         t.join()
     if errors:
         raise RuntimeError(errors[0])
-    return max(results.get()[1], results.get()[1])
+    return _inproc_wall(results)
 
 
 def inproc_queue(params, n_warm, n, msg_size):
@@ -750,7 +759,7 @@ def inproc_queue(params, n_warm, n, msg_size):
         t.join()
     if errors:
         raise RuntimeError(errors[0])
-    return max(results.get()[1], results.get()[1])
+    return _inproc_wall(results)
 
 
 def inproc_zmq(params, n_warm, n, msg_size):
@@ -796,7 +805,7 @@ def inproc_zmq(params, n_warm, n, msg_size):
     push.close()
     pull.close()
     ctx.term()
-    return max(results.get()[1], results.get()[1])
+    return _inproc_wall(results)
 
 
 def inproc_pynng(params, n_warm, n, msg_size):
@@ -840,7 +849,7 @@ def inproc_pynng(params, n_warm, n, msg_size):
         raise RuntimeError(errors[0])
     push.close()
     pull.close()
-    return max(results.get()[1], results.get()[1])
+    return _inproc_wall(results)
 
 
 # ═══════════════════════════════════════════════════════════════════════

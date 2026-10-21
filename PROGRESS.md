@@ -1,5 +1,229 @@
 # Project Progress Report — 2026-05-16
 
+## Update — 2026-10-20b: the benchmark's own two bugs, and the 4 KiB fix
+
+The first Linux numbers (update below) sent the project chasing a "copy-path
+design change". Before designing anything, a cost breakdown — and it turned out
+the measurement, not the transport, was the problem. Two corrections, both
+worth more than the optimisations they were meant to justify.
+
+### 1. Everything had been measured against a debug build
+
+`maturin develop` defaults to **debug** (`maturin build` and the wheels are
+release), and the pipeline never noticed. In debug a single 4 KiB checksum
+costs ~16 µs — more than an entire send. Every published number, including
+the Windows reports and the first Linux run, was a debug-extension number.
+
+### 2. The checksum was 63% of the copy path
+
+With a release build the per-byte cost was still the frame checksum: a serial
+byte-at-a-time FNV-1a. Measured (release, 4 KiB): `checksum32` 4.19 µs of an
+8.29 µs send and of a 4.47 µs receive. Replaced with CRC-32 (`crc32fast`,
+ADR-006) → 0.11 µs, so send 3.16 µs and receive 1.59 µs. The change bumps the
+frame version to 2 and the region format to 4 (regions from older builds are
+rejected at open). The sharded fan-out's routing hash stays FNV-1a — it is a
+solver-checked contract, not a checksum.
+
+### Result (`dsline_shm`, cross-process, Linux)
+
+| | 64 B | 1 KiB | 4 KiB | 64 KiB | latency p50 @64 B |
+|---|---|---|---|---|---|
+| debug build, FNV-1a | 211.7k msg/s | 109.1k | 39.2k | 3.5k | 5.87 µs |
+| release, CRC-32 | **869.2k** | **626.0k** | **540.0k** | **130.9k** | **1.33 µs** |
+
+dsline is now first on latency at every size measured (1.33 µs one-way at
+64 B, against 17.6 µs for `mp.Pipe` and 30.2 µs for the hand-rolled stdlib
+ring) and ahead of `mp.Queue`, `mp.Pipe` and ZeroMQ on throughput at every
+size. The only backend still ahead is that raw stdlib ring — fixed slots, no
+framing, no checksum, no slot state machine — which is the honest price of the
+protocol features. In-process stays GIL-bound (302k msg/s at 64 B): dsline is
+a transport, not an in-process queue.
+
+### The 4 KiB "design change" is off the list
+
+The open item from the earlier update ("encode the frame in place, make the
+checksum optional") is closed by measurement: the frame encode is 0.17 µs and
+the region write ~1 µs at 4 KiB. What is left is the stdlib ring's structural
+advantage, not a defect.
+
+### MPSC: two real bugs behind the "flake"
+
+Chasing the hang (observed once, unreproduced in 12 full-suite and 40 isolated
+runs) surfaced two defects of the same shape — a bound expressed in something
+other than wall-clock time, on a path that must not fail.
+
+1. **`DropOldest` sends could fail.** `drop_oldest_message_mpsc` refused as
+   soon as the cursors stood still over the COMMITTED grace period, but a
+   *live* producer's in-flight reservation leaves the cursors standing still
+   too. A healthy `send` therefore failed with `BufferFullError` whenever it
+   raced another producer's write — **reproduced 2/20 on Windows**, and caught
+   only because the test asserts the documented contract ("drop strategies
+   keep `send` a successful call"). The drop now separates the two cases with
+   the existing writer-identity probe: a provably dead writer's leftover is
+   reclaimed, a live one is waited out, and only a writer that neither commits
+   nor dies within 5 s fails the drop.
+2. **A blocking send could wait past its timeout without bound.**
+   `Backpressure::Block` applied its timeout *per wait attempt* inside the
+   reservation loop, and each attempt returns `Ok` as soon as space appears —
+   so a producer that kept losing the head CAS to a peer retried forever and
+   never returned. This is the most plausible mechanism behind the hang: a
+   stuck producer never signals completion, so the consumer's drain loop never
+   ends — which matches the captured state exactly (a futex wait, two threads,
+   the test's region file held). `reserve_slots` now takes one deadline for
+   the whole attempt.
+
+Both bounds are now wall-clock rather than yield counts: a fixed yield budget
+is scheduler-dependent and fires on *healthy* peers under CPU oversubscription
+(the test harness runs the suite in parallel), which is how both stayed
+hidden. The Windows `dsline-shm` suite went from 2 failures in 20 runs to **0
+in 25**; the test also fails with a diagnostic after 60 s instead of hanging,
+and a panicking producer can no longer leave the consumer waiting for a
+signal that never comes.
+
+### Verification
+
+Both lanes green on release and debug builds: Rust 148 unit + 5 doc tests
+(Windows) / 139 + 5 (Linux), 137 Python tests, `84 passed, 0 failed` solver
+checks. New: a 4 KiB/single-bit corruption test for CRC-32, the ignored
+`timing_probe`, release support in both lane scripts, and the Windows `bench`
+subcommand. Machine-readable results:
+`docs/benchmark_results_linux_2026-10-20.json`,
+`docs/benchmark_results_windows_2026-10-20.json`.
+
+### Still open
+
+- Zero-copy `alloc`/`publish`/`recv_view` throughput is not benchmarked.
+- pynng's dial race prints `ConnectionRefused` noise in the harness log.
+
+---
+
+## Update — 2026-10-20: Linux benchmark (0.1.0's last engineering item) and three defects it exposed
+
+> **Superseded later the same day by the update above.** The numbers in this
+> section were measured against a debug extension with the FNV-1a checksum;
+> the conclusions about throughput were an artifact of that. The three defects
+> it found are real and fixed.
+
+The roadmap's remaining 0.1.0 engineering item — the multi-process performance
+test — is now run on the tier-1 platform, and it immediately exposed three
+real defects. All three are fixed and verified on both lanes.
+
+### The numbers (Linux/WSL2 Ubuntu 24.04, `docs/benchmarks.md`)
+
+- **Latency: best of every backend measured.** 5.87 µs one-way p50 at 64 B,
+  against `mp.Pipe` 15.1 µs, the hand-rolled stdlib shared-memory ring
+  29.2 µs, ZeroMQ 54.9 µs, pynng 73.1 µs. dsline's own Windows figure was
+  130 µs: the `FlushViewOfFile` cost that dominated it does not exist on
+  Linux, and this is the first time the code was even compiled there.
+- **Throughput: 5–20× behind from 1 KiB up** (39.2k vs 248.8k msg/s at
+  4 KiB). The remaining cost is per-message work in the *copy path* — frame
+  encode plus a payload copy and an FNV-1a checksum on send, slot copy-out,
+  frame decode and a second checksum pass on receive — not the transport.
+  4 KiB costs ~25 µs/message against ~1.1 µs for the stdlib ring, which does
+  none of it. Closing this is a design change (encode the frame in place the
+  way `publish` does, make the checksum optional/incremental), recorded as
+  the open item.
+- **In-process is GIL-bound** (93.3k msg/s at 64 B vs 36.8M for
+  `deque`+`Condition`) — the documented "dsline is a transport, not an
+  in-process queue" position, now with numbers.
+
+### Defects found and fixed
+
+1. **In-process threaded use deadlocked.** A blocking `send` held the GIL
+   while spinning for space in Rust, so a consumer thread could never drain
+   the ring: 4 of 200 messages delivered, then `BufferFullError` after the
+   send timeout. `send` now releases the GIL. The other half of the pattern
+   is the handle contract — a handle is serialized by an internal lock, so
+   the producer and the consumer need their own handle ("one handle each",
+   as the MPSC documentation already said). Reproduced with a two-thread
+   script: shared handle still fails by design, handle-per-thread went from
+   4/200 to 200/200 instantly once the GIL was released. A/B-verified against
+   the previous build.
+2. **Exception-driven polling measured the interpreter, not the channel.**
+   `recv()` runs a 256-iteration COMMITTED grace poll and raises
+   `BufferEmptyError` on every empty attempt, so the benchmark's consumers
+   were timing Python exception handling. Adds `try_recv()` (Rust +
+   both Python classes): one header read, returns `None`, keeps crash
+   recovery and the sequence state.
+3. **The Windows lane had been testing a stale extension.** `maturin
+   develop` fails without `CONDA_PREFIX`/`VIRTUAL_ENV`; the failure was
+   hidden by the piped log, and the Python tests kept running the `.pyd`
+   built on 2026-10-02 — so every "Windows lane green" claim about Python
+   behaviour since then was about old code. Adds `scripts/windows-test.sh`
+   (pins `PYO3_PYTHON` + `CONDA_PREFIX`, prints the extension timestamp) and
+   documents the trap.
+
+### Verification
+
+Both lanes green after the fixes: Rust 148 unit + 5 doc tests on Windows /
+139 + 5 on Linux (the 9-test difference is `#[cfg(windows)]` section
+tests), 137 Python tests, `84 passed, 0 failed` solver checks. New tests: a
+Rust `try_recv` unit test, four Python `try_recv` cases, and a Python
+threading test that fails without the GIL release.
+
+### Open items
+
+- 4 KiB+ copy-path throughput (above), and zero-copy `alloc`/`publish`
+  numbers, which the harness does not measure yet.
+- **A rare hang in the `dsline-shm` unit-test suite.** Observed once: the
+  `mpsc-threads` test blocked in a futex with two threads (5 later full-suite
+  runs and 3 isolated MPSC runs passed). Not reproduced; the one open
+  correctness question on the MPSC path.
+- The 2026-09-04 Windows benchmark has not been re-run with the paging-file
+  section backend, and `docs/benchmark_results.json` is still the Windows
+  run. `scripts/wsl-test.sh bench` regenerates the Linux side.
+
+---
+
+## Update — 2026-10-20: WSL/Linux verification lane becomes mandatory
+
+Testing gains a second, mandatory lane: every change is verified on Windows
+(the development host) and inside WSL Ubuntu 24.04. Linux is the tier-1
+platform (roadmap §13.1), its `MAP_SHARED` needs no `FlushViewOfFile`, and
+the platform branches (`/proc` liveness probe, storage-backend choice,
+region directory) only exist there — so the transport's real performance
+numbers and its Unix crash-recovery path were both unverified until now.
+
+- **New artifacts**: `scripts/wsl-test.sh` (idempotent lane entry point:
+  `setup` / `rust` / `python` / `verify` / `bench` / `all`),
+  `docs/development.md` (environment matrix, commands, pass criteria,
+  known traps), `AGENTS.md` (repository-level rule for future sessions),
+  and a rewritten README "Verification" section.
+- **Environment**: rustup stable 1.99.1 + rustfmt, `~/.venvs/dsline`
+  (Python 3.12, `--system-site-packages` so the distro's z3/ortools/
+  pyscipopt stay visible), maturin 1.15.0, cargo target dir on the Linux
+  filesystem. Toolchain installs go through a mirror: the official Rust CDN
+  measured ~31 KB/s against ~9.8 MB/s from a mirror, and `~/.cargo/config.toml`
+  was pointed at a sparse crates.io mirror.
+- **The lane immediately found three Linux-only defects** — the code had
+  never been compiled on Linux, because the last seven commits were never
+  pushed and CI therefore never ran on them:
+  1. `dsline-shm` did not compile on Linux: `current_process_start_time()`
+     called `unwrap_or` on a `Result<Option<u64>, ()>` and returned the
+     `Option` — the entire `/proc` crash-recovery path was unbuildable.
+  2. `dsline-python` did not compile on Linux: `PySlice::indices` takes
+     `c_long` (32-bit on Windows, 64-bit on Linux), so `size as i32` was
+     Windows-only in the zero-copy buffer's slice assignment and
+     `ShmReadView.__getitem__`.
+  3. File-backed `create_or_open` could spuriously fail on Unix: the creator
+     publishes the path with `create_new` before `set_len` runs, so a peer
+     opening in that window saw a short file and got
+     `"file storage is smaller than expected"`. Both file backends now wait
+     the window out with the same bounded spin `wait_initialized` uses. The
+     sharded-MPMC cross-process test (2 producers × 3 consumers opening the
+     same shards) is the reproducer and the regression test.
+- **Both lanes green after the fixes**: Windows 147 unit + 5 doc tests,
+  Linux 138 unit + 5 doc tests (the difference is `#[cfg(windows)]`
+  section-backend tests), 132 Python tests and `84 passed, 0 failed` solver
+  checks on each platform.
+
+Not addressed by this update: the nine Windows-gated tests still have no
+Linux counterpart, and the transport benchmarks (`docs/benchmarks.md`,
+2026-09-04) have still not been re-run — the Linux lane now provides the
+place to take those numbers (`scripts/wsl-test.sh bench`).
+
+---
+
 ## Overview
 
 `dsline` is a lightweight local dataflow framework for Python, built with a Rust performance core and PyO3 bindings. Target: high-throughput, low-latency multi-process communication via shared memory.
