@@ -5695,8 +5695,19 @@ mod tests {
 
     // ── crash recovery tests (writer identity, roadmap §6) ──
 
+    // The reclaim tests below need a platform that can prove a writer is
+    // gone: only Windows and Linux implement the probe (`process.rs`), and
+    // every other platform answers `Unknown`, which the protocol reads as
+    // "never reclaim" (roadmap §6.2). They are gated rather than deleted so
+    // the platforms without a probe still run the refusal-side tests
+    // (`open_keeps_a_live_writer_zombie`,
+    // `open_never_reclaims_an_identityless_zombie`,
+    // `mpsc_reclaim_refuses_an_extent_crossing_a_committed_slot`), which hold
+    // for `Unknown` too.
+
     /// Spawn a child that exits immediately and reap it: the returned PID
     /// is afterwards a provably dead identity.
+    #[cfg(any(windows, target_os = "linux"))]
     fn spawn_dead_identity() -> (u32, u64) {
         #[cfg(windows)]
         let mut child = std::process::Command::new("cmd")
@@ -5722,6 +5733,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, target_os = "linux"))]
     fn open_reclaims_dead_writer_zombie_and_reuses_the_slot() {
         // A producer that died mid-write with its identity recorded leaves
         // a WRITING slot. A later open must verify the identity is dead,
@@ -5805,6 +5817,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, target_os = "linux"))]
     fn consumer_reclaims_dead_writer_at_the_gate() {
         // The consumer handle opened while the ring was healthy, then the
         // producer crashed mid-write. The recv gate's grace poll expires,
@@ -5845,6 +5858,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, target_os = "linux"))]
     fn mpsc_gate_reclaims_a_dead_reservation_extent() {
         // MPSC: the head cursor is reserved before the write, so a crashed
         // producer's reservation is cursor-counted. The consumer's gate
@@ -5962,6 +5976,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, target_os = "linux"))]
     fn reclaim_stale_reports_the_freed_slot_count() {
         // The explicit cleanup entry point reclaims reachable leftovers and
         // is a no-op on a healthy ring.
@@ -6685,6 +6700,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, target_os = "linux"))]
     fn zero_copy_open_reclaims_dead_consumer_pins() {
         let path = test_file_path("zero-copy-dead-pins");
         let (dead_pid, dead_start) = spawn_dead_identity();

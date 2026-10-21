@@ -2,6 +2,7 @@ import gc
 import multiprocessing as mp
 import os
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -363,6 +364,14 @@ class CrossProcessShmChannelTests(unittest.TestCase):
 
 # ── crash recovery (writer identity, roadmap §6) ──
 
+# The reclaim tests below need a platform that can prove a writer is gone:
+# only Windows and Linux implement the probe, and every other platform answers
+# "unknown", which the protocol reads as "never reclaim" (roadmap §6.2). The
+# refusal-side tests keep running everywhere.
+_PROBE_PLATFORM = sys.platform.startswith(("linux", "win32"))
+_PROBE_REASON = "reclaim needs a process-identity probe (Linux/Windows)"
+
+
 
 def _dead_process_identity():
     """Spawn a child that exits immediately and return its (pid, 0)."""
@@ -401,6 +410,7 @@ class CrashRecoveryShmChannelTests(unittest.TestCase):
         process.join(timeout=30)
         self.assertEqual(process.exitcode, 0)
 
+    @unittest.skipUnless(_PROBE_PLATFORM, _PROBE_REASON)
     def test_dead_writer_zombie_is_reclaimed_at_open(self) -> None:
         ch = self.make_channel("crash-open", capacity=4, slot_size=64)
         ch.send(b"one")
@@ -416,6 +426,7 @@ class CrashRecoveryShmChannelTests(unittest.TestCase):
         self.assertEqual(recovered.recv_with_seq(), (0, b"one"))
         self.assertEqual(recovered.recv_with_seq()[1], b"two")
 
+    @unittest.skipUnless(_PROBE_PLATFORM, _PROBE_REASON)
     def test_consumer_reclaims_dead_writer_at_the_gate(self) -> None:
         ch = self.make_channel("crash-gate", capacity=4, slot_size=64)
         consumer = dsline.ShmChannel(ch.name, capacity=4, slot_size=64)
@@ -451,6 +462,7 @@ class CrashRecoveryShmChannelTests(unittest.TestCase):
         with self.assertRaises(dsline.BufferEmptyError):
             recovered.recv()
 
+    @unittest.skipUnless(_PROBE_PLATFORM, _PROBE_REASON)
     def test_reclaim_stale_is_explicit_cleanup(self) -> None:
         ch = self.make_channel("crash-stale", capacity=4, slot_size=64)
         self.assertEqual(ch.reclaim_stale(), 0)
