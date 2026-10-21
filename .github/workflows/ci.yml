@@ -25,6 +25,13 @@ jobs:
       - name: Rust fmt
         run: cargo fmt --all --check
 
+      # The test steps turn their failures into `::error::` annotations: the
+      # raw job log needs repository credentials, so without this a red run
+      # reports only "exit code 101" to anyone outside the repository.
+      # Three details matter: `shell: bash` runs the script with `-e` (hence
+      # `set +e`), cargo colourises its output on a runner (hence the ANSI
+      # strip), and GitHub keeps at most 10 annotations per step (hence the
+      # ordering and the `head -10`).
       - name: Rust tests
         shell: bash
         run: |
@@ -33,12 +40,12 @@ jobs:
           cargo test --workspace 2>&1 | tee cargo-test.log
           status=$?
           if [ "$status" -ne 0 ]; then
-            # Surface what failed as annotations: the raw job log needs
-            # repository credentials, so a failure here is otherwise
-            # undiagnosable from outside.
-            grep -E '^---- .* stdout ----|^error(\[|:)|^test result: FAILED' cargo-test.log \
-              | head -40 \
-              | while IFS= read -r line; do echo "::error::$line"; done
+            sed -e 's/\x1b\[[0-9;]*m//g' cargo-test.log > clean.log
+            {
+              grep -E -- '---- .* stdout ----' clean.log
+              grep -E -- 'error\[|^error:|panicked at' clean.log
+              grep -E -- 'test result: FAILED' clean.log
+            } | head -10 | while IFS= read -r line; do echo "::error::$line"; done
           fi
           exit "$status"
 
@@ -61,9 +68,12 @@ jobs:
           python -m unittest discover -s tests/python 2>&1 | tee python-test.log
           status=$?
           if [ "$status" -ne 0 ]; then
-            grep -E '^(FAIL|ERROR):|^Ran |^FAILED' python-test.log \
-              | head -40 \
-              | while IFS= read -r line; do echo "::error::$line"; done
+            sed -e 's/\x1b\[[0-9;]*m//g' python-test.log > clean.log
+            {
+              grep -E -- '^(FAIL|ERROR):' clean.log
+              grep -E -- '(Error|Exception|_queue\.Empty)' clean.log
+              grep -E -- '^Ran |^FAILED' clean.log
+            } | head -10 | while IFS= read -r line; do echo "::error::$line"; done
           fi
           exit "$status"
 

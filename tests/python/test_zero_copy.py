@@ -76,6 +76,10 @@ def _pinned_ring_producer(name, capacity, slot_size, count, result_queue):
         result_queue.put(("error", repr(exc)))
 
 
+# Cross-process waits are generous: a CI runner has 2-4 cores and a cold
+# page cache, and each spawned process pays a fresh interpreter start
+# plus the extension import.
+
 class ZeroCopyShmChannelTests(unittest.TestCase):
     def make_channel(self, label, **kwargs):
         ch = dsline.ShmChannel(unique_name(label), **kwargs)
@@ -343,7 +347,7 @@ class ZeroCopyShmChannelTests(unittest.TestCase):
             except dsline.BufferEmptyError:
                 time.sleep(0.001)
 
-        status, sent = result_queue.get(timeout=15)
+        status, sent = result_queue.get(timeout=60)
         self.assertEqual(status, "ok")
         self.assertEqual(sent, 6)
         self.assertEqual(received, [f"message-{i}".encode() for i in range(6)])

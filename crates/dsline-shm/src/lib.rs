@@ -5707,7 +5707,10 @@ mod tests {
 
     /// Spawn a child that exits immediately and reap it: the returned PID
     /// is afterwards a provably dead identity.
-    #[cfg(any(windows, target_os = "linux"))]
+    // Not platform-gated: spawning and reaping a child works everywhere. It
+    // is only *classifying* the identity as gone that needs a probe, so the
+    // gating belongs on the tests that assert a reclaim fired (and the
+    // refusal-side test below, which builds the same setup, keeps using it).
     fn spawn_dead_identity() -> (u32, u64) {
         #[cfg(windows)]
         let mut child = std::process::Command::new("cmd")

@@ -59,6 +59,10 @@ def _sharded_producer(name, shards, capacity, slot_size, label, count, result_qu
     result_queue.put("done")
 
 
+# Cross-process waits are generous: a CI runner has 2-4 cores and a cold
+# page cache, and each spawned process pays a fresh interpreter start
+# plus the extension import.
+
 class ShardedChannelTests(unittest.TestCase):
     def make_fanout(self, label, **kwargs):
         kwargs.setdefault("shards", 3)
@@ -192,9 +196,9 @@ class ShardedCrossProcessTests(unittest.TestCase):
         ]
         for process in consumers + producers:
             process.start()
-        results = [result_queue.get(timeout=15) for _ in range(shards + 2)]
+        results = [result_queue.get(timeout=60) for _ in range(shards + 2)]
         for process in consumers + producers:
-            process.join(timeout=15)
+            process.join(timeout=60)
             self.assertEqual(process.exitcode, 0)
         delivered = [r for r in results if isinstance(r, list)]
         self.assertEqual(len(delivered), shards)
@@ -224,9 +228,9 @@ class ShardedCrossProcessTests(unittest.TestCase):
             target=_bc_producer, args=(name, shards, 8, 64, count, result_queue)
         )
         producer.start()
-        results = [result_queue.get(timeout=15) for _ in range(shards + 1)]
+        results = [result_queue.get(timeout=60) for _ in range(shards + 1)]
         for process in consumers + [producer]:
-            process.join(timeout=15)
+            process.join(timeout=60)
             self.assertEqual(process.exitcode, 0)
         delivered = [r for r in results if isinstance(r, list)]
         self.assertEqual(len(delivered), shards)
