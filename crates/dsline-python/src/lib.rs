@@ -102,14 +102,33 @@ impl ShmChannel {
         let bytes_type = PyModule::import_bound(py, "builtins")?.getattr("bytes")?;
         let bytes_obj = bytes_type.call1((data,))?;
         let bytes = bytes_obj.downcast::<PyBytes>()?.as_bytes();
-        let mut channel = self.lock_channel()?;
-        channel.send(bytes).map_err(to_py_err)
+        // Release the GIL for the send: with `Block` backpressure the Rust
+        // side spins until the consumer frees space, and a consumer running
+        // as another thread of this same process needs the GIL to drain the
+        // ring — holding both deadlocks until the send timeout.
+        py.allow_threads(|| {
+            let mut channel = self.lock_channel()?;
+            channel.send(bytes).map_err(to_py_err)
+        })
     }
 
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let mut channel = self.lock_channel()?;
         let data = channel.recv().map_err(to_py_err)?;
         Ok(PyBytes::new_bound(py, &data))
+    }
+
+    /// Non-blocking receive: `bytes`, or `None` when nothing is readable
+    /// right now. This is the call to spin on — `recv()` costs a bounded
+    /// COMMITTED grace poll and raises `BufferEmptyError` on every empty
+    /// attempt, so an exception-driven poll loop measures the interpreter's
+    /// exception path rather than the channel.
+    fn try_recv<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let mut channel = self.lock_channel()?;
+        match channel.try_recv().map_err(to_py_err)? {
+            Some(data) => Ok(Some(PyBytes::new_bound(py, &data))),
+            None => Ok(None),
+        }
     }
 
     fn recv_with_seq<'py>(&self, py: Python<'py>) -> PyResult<(u64, Bound<'py, PyBytes>)> {
@@ -379,11 +398,14 @@ impl FileChannel {
         let bytes_type = PyModule::import_bound(py, "builtins")?.getattr("bytes")?;
         let bytes_obj = bytes_type.call1((data,))?;
         let bytes = bytes_obj.downcast::<PyBytes>()?.as_bytes();
-        let mut channel = self
-            .channel
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
-        channel.send(bytes).map_err(to_py_err)
+        // See `ShmChannel::send`: a blocking send must not hold the GIL.
+        py.allow_threads(|| {
+            let mut channel = self
+                .channel
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+            channel.send(bytes).map_err(to_py_err)
+        })
     }
 
     fn recv<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
@@ -393,6 +415,19 @@ impl FileChannel {
             .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
         let data = channel.recv().map_err(to_py_err)?;
         Ok(PyBytes::new_bound(py, &data))
+    }
+
+    /// Non-blocking receive: `bytes`, or `None` when nothing is readable
+    /// right now (see `ShmChannel::try_recv`).
+    fn try_recv<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let mut channel = self
+            .channel
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("file channel lock poisoned"))?;
+        match channel.try_recv().map_err(to_py_err)? {
+            Some(data) => Ok(Some(PyBytes::new_bound(py, &data))),
+            None => Ok(None),
+        }
     }
 
     fn recv_with_seq<'py>(&self, py: Python<'py>) -> PyResult<(u64, Bound<'py, PyBytes>)> {
@@ -625,7 +660,7 @@ impl ShmWriteBuffer {
             .downcast::<PySlice>()
             .map_err(|_| PyValueError::new_err("buffer indices must be slices"))?;
         let size = self.size()?;
-        let indices = slice.indices(size as i32)?;
+        let indices = slice.indices(size as std::os::raw::c_long)?;
         if indices.step != 1 {
             return Err(PyValueError::new_err("slice step must be 1"));
         }
@@ -750,7 +785,7 @@ impl ShmReadView {
         }
         if let Ok(slice) = key.downcast::<PySlice>() {
             let size = self.with_view(|view| Ok(view.size()))?;
-            let indices = slice.indices(size as i32)?;
+            let indices = slice.indices(size as std::os::raw::c_long)?;
             if indices.step != 1 {
                 return Err(PyValueError::new_err("slice step must be 1"));
             }

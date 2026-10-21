@@ -28,8 +28,28 @@ slot-header scan runs once per open (recovery) to rebuild the sequence state.
 The cursor and pin-floor protocols are verified by
 `verify/check_invariants.py` (Z3, CP-SAT, SCIP, replay).
 
-## Backpressure
+## Receiving
 
+- `recv()` / `recv_with_seq()` are the blocking-style reads: they run the
+  COMMITTED gate's bounded grace poll and raise `BufferEmptyError` when
+  nothing is readable. Use them when the consumer is driven by data (or by an
+  outer loop with a sleep) rather than polling in a tight loop.
+- `try_recv()` is the non-blocking poll: it returns `bytes`, or `None` when
+  nothing is readable right now (an empty ring, or a producer mid-batch). One
+  header read per attempt, no grace poll, no exception — this is the call to
+  spin on. Crash recovery still applies (a dead writer's leftover at the tail
+  is reclaimed on the spot), and it advances the same sequence state as
+  `recv()`, so the two can be mixed.
+
+**One handle per thread.** A handle is serialized by an internal lock, so two
+threads sharing one handle starve each other: a blocking `send` holds the lock
+while it waits for space, and the consumer thread can never drain the ring. In
+process, give the producer and the consumer their own handle (two
+`ShmChannel` objects with the same name) — that is also the pattern the
+multi-producer mode documents ("threads with one handle each"). A blocking
+`send` releases the GIL while it waits, so the other thread keeps running.
+
+## Backpressure
 `ShmChannel` and `FileChannel` support four fixed-slot SPSC backpressure strategies:
 
 - `Backpressure.Block`: wait for space until the configured timeout, then raise `BufferFullError`.

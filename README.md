@@ -16,7 +16,7 @@ Current boundaries:
 - Zero-copy `alloc/publish` (roadmap §4.2) is exposed for single-slot messages: `alloc(size)` returns a writable lease into the shared region, `publish(buf)` seals it (further writes raise) and commits the slot, and `recv_view()` returns a view whose reads go straight to the region — the transport never moves the bytes. While a view is alive its slot is pinned: a shared pin-floor word feeds every producer's send guard, so the ring cannot wrap onto a slot a consumer is still reading; views are released explicitly, by drop, or by the open-time reclaim when their consumer died. Boundaries: `alloc` is single-producer only, both reject `DropOldest` channels, chunked messages stay on the copy path, and Python reads are explicit copies of the requested range (buffer-protocol views need pyo3 0.23 and are future work). See ADR-005 and `docs/README.md` for the safety model.
 - Multi-consumer delivery is available through the sharded fan-out (`ShardedChannel`); a lock-free multi-consumer ring and anonymous OS shared memory (no backing file) are still future work on Unix. (`multi_producer=True` gives multi-producer / single-consumer.) Crash recovery is implemented: writers record `pid + start_time` in every WRITING slot header, and a leftover slot is reclaimed — at open or at the receive gate — once a platform probe proves the writer identity is gone (`GetProcessTimes` on Windows, `/proc` on Linux; unknown platforms default to no auto-reclaim, and a live writer's slots are never touched). In multi-producer mode the reclaim frees the dead reservation's recorded extent and advances the tail past it, so a live message behind a dead producer is delivered instead of wedging the ring. The same identity protocol covers zero-copy pins (a consumer that died holding views). `reclaim_stale()` exposes the explicit owner cleanup, and `stats()["reclaimed_slots"]` / `stats()["pinned_slots"]` report what a handle has reclaimed and how many slots are currently pinned.
 - On Windows a `FileChannel` region file cannot be deleted while a channel (or a live zero-copy view) still holds its mapping (standard memory-mapped file behavior); drop the channel first.
-- The on-region layout version is now 3 (region header grew to 32 bytes for the pin floor). Regions written by older builds are rejected at open — delete stale region files when upgrading.
+- The on-region layout version is now 4, and frames are version 2 (region header grew to 32 bytes for the pin floor; the payload checksum is CRC-32 rather than FNV-1a). Regions written by older builds are rejected at open — delete stale region files when upgrading.
 
 ## Install for development
 
@@ -92,13 +92,23 @@ current prototype splits larger payloads into multiple fixed slots and
 reassembles them on `recv()`. This is variable-length framing over fixed-slot
 storage, not the future shared-memory arena allocator.
 
+In-process producer/consumer threads must each hold **their own handle**: a
+handle is serialized by an internal lock, so two threads sharing one would
+starve each other (a blocking `send` holds that lock). With a handle per
+thread, a blocking `send` releases the GIL while it waits for space, so the
+consumer thread can drain the ring and the send completes. Consumers that poll
+should use `try_recv()`, which returns `None` when nothing is readable:
+`recv()` runs the COMMITTED grace poll and raises `BufferEmptyError` on every
+empty attempt, so an exception-driven poll loop measures the interpreter's
+exception path rather than the channel.
+
 Zero-copy wording follows the project rule:
 
 > dsline provides true zero-copy transfer only for eligible shared-memory alloc/publish payloads after the safety gate is complete. Existing `bytes`, `bytearray`, and ndarray values sent through `send/recv` are expected to use a single copy into shared memory.
 
 Implemented prototype pieces:
 
-- `dsline-core`: fixed-slot SPSC bytes ring, checksum, Frame header, chunk flags, and metadata TLV encode/decode.
+- `dsline-core`: fixed-slot SPSC bytes ring, CRC-32 frame checksum, Frame header, chunk flags, and metadata TLV encode/decode.
 - `dsline-shm`: slot-region byte-range storage trait with file and memory-mapped (OS shared memory) backends, region state model, cross-process SPSC bytes channel over `FREE`, `WRITING`, `COMMITTED`, `PINNED`, and `CORRUPTED` with shared head/tail cursor words in the region header (O(1) per-operation refresh; the slot-header scan runs once at open for sequence recovery and crashed-writer cleanup), multi-slot chunked messages, an opt-in multi-producer (MPSC) mode that reserves head with a hardware CAS, crash recovery via writer identity (`pid + start_time` probed through platform APIs before reclaim), name→region resolution for named channels, and the zero-copy lease/view layer (roadmap §4.2): `alloc` reserves a slot and writes into the region directly, `publish` seals the lease and commits it, `recv_view` pins the slot behind a shared pin-floor word that feeds every producer's send guard, and dead consumers' pins are reclaimed by identity at open.
 - `dsline-python`: PyO3 `ShmChannel` (named, cross-process shared memory) and `FileChannel` (mmap-backed file) bindings over the `dsline-shm` core, Python exception exports, `send()` support for bytes-like inputs (`bytes`, `bytearray`, `memoryview`, and compatible buffer objects), `recv_with_seq()`, `Block`/`Raise`/`DropNewest`/`DropOldest` backpressure, and `stats()` with queue, sequence, and message-size limits.
 - Multi-consumer delivery is provided by the sharded fan-out (roadmap §5.5): `dsline.ShardedChannel(name, shards=N, strategy="round_robin"|"hash"|"broadcast")` composes N named channels and routes each message to one shard (per-producer round-robin, or stateless FNV-1a hash of a routing key so per-key ordering survives) or to all of them (broadcast). Consumers bind one shard via `fan.shard(i)` — the roadmap's "N 个 channel + 路由层" MPMC, no lock-free multi-consumer ring involved.
@@ -133,12 +143,33 @@ channel's region file.
 
 ## Verification
 
+Every change is verified on **two lanes**: Windows (the development host) and
+Linux via WSL. Linux is the tier-1 platform and the only place the transport's
+real performance numbers exist (its `MAP_SHARED` needs no `FlushViewOfFile`),
+so a change is not verified until both lanes pass. The full conventions —
+environment matrix, pass criteria, and the known traps — are in
+[`docs/development.md`](docs/development.md).
+
+Windows lane (one entry point; it pins `PYO3_PYTHON` for the `cargo test`
+link and `CONDA_PREFIX` for `maturin develop` — without the latter the
+extension build fails silently and the Python tests keep running against the
+previously built `.pyd`):
+
 ```bash
-cargo fmt --all --check
-cargo test
-python -m maturin build --manifest-path crates/dsline-python/Cargo.toml --interpreter python
-python -m unittest discover -s tests/python
+bash scripts/windows-test.sh all      # rust + python + verify
 ```
+
+Linux lane (WSL Ubuntu, one entry point):
+
+```bash
+MSYS_NO_PATHCONV=1 wsl.exe -d Ubuntu-24.04 -- bash /mnt/c/Simpl/dsline/scripts/wsl-test.sh all
+```
+
+Both scripts are idempotent; the WSL one also takes `setup`, `rust`, `python`,
+`verify` and `bench` (and `all`). First-time toolchain install needs
+`DSLINE_INSTALL=1`, and on slow international links the mirror overrides in
+the script header (measured here: official Rust CDN ~31 KB/s vs a mirror at
+~10 MB/s).
 
 ## License
 

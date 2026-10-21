@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use memmap2::MmapMut;
 
@@ -516,6 +516,34 @@ pub trait SlotRegionIo: std::fmt::Debug + Sized {
     }
 }
 
+/// Length of an opened file storage, tolerating a concurrent creator that is
+/// still resizing it.
+///
+/// On the file backends `create_or_open` arbitrates the single creator with
+/// `create_new`, which publishes the path *before* the creator's `set_len`
+/// runs — a peer that opens in that window sees a short (often zero-length)
+/// file. Wait it out with the same bounded spin the region-level
+/// `wait_initialized` uses instead of failing the open; a genuinely
+/// mismatched configuration (a channel opened with a larger capacity than it
+/// was created with) still reports the short length after the spin.
+fn wait_for_full_size(file: &File, total_len: usize) -> Result<u64> {
+    let stat = || -> Result<u64> {
+        Ok(file
+            .metadata()
+            .map_err(|_| ChannelError::StorageIo("stat file storage"))?
+            .len())
+    };
+    let mut actual_len = stat()?;
+    for _ in 0..2048 {
+        if actual_len >= total_len as u64 {
+            break;
+        }
+        thread::yield_now();
+        actual_len = stat()?;
+    }
+    Ok(actual_len)
+}
+
 #[derive(Debug)]
 pub struct FileSlotStorage {
     capacity: usize,
@@ -574,10 +602,7 @@ impl FileSlotStorage {
             .write(true)
             .open(&path)
             .map_err(|_| ChannelError::StorageIo("open file storage"))?;
-        let actual_len = file
-            .metadata()
-            .map_err(|_| ChannelError::StorageIo("stat file storage"))?
-            .len();
+        let actual_len = wait_for_full_size(&file, total_len)?;
         if actual_len < total_len as u64 {
             return Err(
                 ChannelError::InvalidConfig("file storage is smaller than expected").into(),
@@ -816,10 +841,7 @@ impl MmapSlotStorage {
             .write(true)
             .open(&path)
             .map_err(|_| ChannelError::StorageIo("open mmap storage"))?;
-        let actual_len = file
-            .metadata()
-            .map_err(|_| ChannelError::StorageIo("stat mmap storage"))?
-            .len();
+        let actual_len = wait_for_full_size(&file, total_len)?;
         if actual_len < total_len as u64 {
             return Err(
                 ChannelError::InvalidConfig("file storage is smaller than expected").into(),
@@ -1636,7 +1658,12 @@ pub const REGION_HEADER_LEN: usize = 32;
 /// 3 = 48-byte slot headers with writer identity + the `pin_floor` word
 /// (zero-copy views, roadmap §4.2). Version 2 regions (no pin floor) are
 /// rejected at open.
-pub const REGION_FORMAT: u32 = 3;
+///
+/// 4 = frames carry a CRC-32 (IEEE) checksum instead of the byte-at-a-time
+/// FNV-1a one (see `dsline_core::checksum`). The stored checksums differ, so
+/// version-3 regions are rejected at open instead of being mis-read as
+/// corrupted.
+pub const REGION_FORMAT: u32 = 4;
 
 /// Magic value published once initialization completes
 /// (bytes `DSL1` little-endian) — single-producer (SPSC) mode.
@@ -3136,9 +3163,16 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     /// (so concurrent droppers never release the same message twice), so
     /// a producer that reserved immediately after the CAS can observe
     /// the previous occupant still COMMITTED. The release completes in
-    /// the winner's drop loop, so the wait is bounded in practice; only
-    /// a crashed releaser leaves the slot occupied forever, hence the
-    /// bound.
+    /// the winner's drop loop, so in practice this waits microseconds; the
+    /// bound exists only for a releaser that died between its CAS and its
+    /// release.
+    ///
+    /// The bound is wall-clock rather than a yield count: under CPU
+    /// oversubscription (the test harness runs the suite in parallel) a
+    /// *live* releaser can be descheduled long enough to exhaust a fixed
+    /// number of yields, which fails an otherwise healthy `send` on a
+    /// DropOldest channel — and the drop strategies document that `send`
+    /// stays a successful call.
     fn write_reserved_slot(
         &self,
         index: usize,
@@ -3146,18 +3180,23 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         frame: &[u8],
         stamp: &WriterIdentity,
     ) -> Result<()> {
-        const RELEASE_WAIT: u32 = 100_000;
-        for _ in 0..RELEASE_WAIT {
+        const RELEASE_WAIT: Duration = Duration::from_secs(5);
+        let deadline = Instant::now() + RELEASE_WAIT;
+        loop {
             match self
                 .region
                 .write_committed_no_flush(index, seq, frame, Some(stamp))
             {
                 Ok(()) => return Ok(()),
-                Err(DslineError::Channel(ChannelError::BufferFull)) => thread::yield_now(),
+                Err(DslineError::Channel(ChannelError::BufferFull)) => {
+                    if Instant::now() >= deadline {
+                        return Err(ChannelError::BufferFull.into());
+                    }
+                    thread::yield_now();
+                }
                 Err(err) => return Err(err),
             }
         }
-        Err(ChannelError::BufferFull.into())
     }
 
     /// Claim `needed_slots` ring slots for this producer.
@@ -3176,6 +3215,14 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             }
             .into());
         }
+        // One deadline for the whole reservation attempt. The retry loop can
+        // lose CAS races repeatedly, so a per-wait timeout would let a `Block`
+        // send wait without bound: every individual wait returns Ok as soon
+        // as space appears, even if another producer claims it first.
+        let deadline = match self.config.backpressure {
+            Backpressure::Block => self.config.timeout.map(|t| Instant::now() + t),
+            _ => None,
+        };
         loop {
             self.refresh_cursors()?;
             if self.config.capacity - self.guard_len() >= needed_slots {
@@ -3193,7 +3240,10 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             match self.config.backpressure {
                 Backpressure::Raise => return Err(ChannelError::BufferFull.into()),
                 Backpressure::Block => {
-                    self.wait_for_space(needed_slots)?;
+                    let Some(deadline) = deadline else {
+                        return Err(ChannelError::BufferFull.into());
+                    };
+                    self.wait_for_space_until(needed_slots, deadline)?;
                     // Re-run the guard and the reservation.
                 }
                 Backpressure::DropNewest => return Ok(None),
@@ -3208,6 +3258,36 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
 
     pub fn recv(&mut self) -> Result<Vec<u8>> {
         Ok(self.recv_with_seq()?.payload)
+    }
+
+    /// Non-blocking receive: a single attempt, without the COMMITTED grace
+    /// poll.
+    ///
+    /// `Ok(None)` means nothing is readable *right now* — the tail slot is
+    /// not COMMITTED (an empty ring, or a producer mid-batch whose head
+    /// cursor is not published yet). A polling consumer pays one header read
+    /// per attempt instead of `recv`'s grace poll plus a Python exception, so
+    /// this is the receive to spin on. Crash recovery still applies: the tail
+    /// reclaim runs once (without the grace poll) and the read is retried
+    /// when it freed a dead writer's leftover.
+    pub fn try_recv(&mut self) -> Result<Option<Vec<u8>>> {
+        self.refresh_cursors()?;
+        if self.closed && self.len == 0 {
+            return Err(ChannelError::Closed.into());
+        }
+        if !self.tail_committed()? {
+            if self.try_reclaim_at_tail()? == 0 || !self.tail_committed()? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(self.recv_with_seq()?.payload))
+    }
+
+    /// Whether the tail slot is COMMITTED — the cheap readability probe
+    /// behind `try_recv` (one slot-header read, no poll, no reclaim).
+    fn tail_committed(&self) -> Result<bool> {
+        let (state, _, _) = self.region.read_header(self.tail)?;
+        Ok(state == SlotState::Committed)
     }
 
     /// Shared prologue of the receive paths (`recv_with_seq`, `recv_view`):
@@ -3697,7 +3777,13 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         let Some(timeout) = self.config.timeout else {
             return Err(ChannelError::BufferFull.into());
         };
-        let deadline = Instant::now() + timeout;
+        self.wait_for_space_until(needed_slots, Instant::now() + timeout)
+    }
+
+    /// Wait for space until `deadline`. The caller owns the deadline so that
+    /// a retried reservation cannot extend the wait past the configured
+    /// timeout (see `reserve_slots`).
+    fn wait_for_space_until(&mut self, needed_slots: usize, deadline: Instant) -> Result<()> {
         while Instant::now() < deadline {
             self.refresh_cursors()?;
             if self.config.capacity - self.guard_len() >= needed_slots {
@@ -4348,11 +4434,13 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     ///
     /// The peek/decode is retried (unbounded) because a concurrent dropper
     /// can tear the tail slot mid-release: every competing drop is bounded
-    /// work, so the retry loop always reaches a stable tail. The only exit
-    /// without progress is the COMMITTED gate rejecting a crashed writer's
-    /// leftover — a WRITING slot at a tail that does not advance, where no
-    /// amount of waiting helps.
+    /// work, so the retry loop always reaches a stable tail. A WRITING tail
+    /// is waited out rather than refused (see the loop), so the only exit
+    /// without progress is a writer that neither commits nor dies within the
+    /// bound.
     fn drop_oldest_message_mpsc(&mut self) -> Result<()> {
+        const DROP_WAIT: Duration = Duration::from_secs(5);
+        let deadline = Instant::now() + DROP_WAIT;
         loop {
             self.refresh_cursors()?;
             if self.len == 0 {
@@ -4360,12 +4448,26 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
             }
             let tail_count = self.tail_cursor;
             if !self.poll_tail_committed()? {
-                // Refuse only when the cursors did not move during the
-                // grace period (a crash leftover); a transient FREE from a
-                // concurrent release resolves as soon as the tail advances.
+                // A WRITING tail is either another producer's in-flight
+                // reservation — which commits shortly, so the drop must *wait
+                // for it* — or a crashed writer's leftover, which the reclaim
+                // takes. Refusing as soon as the cursors stand still conflated
+                // the two: a healthy send on a DropOldest channel failed with
+                // `BufferFull` whenever it raced another producer's write
+                // (reproduced 2/20 on Windows), contradicting the documented
+                // "drop strategies keep `send` a successful call". So reclaim
+                // the dead case, wait out the live one, and keep a wall-clock
+                // bound for a writer that never finishes (a *yield* budget is
+                // scheduler-dependent and fires on healthy peers under load).
+                if self.try_reclaim_at_tail()? > 0 {
+                    continue;
+                }
                 self.refresh_cursors()?;
                 if self.tail_cursor == tail_count {
-                    return Err(ChannelError::BufferFull.into());
+                    if Instant::now() >= deadline {
+                        return Err(ChannelError::BufferFull.into());
+                    }
+                    thread::yield_now();
                 }
                 continue;
             }
@@ -5277,6 +5379,47 @@ mod tests {
     }
 
     #[test]
+    fn try_recv_polls_without_raising_or_consuming() {
+        let path = test_file_path("persistent-try-recv");
+        let config = SpscConfig {
+            capacity: 4,
+            slot_size: 32,
+            backpressure: Backpressure::Raise,
+            timeout: None,
+            multi_producer: false,
+        };
+        let mut producer = PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone())
+            .expect("producer handle");
+        let mut consumer =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("consumer handle");
+
+        // An empty ring reports nothing — twice, without disturbing state.
+        assert_eq!(consumer.try_recv().expect("poll empty"), None);
+        assert_eq!(consumer.try_recv().expect("poll empty again"), None);
+
+        producer.send(b"one").expect("send one");
+        assert_eq!(
+            consumer.try_recv().expect("poll one"),
+            Some(b"one".to_vec())
+        );
+        assert_eq!(consumer.try_recv().expect("poll drained"), None);
+
+        // A non-blocking read advances the same sequence state as `recv`:
+        // the next message is seq 1 and the strict chain still holds.
+        producer.send(b"two").expect("send two");
+        assert_eq!(consumer.recv_with_seq().expect("recv two").seq, 1);
+
+        // Closed and empty is a distinct state, exactly as in `recv`.
+        consumer.close();
+        assert!(matches!(
+            consumer.try_recv(),
+            Err(DslineError::Channel(ChannelError::Closed))
+        ));
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
     fn persistent_channel_sends_and_receives_chunked_message() {
         let path = test_file_path("persistent-chunked");
         let mut channel = PersistentShmChannel::<MmapSlotStorage>::create(
@@ -6120,29 +6263,42 @@ mod tests {
 
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let done_b = done_tx.clone();
+        // Signals completion even when the producer panics: without this the
+        // consumer would wait forever for a signal that never arrives, and the
+        // test would hang (observed once) instead of failing.
+        struct Done(std::sync::mpsc::Sender<()>);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
         let join_a = std::thread::spawn(move || {
+            let _done = Done(done_tx);
             for i in 0..PER_PRODUCER {
                 // 0..60 payload bytes: single-slot and chunked messages mix.
                 let payload = format!("a-{i}-{}", "x".repeat((i * 7) % 60));
                 producer_a.send(payload.as_bytes()).expect("send a");
             }
-            done_tx.send(()).unwrap();
         });
         let join_b = std::thread::spawn(move || {
+            let _done = Done(done_b);
             for i in 0..PER_PRODUCER {
                 let payload = format!("b-{i}-{}", "y".repeat((i * 13) % 60));
                 producer_b.send(payload.as_bytes()).expect("send b");
             }
-            done_b.send(()).unwrap();
         });
 
         // Drain until both producers finished and the ring is empty. The
         // reservations are disjoint by construction, so every payload must
-        // appear exactly once regardless of interleaving.
+        // appear exactly once regardless of interleaving. The deadline turns
+        // a stuck producer into a failure with a diagnostic rather than a
+        // hung test binary.
         let mut consumer =
             PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("open consumer");
         let mut received = Vec::with_capacity(2 * PER_PRODUCER);
         let mut producers_done = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             match consumer.recv_with_seq() {
                 Ok(message) => received.push(String::from_utf8(message.payload).expect("utf8")),
@@ -6153,6 +6309,13 @@ mod tests {
                     if producers_done == 2 {
                         break;
                     }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "producers did not finish within 60s: {producers_done}/2 done, \
+                         ring depth {}, received {}",
+                        consumer.len(),
+                        received.len()
+                    );
                 }
                 Err(err) => panic!("unexpected recv error: {err:?}"),
             }
@@ -6623,5 +6786,125 @@ mod tests {
         ch.send(b"d").expect("send d");
         ch.send(b"e").expect("send e");
         ch.send(b"f").expect("send f");
+    }
+
+    /// Temporary probe: where does the copy path's per-byte cost come from?
+    /// Run with `cargo test -p dsline-shm --lib timing_probe -- --nocapture`.
+    #[test]
+    #[ignore]
+    fn timing_probe() {
+        use dsline_core::checksum::checksum32;
+        use std::time::Instant;
+
+        const N: usize = 5000;
+        let report = |label: &str, total: std::time::Duration| {
+            println!(
+                "{label:<28} {:>8.2} µs/call",
+                total.as_secs_f64() * 1e6 / N as f64
+            );
+        };
+
+        for size in [64usize, 4096] {
+            println!("--- payload {size} B ---");
+            let payload = vec![b'z'; size];
+
+            // 1. checksum alone
+            let t = Instant::now();
+            let mut sink = 0u32;
+            for _ in 0..N {
+                sink = sink.wrapping_add(checksum32(&payload));
+            }
+            report("checksum32", t.elapsed());
+            assert_ne!(sink, 0);
+
+            // 2. frame encode alone
+            let t = Instant::now();
+            for _ in 0..N {
+                let frame = dsline_core::encode_frame(
+                    dsline_core::FrameKind::Bytes,
+                    0,
+                    1,
+                    0,
+                    0,
+                    &[],
+                    &payload,
+                )
+                .expect("encode");
+                sink = sink.wrapping_add(frame.len() as u32);
+            }
+            report("encode_frame", t.elapsed());
+            assert_ne!(sink, 0);
+
+            // 3. region write alone (frame already built)
+            let path = test_file_path(&format!("timing-write-{size}"));
+            let frame =
+                dsline_core::encode_frame(dsline_core::FrameKind::Bytes, 0, 1, 0, 0, &[], &payload)
+                    .expect("encode");
+            let region = PersistentSlotRegion::<MmapSlotStorage>::create(&path, N, size + 98)
+                .expect("region");
+            let t = Instant::now();
+            for index in 0..N {
+                region
+                    .write_committed(index, 1, &frame, None)
+                    .expect("write committed");
+            }
+            report("region write_committed", t.elapsed());
+            drop(region);
+            fs::remove_file(&path).expect("cleanup");
+
+            // 4. region read alone
+            let path = test_file_path(&format!("timing-read-{size}"));
+            let region = PersistentSlotRegion::<MmapSlotStorage>::create(&path, N, size + 98)
+                .expect("region");
+            for index in 0..N {
+                region
+                    .write_committed(index, 1, &frame, None)
+                    .expect("write committed");
+            }
+            let t = Instant::now();
+            for index in 0..N {
+                let snapshot = region.read_committed(index).expect("read");
+                sink = sink.wrapping_add(snapshot.data.len() as u32);
+                region.release_pinned(index).expect("release");
+            }
+            report("region read_committed", t.elapsed());
+            drop(region);
+            fs::remove_file(&path).expect("cleanup");
+
+            // 5. full channel send + try_recv
+            let path = test_file_path(&format!("timing-channel-{size}"));
+            let config = SpscConfig {
+                capacity: N,
+                slot_size: size + 64,
+                backpressure: Backpressure::Raise,
+                timeout: None,
+                multi_producer: false,
+            };
+            let mut producer =
+                PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone())
+                    .expect("producer");
+            let mut consumer =
+                PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("consumer");
+            let t = Instant::now();
+            for _ in 0..N {
+                producer.send(&payload).expect("send");
+            }
+            report("channel send", t.elapsed());
+            let t = Instant::now();
+            for _ in 0..N {
+                sink = sink.wrapping_add(
+                    consumer
+                        .try_recv()
+                        .expect("try_recv")
+                        .expect("readable")
+                        .len() as u32,
+                );
+            }
+            report("channel try_recv", t.elapsed());
+            assert_ne!(sink, 0);
+            drop(producer);
+            drop(consumer);
+            fs::remove_file(&path).expect("cleanup");
+        }
     }
 }

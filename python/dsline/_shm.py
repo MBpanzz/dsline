@@ -5,22 +5,41 @@ destroyed with the last handle); everywhere else they live as `dsline-*.bin`
 region files in the platform runtime directory. These commands manage the
 runtime directory and its region files.
 
-The name → file mapping mirrors `dsline-shm` exactly (FNV-1a checksum32 of
-the UTF-8 name): `dsline-<8 hex digits>.bin`.
+The name → file mapping mirrors `dsline-shm` exactly (CRC-32 of the UTF-8
+name, the same checksum the frame protocol uses): `dsline-<8 hex digits>.bin`.
 """
 
 from __future__ import annotations
 
 import os
+import zlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
+
+
+def _checksum32(data: bytes) -> int:
+    """CRC-32 (IEEE), mirroring dsline-core checksum32 (`crc32fast`).
+
+    `zlib.crc32` is the same CRC-32/ISO-HDLC, so the digests agree byte for
+    byte. The Rust side switched from FNV-1a to CRC-32 for speed, and this
+    mirror must switch with it or the CLI would compute a different region
+    path than the channel it is inspecting.
+    """
+    return zlib.crc32(data) & 0xFFFF_FFFF
+
 
 _FNV_OFFSET = 0x811C_9DC5
 _FNV_PRIME = 0x0100_0193
 
 
-def _checksum32(data: bytes) -> int:
-    """FNV-1a 32-bit, mirroring dsline-core checksum32."""
+def _fnv1a32(data: bytes) -> int:
+    """FNV-1a 32-bit — the *routing* hash of the sharded fan-out.
+
+    Deliberately not `_checksum32`: the frame checksum is free to change with
+    the protocol version, but the routing hash is a documented, solver-checked
+    contract (`ShardedChannel` routes by `FNV-1a-32(key) % shards`, so every
+    process agrees on the shard for a key).
+    """
     value = _FNV_OFFSET
     for byte in data:
         value ^= byte

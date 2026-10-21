@@ -2,7 +2,10 @@ use crate::checksum::checksum32;
 use crate::error::{ProtocolError, Result};
 
 pub const FRAME_MAGIC: u32 = 0x4453_4c4e;
-pub const FRAME_VERSION: u16 = 1;
+/// Frame protocol version. 2 = CRC-32 (IEEE) payload checksum; version 1
+/// frames carried a byte-at-a-time FNV-1a checksum. A reader rejects frames
+/// from another version instead of mis-validating them.
+pub const FRAME_VERSION: u16 = 2;
 pub const FRAME_HEADER_LEN: usize = 50;
 pub const TLV_HEADER_LEN: usize = 6;
 pub const FRAME_FLAG_CHUNKED: u16 = 0x0001;

@@ -2,6 +2,7 @@ import gc
 import multiprocessing as mp
 import os
 import subprocess
+import threading
 import time
 import unittest
 import uuid
@@ -466,6 +467,117 @@ class CrashRecoveryShmChannelTests(unittest.TestCase):
     def test_stats_report_reclaimed_slots(self) -> None:
         ch = self.make_channel("crash-stats", capacity=4, slot_size=64)
         self.assertEqual(ch.stats()["reclaimed_slots"], 0)
+
+
+class TryRecvTests(unittest.TestCase):
+    """`try_recv()` is the non-blocking, non-raising poll.
+
+    `recv()` runs the COMMITTED grace poll and raises `BufferEmptyError` on
+    every empty attempt, so a spin-based consumer pays the interpreter's
+    exception path per poll; `try_recv()` returns `None` instead.
+    """
+
+    def make_channel(self, label, **kwargs):
+        ch = dsline.ShmChannel(unique_name(label), **kwargs)
+        self.addCleanup(remove_region, ch)
+        return ch
+
+    def test_try_recv_returns_none_while_empty(self) -> None:
+        ch = self.make_channel("try-empty", capacity=2, slot_size=16)
+
+        self.assertIsNone(ch.try_recv())
+        self.assertIsNone(ch.try_recv())
+
+    def test_try_recv_returns_payloads_then_none(self) -> None:
+        ch = self.make_channel("try-drain", capacity=2, slot_size=16)
+        ch.send(b"one")
+        ch.send(b"two")
+
+        self.assertEqual(ch.try_recv(), b"one")
+        self.assertEqual(ch.try_recv(), b"two")
+        self.assertIsNone(ch.try_recv())
+
+    def test_try_recv_shares_the_sequence_state_with_recv(self) -> None:
+        ch = self.make_channel("try-seq", capacity=2, slot_size=16)
+        ch.send(b"one")
+        ch.send(b"two")
+
+        self.assertEqual(ch.try_recv(), b"one")
+        # The strict +1 chain continues across the two receive paths.
+        self.assertEqual(ch.recv_with_seq(), (1, b"two"))
+
+    def test_try_recv_reports_a_closed_empty_channel(self) -> None:
+        ch = self.make_channel("try-closed", capacity=2, slot_size=16)
+        ch.close()
+
+        with self.assertRaises(dsline.ChannelClosedError):
+            ch.try_recv()
+
+
+class ThreadingTests(unittest.TestCase):
+    """In-process producer/consumer threads use one handle each.
+
+    A handle is serialized by an internal lock, so two threads sharing one
+    handle would starve each other (a blocking send holds the lock). With a
+    handle per thread the remaining hazard is the GIL: a blocking send spins
+    in Rust until the consumer frees space, and it must release the GIL or the
+    consumer thread can never drain the ring — the send would then block until
+    its timeout and fail.
+    """
+
+    def make_channel(self, label, **kwargs):
+        ch = dsline.ShmChannel(unique_name(label), **kwargs)
+        self.addCleanup(remove_region, ch)
+        return ch
+
+    def test_blocking_send_and_a_consumer_thread_make_progress(self) -> None:
+        count = 200
+        name = unique_name("threads")
+        producer_ch = dsline.ShmChannel(
+            name,
+            capacity=4,
+            slot_size=256,
+            backpressure=dsline.Backpressure.Block,
+            timeout=10.0,
+        )
+        self.addCleanup(remove_region, producer_ch)
+        consumer_ch = dsline.ShmChannel(name, capacity=4, slot_size=256)
+        self.addCleanup(remove_region, consumer_ch)
+
+        payload = b"x" * 128
+        errors = []
+        received = []
+
+        def producer():
+            try:
+                for _ in range(count):
+                    producer_ch.send(payload)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def consumer():
+            try:
+                while len(received) < count:
+                    data = consumer_ch.try_recv()
+                    if data is None:
+                        time.sleep(0)
+                        continue
+                    received.append(data)
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=producer),
+            threading.Thread(target=consumer),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(received), count)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
 
 
 if __name__ == "__main__":

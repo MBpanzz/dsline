@@ -7,6 +7,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# CRC-32 (IEEE) for the frame checksum: corruption detection that runs over
+# every payload byte on send and receive, so a serial byte-at-a-time hash is
+# the copy path's per-byte cost. Small, stable, no unsafe in our code.
+crc32fast = "1"
 
 [dev-dependencies]
 

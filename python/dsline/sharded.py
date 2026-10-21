@@ -36,7 +36,7 @@ capacity/slot_size mismatch fails at open.
 from __future__ import annotations
 
 from ._dsline import Backpressure, BufferEmptyError, ShmChannel
-from ._shm import _checksum32
+from ._shm import _fnv1a32
 
 STRATEGIES = ("round_robin", "hash", "broadcast")
 
@@ -44,13 +44,15 @@ STRATEGIES = ("round_robin", "hash", "broadcast")
 def shard_for(key: bytes, shards: int) -> int:
     """The shard a routing key lands on: ``FNV-1a-32(key) % shards``.
 
-    Uses the project's FNV-1a checksum32 (the same function the name →
-    region mapping uses), so the routing decision is a pure function of the
-    key and the shard count — stateless across processes.
+    A pure function of the key and the shard count, so every process routes
+    the same key to the same shard. It is FNV-1a rather than the frame
+    checksum: the checksum is free to change with the protocol version, while
+    this routing contract is solver-checked (`verify/check_invariants.py`
+    Z5.2) and must not move with it.
     """
     if shards <= 0:
         raise ValueError("shards must be positive")
-    return _checksum32(bytes(key)) % shards
+    return _fnv1a32(bytes(key)) % shards
 
 
 class ShardedChannel:
