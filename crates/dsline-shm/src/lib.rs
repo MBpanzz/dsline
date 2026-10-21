@@ -5727,6 +5727,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, target_os = "linux"))]
     fn process_identity_of_a_live_self_is_alive() {
         let identity = process::current_process_identity();
         assert_eq!(

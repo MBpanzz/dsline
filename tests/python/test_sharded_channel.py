@@ -27,9 +27,12 @@ def _shard_consumer(name, shards, capacity, slot_size, shard_index, count, resul
 
     The shards are multi-producer regions (the producers route with
     `multi_producer=True`), and every opener must agree on the mode, so the
-    consumer opens its shard handle with the same flag. A 20 s deadline
-    bounds the spin so a broken flow reports partial results instead of
-    hanging the suite.
+    consumer opens its shard handle with the same flag. The deadline bounds
+    the spin so a broken flow reports partial results instead of hanging the
+    suite; it is generous because a CI runner has 2-4 cores while this test
+    runs four processes, each paying a fresh interpreter start plus the
+    extension import (a 20 s budget was observed expiring before the
+    producer's first message on the Windows runners).
     """
     fan = dsline.ShardedChannel(
         name, shards=shards, capacity=capacity, slot_size=slot_size,
@@ -37,7 +40,7 @@ def _shard_consumer(name, shards, capacity, slot_size, shard_index, count, resul
     )
     shard = fan.shard(shard_index)
     received = []
-    deadline = time.monotonic() + 20
+    deadline = time.monotonic() + 120
     while len(received) < count and time.monotonic() < deadline:
         try:
             received.append(shard.recv())

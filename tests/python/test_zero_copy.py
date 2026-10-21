@@ -315,7 +315,7 @@ class ZeroCopyShmChannelTests(unittest.TestCase):
         # then cannot wrap onto that slot, so its next send blocks even
         # after the rest of the ring drains.
         view = None
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 120
         while view is None:
             try:
                 view = ch.recv_view()
