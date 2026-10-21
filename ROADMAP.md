@@ -838,6 +838,17 @@ rustc: 1.75
 - 72 小时长稳测试，1.0 前必须完成。
 - RSS、fd、handle、共享内存泄漏检测。
 
+### 17.5 测试环境与执行规范（强制）
+
+所有改动必须在 **Windows 开发通道** 与 **WSL Linux 验证通道** 两条通道上验证通过，细则见 [`docs/development.md`](docs/development.md)。
+
+- **Windows 通道**：`cargo test --workspace`、`maturin develop`、`unittest discover -s tests/python`、`verify/check_invariants.py`；Rust 侧必须显式指定 `PYO3_PYTHON` 指向可用的 conda 解释器，否则 `dsline-python` 测试二进制链接失败。
+- **WSL 通道（强制）**：`scripts/wsl-test.sh all`（幂等；子命令 `setup` / `rust` / `python` / `verify` / `bench`）。
+- **为什么必须双通道**：Linux 是一级平台（§13.1）；`MAP_SHARED` 无需 flush，因此传输层的真实性能数字只能在 Linux 上取得（Windows 侧的 `FlushViewOfFile` 成本见 `docs/benchmarks.md`）；崩溃恢复的 `/proc` 存活探测、存储后端选择、区域目录等平台分支只有 Linux 能覆盖。
+- **平台相关的改动**（`process.rs`、存储后端、区域布局、CLI 的 `shm` 子命令）必须两条通道都跑，并在 `CHANGELOG.md` / `PROGRESS.md` 注明平台差异。
+- 求解器校验（`verify/check_invariants.py`）的 replay 段依赖已构建的扩展；**跳过该段不算通过**。
+- 性能结论必须注明平台与日期；涉及性能的改动需在 WSL 通道跑 `scripts/wsl-test.sh bench` 并更新 `docs/benchmarks.md`。
+
 ---
 
 ## 18. 项目结构

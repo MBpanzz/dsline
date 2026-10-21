@@ -152,7 +152,10 @@ mod imp {
 mod imp {
 
     pub fn current_process_start_time() -> u64 {
-        read_start_time(std::path::Path::new("/proc/self")).unwrap_or(0)
+        read_start_time(std::path::Path::new("/proc/self"))
+            .ok()
+            .flatten()
+            .unwrap_or(0)
     }
 
     /// `Ok(None)` = no such process; `Ok(Some(t))` = starttime in clock
