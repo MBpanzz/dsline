@@ -533,10 +533,12 @@ fn wait_for_full_size(file: &File, total_len: usize) -> Result<u64> {
             .map_err(|_| ChannelError::StorageIo("stat file storage"))?
             .len())
     };
-    // Wall-clock for the same reason as `wait_initialized`: a healthy creator
-    // mid-`set_len` must not be mistaken for a mismatched configuration just
-    // because the scheduler kept it off the CPU.
-    const WAIT: Duration = Duration::from_secs(30);
+    // Wall-clock for the same reason as `wait_initialized`, but short: the
+    // window it covers is the creator's `set_len` right after `create_new` —
+    // microseconds of work — so a *genuinely* mismatched file (a channel
+    // opened with a larger capacity than it was created with) must fail
+    // promptly rather than sit out a long bound.
+    const WAIT: Duration = Duration::from_secs(2);
     let deadline = Instant::now() + WAIT;
     let mut actual_len = stat()?;
     while actual_len < total_len as u64 && Instant::now() < deadline {
@@ -1114,6 +1116,7 @@ mod section_ffi {
         ) -> *mut c_void;
         pub fn UnmapViewOfFile(lp_base_address: *const c_void) -> i32;
         pub fn CloseHandle(h_object: HANDLE) -> i32;
+        pub fn SetLastError(dw_err_code: u32);
         pub fn GetLastError() -> u32;
     }
 }
@@ -1182,6 +1185,18 @@ impl SectionShmSlotStorage {
         let section = unsafe {
             let hi = (total_len as u64 >> 32) as u32;
             let lo = total_len as u32;
+            // `GetLastError` reports the *thread's* last error, and the
+            // function only documents that it sets ERROR_ALREADY_EXISTS when
+            // the object existed — so it must be cleared first. Without this,
+            // a stale code from an earlier call on this thread can make a
+            // brand-new section look existing (nobody initializes it) or, with
+            // a stale 0, make an *existing* section look new and
+            // re-initialize a live ring (slot headers wiped, messages lost —
+            // one handle per thread creating several shards makes this
+            // reachable, and it is what the Windows CI broadcast test was
+            // intermittently showing: a consumer reading an initialized-to-
+            // empty region whose cursors still said "5 pending").
+            section_ffi::SetLastError(0);
             section_ffi::CreateFileMappingW(
                 section_ffi::INVALID_HANDLE_VALUE,
                 std::ptr::null_mut(),
@@ -3085,6 +3100,17 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     /// guaranteed to observe every slot header written before it (release),
     /// so concurrent openers can never see a half-initialized region.
     fn initialize_region(&self) -> Result<()> {
+        // Safety net for a duplicate creator (a misdetected
+        // `CreateFileMapping`): once the magic is published, this region
+        // belongs to whoever initialized it, and rewriting the slot headers
+        // here would wipe live messages while leaving the cursors claiming
+        // they are pending. Opening an initialized region is the correct
+        // behaviour for the loser of that race.
+        if self.region.load_magic()? != 0 {
+            return self
+                .region
+                .wait_initialized(region_magic(self.config.multi_producer));
+        }
         // Initialise all slots as FREE.
         for i in 0..self.config.capacity {
             self.region.write_header(i, SlotState::Free, 0, 0)?;
@@ -5386,6 +5412,35 @@ mod tests {
         assert_eq!(first.payload, b"two");
         assert_eq!(second.seq, 2);
         assert_eq!(second.payload, b"three");
+
+        fs::remove_file(path).expect("cleanup");
+    }
+
+    #[test]
+    fn re_initializing_a_live_region_does_not_wipe_it() {
+        // A duplicate creator (a misdetected CreateFileMapping on Windows,
+        // whose `created` flag comes from the thread's last error) must not
+        // rewrite the slot headers of a region somebody already initialised:
+        // the messages would vanish while the cursors still claimed they were
+        // pending — which is what the Windows CI broadcast test intermittently
+        // observed (a consumer reading nothing, from a region whose paths and
+        // depths matched the producer's).
+        let path = test_file_path("reinit-guard");
+        let config = persistent_config(4, 64);
+        let mut producer =
+            PersistentShmChannel::<MmapSlotStorage>::create(&path, config.clone()).expect("create");
+        producer.send(b"one").expect("send one");
+
+        producer
+            .initialize_region()
+            .expect("re-initialising an initialised region is a no-op");
+
+        let mut consumer =
+            PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("open consumer");
+        assert_eq!(
+            consumer.recv_with_seq().expect("message survived").payload,
+            b"one"
+        );
 
         fs::remove_file(path).expect("cleanup");
     }
