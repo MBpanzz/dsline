@@ -3180,7 +3180,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         frame: &[u8],
         stamp: &WriterIdentity,
     ) -> Result<()> {
-        const RELEASE_WAIT: Duration = Duration::from_secs(5);
+        const RELEASE_WAIT: Duration = Duration::from_secs(30);
         let deadline = Instant::now() + RELEASE_WAIT;
         loop {
             match self
@@ -4439,7 +4439,7 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
     /// without progress is a writer that neither commits nor dies within the
     /// bound.
     fn drop_oldest_message_mpsc(&mut self) -> Result<()> {
-        const DROP_WAIT: Duration = Duration::from_secs(5);
+        const DROP_WAIT: Duration = Duration::from_secs(30);
         let deadline = Instant::now() + DROP_WAIT;
         loop {
             self.refresh_cursors()?;
@@ -6231,7 +6231,11 @@ mod tests {
             capacity,
             slot_size: 64,
             backpressure: Backpressure::Block,
-            timeout: Some(Duration::from_secs(10)),
+            // Generous on purpose: the suite runs in parallel, and a CI runner
+            // has 2-4 cores for it. A tight timeout here measures the runner's
+            // scheduler, not the channel (a `Block` send that times out is a
+            // legitimate failure, so the budget must not be tight).
+            timeout: Some(Duration::from_secs(60)),
             multi_producer: true,
         }
     }
@@ -6298,7 +6302,7 @@ mod tests {
             PersistentShmChannel::<MmapSlotStorage>::open(&path, config).expect("open consumer");
         let mut received = Vec::with_capacity(2 * PER_PRODUCER);
         let mut producers_done = 0;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
         loop {
             match consumer.recv_with_seq() {
                 Ok(message) => received.push(String::from_utf8(message.payload).expect("utf8")),

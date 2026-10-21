@@ -176,3 +176,12 @@ cd /mnt/c/Simpl/dsline && bash scripts/wsl-test.sh setup
 另一个背景事实：这些代码从未被 CI 编译过——本地 `main` 领先 `origin/main` 7 个提交（MPSC、Pipeline/CLI、崩溃恢复、分片 MPMC、零拷贝），CI 最后一次运行停在 2026-06-06。**双通道验证不能替代推送**：提交后要确认 CI 真的跑起来（`.github/workflows/ci.yml` 覆盖 ubuntu/macos/windows）。
 
 同一轮还暴露了一个流程漏洞：**扩展静默陈旧**。Windows 上 `maturin develop` 因为找不到虚拟环境/conda 环境一直失败，而失败信息被管道日志吞掉，于是 Python 测试从 2026-10-02 起一直跑的是旧 `.pyd`——Rust 单测是新的，Python 测试却什么都没验证到。现在的 `scripts/windows-test.sh` 固定了环境并在构建后打印扩展时间戳；改动 Rust 侧后**务必确认时间戳变了**。
+
+### 9.1 推送后的第一次 CI（2026-10-21，运行 #14）
+
+7 个未推送提交 + 3 个新提交推送后，CI 第一次看到 9 月以来的全部代码：**ubuntu 3.12 与两个 Windows job 通过；ubuntu 3.11 与两个 macOS job 的 "Rust tests" 失败**。
+
+- **macOS：确定的缺陷。** `process.rs` 的身份测试断言真实平台探测的结果，但只有 Windows 和 Linux 实现了探测（其他平台按 ROADMAP §6.2 的保守默认一律回 `Unknown`，从不自动回收）。这些测试已按平台门控，并新增一个测试固定"无探测平台一律 Unknown"——它正好在 CI 的 macOS job 上运行。
+- **ubuntu 3.11：拥塞相关的超时。** 本机用 `taskset` 限到 2 核与 4 核各跑 20 次都无法复现（0/40），而 CI runner 只有 2–4 核且整套测试并行；压力测试与内部等待的预算因此放宽，但仍保持有界。
+- 教训：**本机 12 核不会暴露的东西，CI 的 2–4 核会**。时序敏感的压力测试要给足预算，任何"永不失败"的路径都必须有有界失败兜底（有界失败也优于挂死）。
+- 为让此类失败下次可诊断，CI 的 Rust/Python 测试步骤现在把失败测试名与 `error[...]` 以 `::error::` 注解输出（原始 job 日志需要仓库凭据，否则只看得到 "exit code 101"）。

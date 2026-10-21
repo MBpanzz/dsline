@@ -240,7 +240,12 @@ mod tests {
         pid
     }
 
+    /// The identity tests below assert what a real platform probe answers;
+    /// only Windows and Linux implement one (`imp::process_start_time`), and
+    /// the other platforms deliberately answer `Unknown` for everything (see
+    /// `identity_probe_is_conservative_without_a_platform_impl`).
     #[test]
+    #[cfg(any(windows, target_os = "linux"))]
     fn current_process_identity_is_alive() {
         let identity = current_process_identity();
         assert_ne!(identity.pid, 0);
@@ -248,6 +253,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, target_os = "linux"))]
     fn current_identity_survives_a_roundtrip() {
         let identity = current_process_identity();
         assert_eq!(
@@ -257,6 +263,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, target_os = "linux"))]
     fn reaped_process_identity_is_gone() {
         let pid = spawn_and_reap();
         // The exact start_time does not matter: the PID no longer exists.
@@ -265,6 +272,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, target_os = "linux"))]
     fn pid_reuse_is_detected_as_gone() {
         let pid = spawn_and_reap();
         // A "reused" PID that exists with a different start time: simulate
@@ -288,6 +296,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(windows, target_os = "linux"))]
     fn improbable_pid_is_gone_not_unknown() {
         // A PID beyond the platform's process-id range must classify as
         // Gone (no such process), not Unknown. Windows pids are < 2^22ish

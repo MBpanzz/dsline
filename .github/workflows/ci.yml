@@ -26,7 +26,20 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Rust tests
-        run: cargo test
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --workspace 2>&1 | tee cargo-test.log
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            # Surface what failed as annotations: the raw job log needs
+            # repository credentials, so a failure here is otherwise
+            # undiagnosable from outside.
+            grep -E '^---- .* stdout ----|^error(\[|:)|^test result: FAILED' cargo-test.log \
+              | head -40 \
+              | while IFS= read -r line; do echo "::error::$line"; done
+          fi
+          exit "$status"
 
       - name: Install maturin
         run: python -m pip install "maturin>=1.5,<2"
@@ -40,7 +53,17 @@ jobs:
           python -m pip install target/wheels/*.whl
 
       - name: Python tests
-        run: python -m unittest discover -s tests/python
+        shell: bash
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests/python 2>&1 | tee python-test.log
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            grep -E '^(FAIL|ERROR):|^Ran |^FAILED' python-test.log \
+              | head -40 \
+              | while IFS= read -r line; do echo "::error::$line"; done
+          fi
+          exit "$status"
 
       - name: CLI smoke
         run: python -m dsline info --json
