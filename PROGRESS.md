@@ -1,5 +1,50 @@
 # Project Progress Report — 2026-05-16
 
+## Update — 2026-10-21: CI green on all six jobs, and a Windows data-loss bug behind the last failure
+
+The pushed code had never been through CI since 2026-06-06. Six runs later, all
+six jobs (ubuntu / macOS / Windows × Python 3.11 / 3.12) pass. What the loop
+found, in order:
+
+1. **macOS did not compile.** Several tests/methods assumed a platform
+   process-identity probe; only Windows and Linux implement one, and the rest
+   answer `Unknown` by design (roadmap §6.2). The probe-dependent tests are
+   gated and a test now pins the conservative behaviour on the platforms that
+   have no probe. Reproduced locally with `cargo check --target
+   x86_64-apple-darwin -p dsline-shm --all-targets` — the cheap way to check
+   this class of mistake without a Mac.
+2. **Several bounds were yield counts rather than wall-clock.** The same class
+   of bug as the MPSC ones fixed earlier: `wait_initialized` (2048 yields) and
+   `wait_for_full_size`, plus every cross-process test deadline. A CI runner
+   has 2–4 cores for the whole suite, so a fixed budget measures the
+   scheduler: an opener racing a creator that is descheduled gives up while
+   nothing is wrong.
+3. **The Windows failure was a data-loss bug, not a test bug.** The
+   paging-file section backend decided "I am the creator" from `GetLastError()`
+   *without clearing it first*. That returns the thread's last error, and
+   `CreateFileMappingW` only documents that it sets `ERROR_ALREADY_EXISTS` on
+   the existing-object path — so a stale code from an earlier call on the same
+   thread could make an **existing** section look new. The misclassified
+   process then ran the initialization pass, rewriting every slot header to
+   `FREE` while the cursors still claimed the messages were pending: every
+   consumer of that region read nothing, forever. `ShardedChannel` creates all
+   N shards on one thread, which is exactly the pattern that reaches it, and
+   the failure only appeared as "one consumer saw nothing" in the sharded
+   tests. Fixed by clearing the error first, plus a guard that refuses to
+   re-initialize a region whose magic is already published (so the invariant
+   survives a misdetection), with a cross-platform regression test.
+4. **CI could not describe its own failures.** The job log needs repository
+   credentials, so a red run reported only "exit code 101". The test steps now
+   strip ANSI and emit the failing test names and error lines as `::error::`
+   annotations (10 per step is GitHub's limit), which is what identified the
+   Windows test and, later, its region paths.
+
+Process notes for future sessions: `shell: bash` in a workflow runs with `-e`
+(a failing `cmd | tee` aborts the step before any diagnostic block runs), and
+the macOS jobs are the ones that exercise the no-probe branches — run the
+apple cross-check before pushing.
+
+
 ## Update — 2026-10-20b: the benchmark's own two bugs, and the 4 KiB fix
 
 The first Linux numbers (update below) sent the project chasing a "copy-path
