@@ -22,6 +22,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # `.cargo/config.toml` carries a machine-local `PYO3_PYTHON` default so a
+      # bare `cargo build` works on the development host. Explicit environment
+      # values win over that config (`force = false`), so CI pins its own
+      # interpreter here — otherwise PyO3 would look for the developer's path.
+      - name: Pin the Python interpreter for PyO3
+        shell: bash
+        run: echo "PYO3_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+
       - name: Rust fmt
         run: cargo fmt --all --check
 
