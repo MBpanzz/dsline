@@ -228,9 +228,9 @@ class CrossProcessFileChannelTests(unittest.TestCase):
         try:
             for payload in payloads:
                 ch.send(payload)
-            received = result_queue.get(timeout=30)
+            received = result_queue.get(timeout=180)
         finally:
-            process.join(timeout=30)
+            process.join(timeout=180)
         if process.is_alive():
             process.terminate()
             process.join(timeout=5)

@@ -292,7 +292,7 @@ class ZeroCopyShmChannelTests(unittest.TestCase):
             except dsline.BufferEmptyError:
                 time.sleep(0.001)
 
-        status, seqs = result_queue.get(timeout=10)
+        status, seqs = result_queue.get(timeout=180)
         self.assertEqual(status, "ok")
         self.assertEqual([seq for seq, _ in received], seqs)
         self.assertEqual([payload for _, payload in received], messages)
@@ -347,7 +347,7 @@ class ZeroCopyShmChannelTests(unittest.TestCase):
             except dsline.BufferEmptyError:
                 time.sleep(0.001)
 
-        status, sent = result_queue.get(timeout=60)
+        status, sent = result_queue.get(timeout=180)
         self.assertEqual(status, "ok")
         self.assertEqual(sent, 6)
         self.assertEqual(received, [f"message-{i}".encode() for i in range(6)])

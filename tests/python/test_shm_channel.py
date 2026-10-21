@@ -263,8 +263,8 @@ class MultiProducerShmChannelTests(unittest.TestCase):
                 time.sleep(0.001)
                 continue
             received.append(payload)
-        producer_a.join(timeout=30)
-        producer_b.join(timeout=30)
+        producer_a.join(timeout=180)
+        producer_b.join(timeout=180)
         if producer_a.is_alive():
             producer_a.terminate()
         if producer_b.is_alive():
@@ -279,7 +279,7 @@ class MultiProducerShmChannelTests(unittest.TestCase):
         }
         self.assertEqual(set(received), expected, "every message delivered")
         self.assertEqual(len(received), 2 * count, "no duplicate deliveries")
-        completions = {result_queue.get(timeout=5) for _ in range(2)}
+        completions = {result_queue.get(timeout=180) for _ in range(2)}
         self.assertEqual(
             completions,
             {("a", count), ("b", count)},
@@ -351,9 +351,9 @@ class CrossProcessShmChannelTests(unittest.TestCase):
         try:
             for payload in payloads:
                 ch.send(payload)
-            received = result_queue.get(timeout=30)
+            received = result_queue.get(timeout=180)
         finally:
-            process.join(timeout=30)
+            process.join(timeout=180)
         if process.is_alive():
             process.terminate()
             process.join(timeout=5)
@@ -406,8 +406,8 @@ class CrashRecoveryShmChannelTests(unittest.TestCase):
             args=(name, capacity, slot_size, result_queue),
         )
         process.start()
-        result_queue.get(timeout=30)
-        process.join(timeout=30)
+        result_queue.get(timeout=180)
+        process.join(timeout=180)
         self.assertEqual(process.exitcode, 0)
 
     @unittest.skipUnless(_PROBE_PLATFORM, _PROBE_REASON)

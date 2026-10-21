@@ -533,11 +533,13 @@ fn wait_for_full_size(file: &File, total_len: usize) -> Result<u64> {
             .map_err(|_| ChannelError::StorageIo("stat file storage"))?
             .len())
     };
+    // Wall-clock for the same reason as `wait_initialized`: a healthy creator
+    // mid-`set_len` must not be mistaken for a mismatched configuration just
+    // because the scheduler kept it off the CPU.
+    const WAIT: Duration = Duration::from_secs(30);
+    let deadline = Instant::now() + WAIT;
     let mut actual_len = stat()?;
-    for _ in 0..2048 {
-        if actual_len >= total_len as u64 {
-            break;
-        }
+    while actual_len < total_len as u64 && Instant::now() < deadline {
         thread::yield_now();
         actual_len = stat()?;
     }
@@ -2220,7 +2222,15 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
     /// the magic appears, the format word is checked so a region written by
     /// a build with a different layout is rejected instead of misread.
     pub fn wait_initialized(&self, expected: u32) -> Result<()> {
-        for _ in 0..2048 {
+        // Wall-clock, not a yield count: the opener races a creator that has
+        // to run its whole initialization pass, and a fixed yield budget
+        // measures the scheduler instead — on a loaded CI runner (several
+        // processes creating the same shards at once) a healthy creator can
+        // be descheduled long enough to exhaust it, and the opener then dies
+        // with "region is not initialized" while nothing is wrong.
+        const WAIT: Duration = Duration::from_secs(30);
+        let deadline = Instant::now() + WAIT;
+        loop {
             let magic = self.load_magic()?;
             if magic == expected {
                 return self.check_format();
@@ -2231,9 +2241,11 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
                 )
                 .into());
             }
+            if Instant::now() >= deadline {
+                return Err(ChannelError::InvalidConfig("region is not initialized").into());
+            }
             thread::yield_now();
         }
-        Err(ChannelError::InvalidConfig("region is not initialized").into())
     }
 
     /// Load the on-region format word.
