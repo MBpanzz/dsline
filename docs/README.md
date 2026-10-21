@@ -41,6 +41,13 @@ The cursor and pin-floor protocols are verified by
   is reclaimed on the spot), and it advances the same sequence state as
   `recv()`, so the two can be mixed.
 
+**Windows lifetime rule.** A named paging-file section exists only while at
+least one handle to it is open, and its contents go with it. A producer that
+sends and closes before any consumer has opened the channel therefore destroys
+its own messages; a later consumer creates a fresh, empty region under the same
+name (the paths match, the data is gone). Open the consumer side first — or
+synchronise — when the producer and the consumer start concurrently.
+
 **One handle per thread.** A handle is serialized by an internal lock, so two
 threads sharing one handle starve each other: a blocking `send` holds the lock
 while it waits for space, and the consumer thread can never drain the ring. In

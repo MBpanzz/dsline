@@ -1,0 +1,11 @@
+# Local default for the PyO3 build.
+#
+# An abi3 extension module on Windows links `python3.lib`, which only a CPython
+# installation ships (the MSYS2 python that PATH typically resolves has none),
+# so a bare `cargo build` / `cargo test` fails with LNK1181 without this.
+#
+# `force = false` (the default) means an explicitly set PYO3_PYTHON — the lane
+# scripts, or CI's own interpreter — still wins; this is only the fallback for
+# running cargo directly.
+[env]
+PYO3_PYTHON = { value = "C:/Users/86177/miniforge3/python.exe", force = false }

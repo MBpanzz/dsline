@@ -2243,7 +2243,7 @@ impl<S: SlotRegionIo> PersistentSlotRegion<S> {
         // processes creating the same shards at once) a healthy creator can
         // be descheduled long enough to exhaust it, and the opener then dies
         // with "region is not initialized" while nothing is wrong.
-        const WAIT: Duration = Duration::from_secs(30);
+        const WAIT: Duration = Duration::from_secs(5);
         let deadline = Instant::now() + WAIT;
         loop {
             let magic = self.load_magic()?;
@@ -4565,16 +4565,18 @@ impl<S: SlotRegionIo> PersistentShmChannel<S> {
         let (storage, created) =
             S::create_or_open(&path, config.capacity, region_slot_size, total_len)?;
         let region = std::sync::Arc::new(PersistentSlotRegion::<S>::from_storage(storage)?);
-        if created {
+        if created && region.load_magic()? == 0 {
             // Freshly created: initialise all slots as FREE and publish the
             // region magic last.
-            Self::new_initialized(region, config)
-        } else {
-            // The region already exists: wait for the creator's magic, then
-            // recover.
-            region.wait_initialized(region_magic(config.multi_producer))?;
-            Self::opened(region, config)
+            return Self::new_initialized(region, config);
         }
+        // Either the region already existed, or `created` was misdetected
+        // (the Windows section backend derives it from the thread's last
+        // error): both must take the *recovery* path, because the region may
+        // already hold live data. Treating a duplicate creator as a fresh one
+        // would leave its handle with head/tail/sequence state at zero.
+        region.wait_initialized(region_magic(config.multi_producer))?;
+        Self::opened(region, config)
     }
 }
 

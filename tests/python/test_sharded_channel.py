@@ -22,7 +22,9 @@ def remove_region(channel) -> None:
     gc.collect()
 
 
-def _shard_consumer(name, shards, capacity, slot_size, shard_index, count, result_queue):
+def _shard_consumer(
+    name, shards, capacity, slot_size, shard_index, count, result_queue, barrier=None
+):
     """Child process worker: drain one shard until `count` messages arrive.
 
     The shards are multi-producer regions (the producers route with
@@ -39,6 +41,9 @@ def _shard_consumer(name, shards, capacity, slot_size, shard_index, count, resul
         multi_producer=True,
     )
     shard = fan.shard(shard_index)
+    if barrier is not None:
+        # Every region now has a live handle somewhere; a producer may send.
+        barrier.wait(timeout=120)
     received = []
     deadline = time.monotonic() + 120
     while len(received) < count and time.monotonic() < deadline:
@@ -60,12 +65,16 @@ def _shard_consumer(name, shards, capacity, slot_size, shard_index, count, resul
     )
 
 
-def _sharded_producer(name, shards, capacity, slot_size, label, count, result_queue):
+def _sharded_producer(
+    name, shards, capacity, slot_size, label, count, result_queue, barrier=None
+):
     """Child process worker: send `count` uniquely-labeled messages."""
     fan = dsline.ShardedChannel(
         name, shards=shards, capacity=capacity, slot_size=slot_size,
         multi_producer=True,
     )
+    if barrier is not None:
+        barrier.wait(timeout=120)
     for i in range(count):
         fan.send(f"{label}-{i}".encode())
     paths = [channel.path for channel in fan.shards()]
@@ -196,17 +205,18 @@ class ShardedCrossProcessTests(unittest.TestCase):
         name = unique_name("xproc")
         shards, per_producer = 3, 12
         result_queue = ctx.Queue()
+        barrier = ctx.Barrier(shards + 2)
         consumers = [
             ctx.Process(
                 target=_shard_consumer,
-                args=(name, shards, 16, 64, i, 2 * per_producer // shards, result_queue),
+                args=(name, shards, 16, 64, i, 2 * per_producer // shards, result_queue, barrier),
             )
             for i in range(shards)
         ]
         producers = [
             ctx.Process(
                 target=_sharded_producer,
-                args=(name, shards, 16, 64, label, per_producer, result_queue),
+                args=(name, shards, 16, 64, label, per_producer, result_queue, barrier),
             )
             for label in ("A", "B")
         ]
@@ -240,17 +250,18 @@ class ShardedCrossProcessTests(unittest.TestCase):
         name = unique_name("bc")
         shards, count = 3, 5
         result_queue = ctx.Queue()
+        barrier = ctx.Barrier(shards + 1)
         consumers = [
             ctx.Process(
                 target=_shard_consumer,
-                args=(name, shards, 8, 64, i, count, result_queue),
+                args=(name, shards, 8, 64, i, count, result_queue, barrier),
             )
             for i in range(shards)
         ]
         for process in consumers:
             process.start()
         producer = ctx.Process(
-            target=_bc_producer, args=(name, shards, 8, 64, count, result_queue)
+            target=_bc_producer, args=(name, shards, 8, 64, count, result_queue, barrier)
         )
         producer.start()
         results = [result_queue.get(timeout=180) for _ in range(shards + 1)]
@@ -275,13 +286,15 @@ class ShardedCrossProcessTests(unittest.TestCase):
             )
 
 
-def _bc_producer(name, shards, capacity, slot_size, count, result_queue):
+def _bc_producer(name, shards, capacity, slot_size, count, result_queue, barrier=None):
     # The consumers created the shards as multi-producer regions; every
     # opener must agree on the mode.
     fan = dsline.ShardedChannel(
         name, shards=shards, capacity=capacity, slot_size=slot_size,
         strategy="broadcast", multi_producer=True,
     )
+    if barrier is not None:
+        barrier.wait(timeout=120)
     for i in range(count):
         fan.send(f"bc-{i}".encode())
     paths = [channel.path for channel in fan.shards()]
