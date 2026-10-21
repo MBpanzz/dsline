@@ -47,7 +47,17 @@ def _shard_consumer(name, shards, capacity, slot_size, shard_index, count, resul
         except dsline.BufferEmptyError:
             continue
     fan.close()
-    result_queue.put(received)
+    # Report what this consumer saw *and* which region it read, so a failure
+    # can tell "the producer wrote elsewhere" from "the messages were lost".
+    result_queue.put(
+        {
+            "kind": "consumer",
+            "shard": shard_index,
+            "received": received,
+            "path": shard.path,
+            "depth": shard.stats()["queue_depth"],
+        }
+    )
 
 
 def _sharded_producer(name, shards, capacity, slot_size, label, count, result_queue):
@@ -58,8 +68,9 @@ def _sharded_producer(name, shards, capacity, slot_size, label, count, result_qu
     )
     for i in range(count):
         fan.send(f"{label}-{i}".encode())
+    paths = [channel.path for channel in fan.shards()]
     fan.close()
-    result_queue.put("done")
+    result_queue.put({"kind": "producer", "paths": paths})
 
 
 # Cross-process waits are generous: a CI runner has 2-4 cores and a cold
@@ -205,8 +216,17 @@ class ShardedCrossProcessTests(unittest.TestCase):
         for process in consumers + producers:
             process.join(timeout=180)
             self.assertEqual(process.exitcode, 0)
-        delivered = [r for r in results if isinstance(r, list)]
-        self.assertEqual(len(delivered), shards)
+        consumers_out = [r for r in results if r.get("kind") == "consumer"]
+        self.assertEqual(len(consumers_out), shards)
+        producer_paths = {
+            path for r in results if r.get("kind") == "producer" for path in r["paths"]
+        }
+        self.assertEqual(
+            {r["path"] for r in consumers_out},
+            producer_paths,
+            f"consumers read different regions than the producers wrote: {consumers_out}",
+        )
+        delivered = [r["received"] for r in consumers_out]
         union = [msg for shard_msgs in delivered for msg in shard_msgs]
         # Payloads are unique per message, so "no duplicate payloads" plus
         # the exact count is exactly-once delivery.
@@ -237,12 +257,22 @@ class ShardedCrossProcessTests(unittest.TestCase):
         for process in consumers + [producer]:
             process.join(timeout=180)
             self.assertEqual(process.exitcode, 0)
-        delivered = [r for r in results if isinstance(r, list)]
-        self.assertEqual(len(delivered), shards)
+        consumers_out = [r for r in results if r.get("kind") == "consumer"]
+        self.assertEqual(len(consumers_out), shards)
+        producer_paths = {
+            path for r in results if r.get("kind") == "producer" for path in r["paths"]
+        }
+        self.assertEqual(
+            {r["path"] for r in consumers_out},
+            producer_paths,
+            f"consumers read different regions than the producer wrote: {consumers_out}",
+        )
         expected = [f"bc-{i}".encode() for i in range(count)]
-        for shard_msgs in delivered:
+        for consumer_out in consumers_out:
             # Every consumer (one per shard) sees every broadcast message.
-            self.assertEqual(shard_msgs, expected)
+            self.assertEqual(
+                consumer_out["received"], expected, f"shard {consumer_out}"
+            )
 
 
 def _bc_producer(name, shards, capacity, slot_size, count, result_queue):
@@ -254,8 +284,9 @@ def _bc_producer(name, shards, capacity, slot_size, count, result_queue):
     )
     for i in range(count):
         fan.send(f"bc-{i}".encode())
+    paths = [channel.path for channel in fan.shards()]
     fan.close()
-    result_queue.put("done")
+    result_queue.put({"kind": "producer", "paths": paths})
 
 
 if __name__ == "__main__":
